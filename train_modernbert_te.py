@@ -58,7 +58,7 @@ WANDB_PROJECT = "nanoplm-modernbert-te"
 WANDB_RUN_NAME = None
 
 # Peak BF16 TFLOPS per H100 SXM (used for MFU estimate)
-H100_PEAK_TFLOPS = 1979
+H100_PEAK_TFLOPS = 989
 
 # ====================
 # Data settings

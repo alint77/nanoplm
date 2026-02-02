@@ -2,6 +2,7 @@ import os
 import json
 import torch
 import wandb
+import time
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -11,6 +12,7 @@ from torch.utils.data import Dataset
 from transformers import (
     Trainer,
     TrainingArguments,
+    TrainerCallback,
 )
 
 from nanoplm.pretraining.models.modern_bert import (
@@ -157,7 +159,58 @@ def _prepare_run_and_steps(
         eval_steps = max(1, int(total_steps * pretrain_config.eval_steps_percentage))
         save_steps = max(1, int(total_steps * pretrain_config.save_steps_percentage))
 
+    logging_steps = 1  # Force logging on every step
     return run_name, output_dir, num_epochs, logging_steps, eval_steps, save_steps
+
+
+class PerformanceCallback(TrainerCallback):
+    """
+    Callback to calculate and log MFU (Model FLOPs Utilization) and tokens/sec.
+    MFU calculation for H100 SXM5 (~989 TFLOPS peak BF16/FP16).
+    """
+
+    def __init__(self, model, global_batch_size, max_length, num_gpus):
+        self.model = model
+        self.global_batch_size = global_batch_size
+        self.max_length = max_length
+        self.num_gpus = max(1, num_gpus)
+
+        # H100 SXM5 Peak BF16/FP16 TFLOPS (non-sparse)
+        self.peak_flops_per_gpu = 989e12
+
+        # 6 * params is a common approximation for transformer FLOPs per token (fwd+bwd)
+        # We only count trainable parameters
+        self.num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        self.flops_per_token = 6 * self.num_params
+        self.total_flops_per_step = self.flops_per_token * self.global_batch_size * self.max_length
+
+        self.step_start_time = None
+        self.last_metrics = {}
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        self.step_start_time = time.time()
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.step_start_time is not None:
+            step_duration = time.time() - self.step_start_time
+            if step_duration > 0:
+                # Tokens per second (global)
+                tokens_per_sec = (self.global_batch_size * self.max_length) / step_duration
+
+                # MFU = (Actual FLOPs) / (Total Peak FLOPs)
+                actual_flops = self.total_flops_per_step / step_duration
+                total_peak_flops = self.peak_flops_per_gpu * self.num_gpus
+                mfu = actual_flops / total_peak_flops
+
+                self.last_metrics = {
+                    "perf/tokens_per_sec": tokens_per_sec,
+                    "perf/mfu": mfu,
+                }
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is not None and self.last_metrics:
+            for k, v in self.last_metrics.items():
+                logs[k] = v
 
 
 def run_pretraining(
@@ -303,6 +356,13 @@ def run_pretraining(
 
     args = TrainingArguments(**training_dict)
 
+    perf_callback = PerformanceCallback(
+        model=model,
+        global_batch_size=global_batch_size,
+        max_length=pretrain_config.max_length,
+        num_gpus=effective_world_size,
+    )
+
     trainer = Trainer(
         model=model,
         args=args,
@@ -310,6 +370,7 @@ def run_pretraining(
         train_dataset=train_ds,
         eval_dataset=val_ds,
         processing_class=tokenizer,
+        callbacks=[perf_callback],
     )
 
     logger.info("Starting Trainer")
