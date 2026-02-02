@@ -85,7 +85,7 @@ NUM_LAYERS = 16
 NUM_HEADS = 16
 ATTENTION_DROPOUT = 0.0
 MLP_DROPOUT = 0.0
-MLP_ACTIVATION = "swiglu"
+MLP_ACTIVATION = "geglu"
 CLASSIFIER_ACTIVATION = "gelu"
 MLP_BIAS = False
 ATTENTION_BIAS = False
@@ -102,7 +102,7 @@ WARMUP_STEPS = 200
 MIN_LR = 1e-6
 EVAL_EVERY = 200
 EVAL_ITERS = 25
-LOG_EVERY = 50
+LOG_EVERY = 1
 
 SEED = 1337
 
@@ -165,12 +165,49 @@ def print0(*args, **kwargs):
 
 
 def build_attention_mask(attention_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Build attention mask for TE DotProductAttention.
+    
+    TE expects mask shape [batch_size, 1, 1, seqlen] where True means masked.
+    Input attention_mask is [batch_size, seqlen] where 1 means valid token.
+    """
     if attention_mask is None:
         return None
     if attention_mask.dim() == 4:
         return attention_mask
+    # Convert from (1=valid, 0=pad) to (True=masked, False=valid)
     mask = ~attention_mask.to(torch.bool)
-    return mask.unsqueeze(1).unsqueeze(1)
+    return mask.unsqueeze(1).unsqueeze(2)  # [bsz, 1, 1, seqlen]
+
+
+def build_sliding_window_mask(attention_mask: torch.Tensor, window_size: int) -> torch.Tensor:
+    """Build combined sliding window + padding mask.
+    
+    Note: TE DotProductAttention has a native window_size parameter that's more efficient.
+    This function is kept for reference but we use TE's native sliding window instead.
+    
+    Args:
+        attention_mask: [bsz, seqlen] where 1=valid, 0=pad
+        window_size: total window size (each position attends to window_size/2 on each side)
+    
+    Returns:
+        mask: [bsz, 1, seqlen, seqlen] where True=masked
+    """
+    bsz, seqlen = attention_mask.shape
+    device = attention_mask.device
+    
+    # Padding mask: [bsz, 1, 1, seqlen] -> broadcast to [bsz, 1, seqlen, seqlen]
+    pad_mask = ~attention_mask.to(torch.bool)
+    pad_mask = pad_mask.unsqueeze(1).unsqueeze(2)  # [bsz, 1, 1, seqlen]
+    
+    # Sliding window mask: [1, 1, seqlen, seqlen]
+    half_window = window_size // 2
+    idx = torch.arange(seqlen, device=device)
+    dist = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs()
+    sliding_mask = dist > half_window
+    sliding_mask = sliding_mask.unsqueeze(0).unsqueeze(0)
+    
+    # Combined mask: True if it should be masked
+    return pad_mask | sliding_mask
 
 
 def get_activation(name: str):
@@ -190,14 +227,79 @@ def get_activation(name: str):
 # TE init helpers
 
 def te_init_method(weight):
-    fan_out = weight.size(0)
-    fan_in = weight.size(1)
-    std = 1.0 / math.sqrt(fan_in) * min(1.0, math.sqrt(fan_out / fan_in))
-    torch.nn.init.normal_(weight, mean=0.0, std=std)
+    # Match HF ModernBERT trunc_normal_ initialization
+    std = 0.02
+    cutoff = 2.0 * std
+    torch.nn.init.trunc_normal_(weight, mean=0.0, std=std, a=-cutoff, b=cutoff)
 
 
 def te_output_layer_init_method(weight):
     torch.nn.init.zeros_(weight)
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotates half the hidden dims of the input (used for RoPE)."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor, 
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotary position embeddings to query and key tensors.
+    
+    Args:
+        q: [batch, seq, heads, head_dim]
+        k: [batch, seq, heads, head_dim]
+        cos: [seq, head_dim] or [1, seq, 1, head_dim]
+        sin: [seq, head_dim] or [1, seq, 1, head_dim]
+    
+    Returns:
+        q_rotated, k_rotated with same shapes as inputs
+    """
+    # Ensure cos/sin are broadcastable: [1, seq, 1, head_dim]
+    if cos.dim() == 2:
+        cos = cos.unsqueeze(0).unsqueeze(2)  # [1, seq, 1, head_dim]
+        sin = sin.unsqueeze(0).unsqueeze(2)
+    
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+class ModernBertRotaryEmbedding(nn.Module):
+    """Rotary Position Embedding for ModernBERT.
+    
+    Returns (cos, sin) tensors that can be used to apply RoPE to Q and K.
+    """
+    def __init__(self, dim: int, theta: float = 160000.0):
+        super().__init__()
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.dim = dim
+
+    def forward(self, max_seq_len: int, device: torch.device, dtype: torch.dtype = torch.float32):
+        """Compute rotary embeddings.
+        
+        Args:
+            max_seq_len: Maximum sequence length
+            device: Device to create tensors on
+            dtype: Dtype for output tensors
+            
+        Returns:
+            cos, sin: Both of shape [seq_len, head_dim]
+        """
+        seq = torch.arange(max_seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(seq, self.inv_freq)  # [seq_len, head_dim/2]
+        # Duplicate freqs for full head_dim (interleaved RoPE pattern)
+        emb = torch.cat((freqs, freqs), dim=-1)  # [seq_len, head_dim]
+        cos = emb.cos().to(dtype)
+        sin = emb.sin().to(dtype)
+        return cos, sin
 
 
 @dataclass
@@ -210,33 +312,72 @@ class ModernBertTEConfig:
     max_position_embeddings: int = 1024
     attention_dropout: float = 0.0
     mlp_dropout: float = 0.0
-    mlp_activation: str = "swiglu"
+    mlp_activation: str = "geglu"
     classifier_activation: str = "gelu"
     attention_bias: bool = False
     mlp_bias: bool = False
+    norm_eps: float = 1e-5
+    norm_bias: bool = False
+    sliding_window: int = 128
+    global_attn_every: int = 3
 
 
 class ModernBertBlock(nn.Module):
-    def __init__(self, config: ModernBertTEConfig, layer_number: int):
+    """ModernBERT transformer block using Transformer Engine.
+    
+    Uses pre-norm architecture with LayerNorm before attention and MLP.
+    First layer skips the attention pre-norm (following ModernBERT design).
+    """
+    def __init__(
+        self, 
+        config: ModernBertTEConfig, 
+        layer_number: int, 
+        attn_type: str = "global",
+        is_first_layer: bool = False,
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
+        self.attn_type = attn_type
+        self.layer_number = layer_number
+        self.is_first_layer = is_first_layer
+        
         if self.hidden_size % self.num_heads != 0:
             raise ValueError("hidden_size must be divisible by num_attention_heads")
 
-        self.qkv = te.LayerNormLinear(
-            in_features=config.hidden_size,
-            out_features=3 * config.hidden_size,
-            bias=config.attention_bias,
-            normalization="RMSNorm",
-            init_method=te_init_method,
-        )
+        # ModernBERT: first layer skips the attention pre-norm
+        if is_first_layer:
+            self.attn_norm = nn.Identity()
+            self.qkv = te.Linear(
+                in_features=config.hidden_size,
+                out_features=3 * config.hidden_size,
+                bias=config.attention_bias,
+                init_method=te_init_method,
+            )
+        else:
+            self.attn_norm = te.LayerNorm(config.hidden_size, eps=config.norm_eps)
+            self.qkv = te.Linear(
+                in_features=config.hidden_size,
+                out_features=3 * config.hidden_size,
+                bias=config.attention_bias,
+                init_method=te_init_method,
+            )
+        
+        # Configure sliding window for local attention layers
+        # TE window_size: (left, right) where -1 means no limit
+        if attn_type == "sliding":
+            half_window = config.sliding_window // 2
+            window_size = (half_window, half_window)
+        else:
+            window_size = (-1, -1)  # No sliding window (global attention)
+        
         self.attn = te.DotProductAttention(
             num_attention_heads=self.num_heads,
             kv_channels=self.head_dim,
             attention_dropout=config.attention_dropout,
             attn_mask_type="padding",
+            window_size=window_size,
             qkv_format="bshd",
             layer_number=layer_number,
         )
@@ -252,7 +393,8 @@ class ModernBertBlock(nn.Module):
             hidden_size=config.hidden_size,
             ffn_hidden_size=config.intermediate_size,
             bias=config.mlp_bias,
-            normalization="RMSNorm",
+            normalization="LayerNorm",
+            eps=config.norm_eps,
             activation=config.mlp_activation,
             init_method=te_init_method,
             output_layer_init_method=te_output_layer_init_method,
@@ -260,22 +402,45 @@ class ModernBertBlock(nn.Module):
         self.mlp_dropout = nn.Dropout(config.mlp_dropout)
 
     def _unwrap(self, out):
+        """Unwrap TE module output (may return tuple with extra info)."""
         return out[0] if isinstance(out, tuple) else out
 
     def forward(
         self,
         x: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        cos: Optional[torch.Tensor] = None,
+        sin: Optional[torch.Tensor] = None,
         is_first_microbatch: bool = False,
         checkpoint_core_attention: bool = False,
     ) -> torch.Tensor:
+        """Forward pass.
+        
+        Args:
+            x: [batch, seq, hidden] input tensor
+            attention_mask: [batch, 1, 1, seq] padding mask (True=masked)
+            cos, sin: Rotary position embeddings [seq, head_dim]
+            is_first_microbatch: For FP8 weight caching
+            checkpoint_core_attention: Recompute attention in backward
+        """
         residual = x
-        qkv = self.qkv(x, is_first_microbatch=is_first_microbatch)
+        
+        # Pre-norm (skipped for first layer)
+        x_normed = self.attn_norm(x)
+        
+        # QKV projection
+        qkv = self.qkv(x_normed, is_first_microbatch=is_first_microbatch)
         qkv = self._unwrap(qkv)
+        
         bsz, seqlen, _ = qkv.shape
         qkv = qkv.view(bsz, seqlen, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)
+        q, k, v = qkv.unbind(dim=2)  # Each: [bsz, seqlen, num_heads, head_dim]
 
+        # Apply RoPE to Q and K before attention
+        if cos is not None and sin is not None:
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # Attention
         attn_out = self.attn(
             q,
             k,
@@ -286,10 +451,13 @@ class ModernBertBlock(nn.Module):
         )
         attn_out = self._unwrap(attn_out)
         attn_out = attn_out.contiguous().view(bsz, seqlen, self.hidden_size)
+        
+        # Output projection
         attn_out = self.attn_proj(attn_out, is_first_microbatch=is_first_microbatch)
         attn_out = self._unwrap(attn_out)
         x = residual + self.attn_dropout(attn_out)
 
+        # MLP with pre-norm (handled by LayerNormMLP)
         residual = x
         mlp_out = self.mlp(x, is_first_microbatch=is_first_microbatch)
         mlp_out = self._unwrap(mlp_out)
@@ -307,7 +475,7 @@ class ModernBertMLMHead(nn.Module):
             init_method=te_init_method,
         )
         self.act = get_activation(config.classifier_activation)
-        self.norm = te.LayerNorm(config.hidden_size)
+        self.norm = te.LayerNorm(config.hidden_size, eps=config.norm_eps)
         self.decoder = te.Linear(
             config.hidden_size,
             config.vocab_size,
@@ -330,37 +498,92 @@ class ModernBertMLMHead(nn.Module):
 
 
 class ModernBertForMaskedLM(nn.Module):
+    """ModernBERT model for Masked Language Modeling using Transformer Engine."""
+    
     def __init__(self, config: ModernBertTEConfig, pad_token_id: int):
         super().__init__()
         self.config = config
         self.pad_token_id = pad_token_id
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=pad_token_id)
-        self.pos_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
-        self.emb_norm = te.LayerNorm(config.hidden_size)
+        self.emb_norm = te.LayerNorm(config.hidden_size, eps=config.norm_eps)
         self.emb_drop = nn.Dropout(0.0)
-        self.layers = nn.ModuleList([
-            ModernBertBlock(config, layer_number=i + 1) for i in range(config.num_hidden_layers)
-        ])
-        self.final_norm = te.RMSNorm(config.hidden_size)
+        
+        self.rotary_emb = ModernBertRotaryEmbedding(
+            dim=config.hidden_size // config.num_attention_heads,
+            theta=160000.0,  # ModernBERT uses higher theta for better extrapolation
+        )
+        
+        # All layers use global attention (no sliding window)
+        # First layer skips pre-norm (ModernBERT pattern)
+        self.layers = nn.ModuleList()
+        for i in range(config.num_hidden_layers):
+            is_first = (i == 0)
+            self.layers.append(
+                ModernBertBlock(
+                    config, 
+                    layer_number=i + 1, 
+                    attn_type="global",
+                    is_first_layer=is_first,
+                )
+            )
+
+        self.final_norm = te.LayerNorm(config.hidden_size, eps=config.norm_eps)
         self.mlm_head = ModernBertMLMHead(config)
 
         self._init_weights()
 
     def _init_weights(self):
-        torch.nn.init.normal_(self.tok_embeddings.weight, mean=0.0, std=1.0)
-        torch.nn.init.normal_(self.pos_embeddings.weight, mean=0.0, std=1.0)
+        """Initialize embedding weights with truncated normal."""
+        torch.nn.init.trunc_normal_(self.tok_embeddings.weight, mean=0.0, std=0.02, a=-0.04, b=0.04)
         if self.tok_embeddings.weight.device.type == "cuda":
             self.tok_embeddings.to(dtype=torch.bfloat16)
-            self.pos_embeddings.to(dtype=torch.bfloat16)
+
+    def _pad_for_fp8(self, tensor: torch.Tensor, alignment: int = 16) -> tuple[torch.Tensor, int]:
+        """Pad tensor's first dimension to be divisible by alignment for FP8.
+        
+        Args:
+            tensor: Input tensor of shape [N, ...]
+            alignment: Required divisibility (16 for FP8 GEMM leading dimension)
+            
+        Returns:
+            padded_tensor: Tensor with first dim padded to multiple of alignment
+            original_size: Original first dimension size
+        """
+        original_size = tensor.size(0)
+        remainder = original_size % alignment
+        if remainder == 0:
+            return tensor, original_size
+        
+        pad_size = alignment - remainder
+        # Create padding with zeros
+        pad_shape = (pad_size,) + tensor.shape[1:]
+        padding = torch.zeros(pad_shape, dtype=tensor.dtype, device=tensor.device)
+        padded_tensor = torch.cat([tensor, padding], dim=0)
+        return padded_tensor, original_size
 
     def _loss_from_hidden(self, hidden_states: torch.Tensor, labels: torch.Tensor, is_first_microbatch: bool):
-        logits = self.mlm_head(hidden_states, is_first_microbatch=is_first_microbatch)
-        vocab_size = logits.size(-1)
-        loss = F.cross_entropy(
-            logits.view(-1, vocab_size),
-            labels.view(-1),
-            ignore_index=-100,
-        )
+        # Sparse prediction: only pass masked tokens through the head
+        labels = labels.view(-1)
+        mask = labels != -100
+        
+        if mask.any():
+            masked_hidden = hidden_states.view(-1, hidden_states.size(-1))[mask]
+            masked_labels = labels[mask]
+            
+            # Pad for FP8 alignment if needed (16 for leading dimension requirement)
+            if USE_FP8 or USE_NVFP4:
+                masked_hidden, orig_size = self._pad_for_fp8(masked_hidden, alignment=16)
+            
+            logits = self.mlm_head(masked_hidden, is_first_microbatch=is_first_microbatch)
+            
+            # Remove padding from logits before loss computation
+            if USE_FP8 or USE_NVFP4:
+                logits = logits[:orig_size]
+            
+            loss = F.cross_entropy(logits, masked_labels)
+        else:
+            loss = hidden_states.new_tensor(0.0, requires_grad=True)
+            
         return loss
 
     def forward(
@@ -371,24 +594,43 @@ class ModernBertForMaskedLM(nn.Module):
         labels: Optional[torch.Tensor] = None,
         is_first_microbatch: bool = False,
     ):
+        """Forward pass for MLM.
+        
+        Args:
+            input_ids: [batch, seq] token IDs
+            attention_mask: [batch, seq] where 1=valid, 0=pad
+            position_ids: Unused, kept for API compatibility
+            labels: [batch, seq] target IDs, -100 for non-masked positions
+            is_first_microbatch: For FP8 weight caching optimization
+            
+        Returns:
+            logits: Predicted logits (sparse if labels provided)
+            loss: Cross-entropy loss if labels provided
+        """
         bsz, seqlen = input_ids.shape
-        if position_ids is None:
-            position_ids = torch.arange(seqlen, device=input_ids.device)
-            position_ids = position_ids.unsqueeze(0).expand(bsz, -1)
-
-        tok_emb = self.tok_embeddings(input_ids)
-        pos_emb = self.pos_embeddings(position_ids)
-        hidden_states = self.emb_norm(tok_emb + pos_emb)
+        
+        # Embeddings
+        hidden_states = self.tok_embeddings(input_ids)
+        hidden_states = self.emb_norm(hidden_states)
         hidden_states = self.emb_drop(hidden_states)
-
+        
+        # Build padding mask for attention (True = masked position)
+        # TE uses the same mask for both global and sliding window
+        # (sliding window is handled via window_size param in DotProductAttention)
         attn_mask = build_attention_mask(attention_mask)
+        
+        # Compute rotary embeddings (cos, sin)
+        cos, sin = self.rotary_emb(seqlen, hidden_states.device, hidden_states.dtype)
 
+        # Transformer layers
         for block in self.layers:
             if USE_AC_BLOCKS:
                 hidden_states = te.checkpoint(
                     block,
                     hidden_states,
                     attn_mask,
+                    cos,
+                    sin,
                     is_first_microbatch,
                     USE_AC_ATTENTION,
                     use_reentrant=True,
@@ -397,31 +639,54 @@ class ModernBertForMaskedLM(nn.Module):
                 hidden_states = block(
                     hidden_states,
                     attention_mask=attn_mask,
+                    cos=cos,
+                    sin=sin,
                     is_first_microbatch=is_first_microbatch,
                     checkpoint_core_attention=USE_AC_ATTENTION,
                 )
 
         hidden_states = self.final_norm(hidden_states)
 
-        if labels is not None and USE_AC_LM_HEAD and self.training:
-            loss = te.checkpoint(
-                self._loss_from_hidden,
-                hidden_states,
-                labels,
-                is_first_microbatch,
-                use_reentrant=True,
-            )
-            logits = None
+        # MLM head and loss computation
+        if labels is not None:
+            if USE_AC_LM_HEAD and self.training:
+                # Use activation checkpointing for LM head
+                loss = te.checkpoint(
+                    self._loss_from_hidden,
+                    hidden_states,
+                    labels,
+                    is_first_microbatch,
+                    use_reentrant=True,
+                )
+                logits = None
+            else:
+                # Sparse prediction: only compute logits for masked positions
+                flat_labels = labels.view(-1)
+                mask = flat_labels != -100
+                
+                if mask.any():
+                    masked_hidden = hidden_states.view(-1, hidden_states.size(-1))[mask]
+                    masked_labels = flat_labels[mask]
+                    
+                    # Pad for FP8 alignment if needed (16 for leading dimension requirement)
+                    if USE_FP8 or USE_NVFP4:
+                        masked_hidden, orig_size = self._pad_for_fp8(masked_hidden, alignment=16)
+                    
+                    logits = self.mlm_head(masked_hidden, is_first_microbatch=is_first_microbatch)
+                    
+                    # Remove padding from logits before loss computation
+                    if USE_FP8 or USE_NVFP4:
+                        logits = logits[:orig_size]
+                    
+                    loss = F.cross_entropy(logits, masked_labels)
+                else:
+                    # No masked tokens in batch (shouldn't happen normally)
+                    logits = None
+                    loss = hidden_states.new_tensor(0.0, requires_grad=True)
         else:
+            # Inference: compute logits for all positions
             logits = self.mlm_head(hidden_states, is_first_microbatch=is_first_microbatch)
             loss = None
-            if labels is not None:
-                vocab_size = logits.size(-1)
-                loss = F.cross_entropy(
-                    logits.view(-1, vocab_size),
-                    labels.view(-1),
-                    ignore_index=-100,
-                )
 
         return logits, loss
 
@@ -556,19 +821,13 @@ def build_param_groups(model):
         {"params": no_decay, "weight_decay": 0.0},
     ]
 
-try:
-    optimizer = torch.optim.AdamW(
-        build_param_groups(raw_model),
-        lr=LEARNING_RATE,
-        betas=(0.9, 0.95),
-        fused=(device != "cpu"),
-    )
-except TypeError:
-    optimizer = torch.optim.AdamW(
-        build_param_groups(raw_model),
-        lr=LEARNING_RATE,
-        betas=(0.9, 0.95),
-    )
+optimizer = torch.optim.AdamW(
+    build_param_groups(raw_model),
+    lr=LEARNING_RATE,
+    betas=(0.9, 0.95),
+    fused=True,
+)
+
 
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
     optimizer,
