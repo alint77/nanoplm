@@ -17,7 +17,11 @@ Usage
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Generator, Tuple
 
@@ -35,6 +39,15 @@ from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertToken
 
 # -- biotrainer imports ------------------------------------------------------
 from biotrainer.autoeval import autoeval_pipeline
+from biotrainer.autoeval.autoeval import (
+    get_unique_framework_sequences,
+    _setup_embedding_functions,
+    _check_h5_file,
+)
+from biotrainer.autoeval.config_bank import AutoEvalConfigBank
+from biotrainer.autoeval.report_manager import ReportManager
+from biotrainer.protocols import Protocol
+from biotrainer.utilities.executer import parse_config_file_and_execute_run
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +229,22 @@ def load_model_config(yaml_path: str | Path = "pretrain.yaml") -> ProtModernBert
 
 
 # ---------------------------------------------------------------------------
+# Parallel task execution
+# ---------------------------------------------------------------------------
+
+def _run_single_task(task_name: str, config: dict) -> tuple[str, dict]:
+    """Run a single biotrainer task in a subprocess. Returns (task_name, result_dict)."""
+    try:
+        result = parse_config_file_and_execute_run(config=config)
+        return task_name, result
+    except Exception as e:
+        print(f"[ERROR] Task {task_name} failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return task_name, None
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -279,6 +308,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Name for the embedder in the report. Defaults to checkpoint dir name.",
     )
+    p.add_argument(
+        "--parallel-tasks",
+        type=int,
+        default=0,
+        help="Number of parallel workers for downstream task training. "
+             "0 = sequential (original behavior), >0 = use that many workers.",
+    )
     return p.parse_args()
 
 
@@ -303,38 +339,165 @@ def main():
     embedder_name = args.embedder_name or Path(args.checkpoint_dir).resolve().stem
     print(f"Embedder name: {embedder_name}")
 
-    # Run autoeval
-    print(f"\nStarting autoeval pipeline: framework={args.framework}")
-    print("=" * 60)
+    # ── Sequential mode (original behavior) ──────────────────────────────
+    if args.parallel_tasks <= 0:
+        print(f"\nStarting autoeval pipeline (sequential): framework={args.framework}")
+        print("=" * 60)
 
-    current_progress = None
-    for progress in autoeval_pipeline(
+        current_progress = None
+        for progress in autoeval_pipeline(
+            embedder_name=embedder_name,
+            framework=args.framework,
+            output_dir=args.output_dir,
+            min_seq_length=args.min_seq_length,
+            max_seq_length=args.max_seq_length,
+            custom_embedding_function_per_residue=lambda seqs: embed_per_residue(
+                model, tokenizer, seqs, device, args.batch_size
+            ),
+            custom_embedding_function_per_sequence=lambda seqs: embed_per_sequence(
+                model, tokenizer, seqs, device, args.batch_size
+            ),
+        ):
+            current_progress = progress
+            print(
+                f"[{progress.completed_tasks}/{progress.total_tasks}] "
+                f"{progress.current_framework_name}: {progress.current_task_name}"
+            )
+
+        # Final report
+        if current_progress and current_progress.final_report:
+            print("\n" + "=" * 60)
+            print("AUTOEVAL COMPLETE — Final Report Summary")
+            print("=" * 60)
+            current_progress.final_report.summary()
+        else:
+            print("\n[WARN] No final report generated.")
+        return
+
+    # ── Parallel mode ────────────────────────────────────────────────────
+    print(f"\nStarting autoeval pipeline (PARALLEL, {args.parallel_tasks} workers): "
+          f"framework={args.framework}")
+    print("=" * 60)
+    overall_start = time.time()
+
+    # --- Build the same output_dir structure that autoeval_pipeline uses ---
+    embedder_dir_name = embedder_name.replace("/", "-")
+    framework_dir = f"{args.framework}_{args.min_seq_length}_{args.max_seq_length}"
+    output_dir = Path(args.output_dir) / embedder_dir_name / framework_dir
+    os.makedirs(output_dir, exist_ok=True)
+
+    # --- Phase 1: Compute embeddings (sequential, GPU) ---
+    print("\n>>> Phase 1: Computing embeddings …")
+    t0 = time.time()
+
+    # Reuse biotrainer's own setup to get tasks, sequences, and embedding functions
+    task_config_tuples, unique_per_residue, unique_per_sequence = \
+        get_unique_framework_sequences(
+            framework=args.framework,
+            min_seq_length=args.min_seq_length,
+            max_seq_length=args.max_seq_length,
+        )
+
+    embedding_fn_per_residue, embedding_fn_per_sequence = _setup_embedding_functions(
         embedder_name=embedder_name,
-        framework=args.framework,
-        output_dir=args.output_dir,
-        min_seq_length=args.min_seq_length,
-        max_seq_length=args.max_seq_length,
+        output_dir=output_dir,
+        use_half_precision=False,
         custom_embedding_function_per_residue=lambda seqs: embed_per_residue(
             model, tokenizer, seqs, device, args.batch_size
         ),
         custom_embedding_function_per_sequence=lambda seqs: embed_per_sequence(
             model, tokenizer, seqs, device, args.batch_size
         ),
-    ):
-        current_progress = progress
-        print(
-            f"[{progress.completed_tasks}/{progress.total_tasks}] "
-            f"{progress.current_framework_name}: {progress.current_task_name}"
+    )
+
+    # Actually compute (or skip if HDF5 already exists)
+    embeddings_file_per_residue = embedding_fn_per_residue(
+        [sr.seq for _, sr in unique_per_residue.items()]
+    )
+    embeddings_file_per_sequence = embedding_fn_per_sequence(
+        [sr.seq for _, sr in unique_per_sequence.items()]
+    )
+
+    _check_h5_file("per-residue", embeddings_file_per_residue, len(unique_per_residue))
+    _check_h5_file("per-sequence", embeddings_file_per_sequence, len(unique_per_sequence))
+
+    print(f"Embeddings done in {time.time() - t0:.1f}s")
+
+    # Free GPU memory — the model is no longer needed
+    del model
+    torch.cuda.empty_cache()
+
+    # --- Phase 2: Prepare task configs ---
+    print("\n>>> Phase 2: Preparing task configs …")
+    prepared_tasks = []   # list of (task, task_name, config_dict)
+    report_manager = ReportManager(
+        embedder_name=embedder_name,
+        training_date=str(datetime.now().date().isoformat()),
+        min_seq_len=args.min_seq_length,
+        max_seq_len=args.max_seq_length,
+    )
+
+    for task, cfg in task_config_tuples:
+        task_name = task.combined_name()
+        task_output_dir = output_dir / task_name
+
+        # Pick the right embeddings file
+        if Protocol.from_string(cfg["protocol"]) in Protocol.using_per_sequence_embeddings():
+            task_emb_file = embeddings_file_per_sequence
+        else:
+            task_emb_file = embeddings_file_per_residue
+
+        cfg = AutoEvalConfigBank.add_custom_values_to_config(
+            config=cfg,
+            embedder_name=embedder_name,
+            embeddings_file=task_emb_file,
+            input_file=task.input_file,
+            output_dir=task_output_dir,
         )
 
-    # Final report
-    if current_progress and current_progress.final_report:
-        print("\n" + "=" * 60)
-        print("AUTOEVAL COMPLETE — Final Report Summary")
-        print("=" * 60)
-        current_progress.final_report.summary()
+        # Check for existing results (resume support)
+        maybe_result = report_manager.maybe_load_existing_result(task_output_dir=task_output_dir)
+        if maybe_result:
+            print(f"  Loaded existing result for {task_name}, skipping …")
+            report_manager.add_result(task=task, result_dict=maybe_result)
+        else:
+            prepared_tasks.append((task, task_name, cfg))
+
+    if not prepared_tasks:
+        print("All tasks already have results — nothing to run!")
     else:
-        print("\n[WARN] No final report generated.")
+        task_names = [tn for _, tn, _ in prepared_tasks]
+        print(f"  Tasks to run ({len(prepared_tasks)}): {task_names}")
+
+        # --- Phase 3: Run tasks in parallel ---
+        print(f"\n>>> Phase 3: Running {len(prepared_tasks)} tasks in parallel "
+              f"({args.parallel_tasks} workers) …")
+        t1 = time.time()
+
+        with ThreadPoolExecutor(max_workers=args.parallel_tasks) as pool:
+            futures = {
+                pool.submit(_run_single_task, task_name, cfg): (task, task_name)
+                for task, task_name, cfg in prepared_tasks
+            }
+            for future in as_completed(futures):
+                task, task_name = futures[future]
+                returned_name, result = future.result()
+                if result is not None:
+                    report_manager.add_result(task=task, result_dict=result)
+                    print(f"  ✓ {returned_name} done")
+                else:
+                    print(f"  ✗ {returned_name} FAILED")
+
+        print(f"All tasks finished in {time.time() - t1:.1f}s")
+
+    # --- Phase 4: Write report ---
+    report = report_manager.write(output_dir=output_dir.parent)
+
+    total_time = time.time() - overall_start
+    print(f"\n{'=' * 60}")
+    print(f"AUTOEVAL COMPLETE — Final Report Summary  (total: {total_time:.1f}s)")
+    print(f"{'=' * 60}")
+    report.summary()
 
 
 if __name__ == "__main__":
