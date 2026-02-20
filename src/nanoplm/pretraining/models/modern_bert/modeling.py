@@ -23,7 +23,7 @@ import torch.nn.functional as F
 # Only the residual-stream expansion is implemented; resid_lambdas and
 # x0_lambdas are assumed False.  See arXiv:2512.24880.
 # ---------------------------------------------------------------------------
-USE_MHC: bool = False
+USE_MHC: bool = True
 MHC_N: int = 4  # number of residual streams (n in the paper)
 
 _HAS_FLASH_VARLEN = False
@@ -349,9 +349,9 @@ class MHCLayer(nn.Module):
         h_res  = _mhc_sinkhorn(res_logits, self.tmax, self.sinkhorn_eps)      # (T, n, n)
 
         # Restore leading dims (no-op for varlen where lead=(T,) already)
-        h_pre  = h_pre.reshape(*lead, n)
-        h_post = h_post.reshape(*lead, n)
-        h_res  = h_res.reshape(*lead, n, n)
+        h_pre  = h_pre.reshape(*lead, n).to(x.dtype)
+        h_post = h_post.reshape(*lead, n).to(x.dtype)
+        h_res  = h_res.reshape(*lead, n, n).to(x.dtype)
         return h_pre, h_post, h_res
 
     def forward(self, x: torch.Tensor, **layer_kwargs) -> torch.Tensor:
