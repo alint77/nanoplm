@@ -858,6 +858,11 @@ def run_te_pretraining(
                         is_main=is_main,
                     )
 
+            # Discard any leftover partial gradient accumulation to prevent
+            # stale gradients from leaking into the next epoch.
+            optimizer.zero_grad(set_to_none=True)
+            accum_loss = torch.tensor(0.0, device=device)
+
             if resume_micro_step > 0 and epoch == resume_epoch:
                 resume_micro_step = 0
 
