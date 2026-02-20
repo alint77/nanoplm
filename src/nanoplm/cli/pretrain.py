@@ -141,6 +141,11 @@ def pretrain():
     help="Weight decay"
 )
 @click.option(
+    "--gradient-clipping/--no-gradient-clipping",
+    default=True,
+    help="Enable gradient clipping with max norm 1.0",
+)
+@click.option(
     "--warmup-steps",
     type=int,
     default=350,
@@ -433,6 +438,7 @@ def run(
     num_epochs: int,
     learning_rate: float,
     weight_decay: float,
+    gradient_clipping: bool,
     warmup_steps: int,
     lr_decay_to_fraction: float,
     lr_schedule: str,
@@ -494,6 +500,7 @@ def run(
         num_epochs=num_epochs,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
+        gradient_clipping=gradient_clipping,
         warmup_steps=warmup_steps,
         lr_decay_to_fraction=lr_decay_to_fraction,
         lr_schedule=lr_schedule,
@@ -765,6 +772,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  lr_decay_to_fraction: 0.1\n"
         "  lr_schedule: \"Linear\" # Linear or Cosine \n" 
         "  weight_decay: 0.0\n"
+        "  gradient_clipping: true\n"
         "  # Muon/NorMuon hyperparameters (used only when optimizer: muon or normuon)\n"
         "  muon_learning_rate: 1e-3\n"
         "  muon_weight_decay: 0.01\n"
@@ -900,6 +908,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         'muon_use_polar_express',
         'use_packing',
         'use_static_inp_size',
+        'gradient_clipping',
         'profiler_enabled',
     ]:
         if bool_key in kwargs:

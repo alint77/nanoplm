@@ -934,7 +934,11 @@ def run_pure_pretraining(
             # Optimizer step
             if scaler is not None and scaler.is_enabled():
                 scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
+            max_grad_norm = 1.0 if pretrain_config.gradient_clipping else float("inf")
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=max_grad_norm,
+            ).item()
 
             step_skipped = False
             if scaler is not None and scaler.is_enabled():
