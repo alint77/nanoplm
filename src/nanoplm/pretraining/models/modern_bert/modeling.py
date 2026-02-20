@@ -17,6 +17,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# ---------------------------------------------------------------------------
+# Manifold-Constrained Hyper-Connections (mHC) — POC flag
+# Set USE_MHC=True to enable multi-stream residual connections.
+# Only the residual-stream expansion is implemented; resid_lambdas and
+# x0_lambdas are assumed False.  See arXiv:2512.24880.
+# ---------------------------------------------------------------------------
+USE_MHC: bool = False
+MHC_N: int = 4  # number of residual streams (n in the paper)
+
 _HAS_FLASH_VARLEN = False
 _flash_varlen_fn = None
 _FLASH_HAS_DROPOUT = False
@@ -84,6 +93,8 @@ class ModernBertConfig:
     use_qk_norm: bool = False
     resid_lambda_init: float = 1.0
     x0_lambda_init: float = 0.1
+    # mHC settings (used only when USE_MHC=True at module level)
+    mhc_n: int = MHC_N  # number of residual streams
 
     head_dim: int = field(init=False)
     sliding_window: int = field(init=False)
@@ -222,6 +233,151 @@ def _position_ids_from_cu_seqlens(
     return torch.arange(total, device=device, dtype=torch.int32) - offsets
 
 
+# ---------------------------------------------------------------------------
+# mHC building blocks (pure PyTorch reference implementation)
+# ---------------------------------------------------------------------------
+
+
+def _mhc_sinkhorn(logits: torch.Tensor, tmax: int = 20, eps: float = 1e-6) -> torch.Tensor:
+    """Project logits to the doubly-stochastic manifold via Sinkhorn-Knopp.
+
+    Args:
+        logits: (..., n, n) raw residual-matrix logits.
+        tmax:   number of alternating normalisation iterations.
+        eps:    numerical stability addend.
+
+    Returns:
+        Doubly-stochastic matrix of same shape as *logits*.
+    """
+    mat = torch.softmax(logits, dim=-1) + eps  # row-softmax init + eps
+    # first column normalisation is baked into the loop
+    mat = mat / (mat.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(tmax - 1):
+        mat = mat / (mat.sum(dim=-1, keepdim=True) + eps)
+        mat = mat / (mat.sum(dim=-2, keepdim=True) + eps)
+    return mat
+
+
+class MHCLayer(nn.Module):
+    """Manifold-Constrained Hyper-Connections wrapper (arXiv:2512.24880).
+
+    Wraps a sublayer (attention or MLP) that expects a single-stream tensor
+    of shape ``(..., C)`` and lifts it to operate on an *n*-stream residual
+    state of shape ``(..., n, C)``.
+
+    Following the paper exactly:
+    - ``C`` is the FULL hidden_size (same as the baseline model width).
+    - The state ``x ∈ R^{n×C}`` has n streams each of size hidden_size.
+    - Pre-aggregation ``h_pre @ x → (1, C)`` feeds the sublayer at full width.
+    - The sublayer is identical to the baseline (no parameter reduction).
+    - Only the routing projections (phi) are added: phi ∈ R^{nC × (n²+2n)},
+      which is negligible overhead (e.g. 3072×24 for n=4, C=768).
+
+    Forward:
+        1. Compute routing coefficients from the flattened n×C state via
+           fused RMS-norm + linear projection.
+        2. Pre-aggregate n streams to one via h_pre: (n,C) → (C,).
+        3. Run the wrapped sublayer on the full-width single-stream result.
+        4. Scatter back to n streams: h_res @ x + h_post^T * f_out.
+
+    Parameters:
+        layer:      The sublayer to wrap (ModernBertAttention or MLP).
+        n:          Number of residual streams (``MHC_N``).
+        c:          Full per-stream channel dimension (= ``hidden_size``).
+        tmax:       Sinkhorn-Knopp iterations (default 20).
+        rms_eps:    Epsilon for RMS normalisation of the flattened state.
+        sinkhorn_eps: Epsilon inside Sinkhorn iterations.
+        post_mult:  Scale applied to ``h_post`` after sigmoid (default 2).
+    """
+
+    def __init__(
+        self,
+        layer: nn.Module,
+        n: int,
+        c: int,
+        tmax: int = 20,
+        rms_eps: float = 1e-6,
+        sinkhorn_eps: float = 1e-6,
+        post_mult: float = 2.0,
+    ) -> None:
+        super().__init__()
+        self.layer = layer
+        self.n = n
+        self.c = c
+        self.tmax = tmax
+        self.rms_eps = rms_eps
+        self.sinkhorn_eps = sinkhorn_eps
+        self.post_mult = post_mult
+
+        k = n * c            # flattened stream dimension
+        m = n * n + 2 * n    # total routing outputs: h_res (n²) + h_pre (n) + h_post (n)
+
+        # Learnable projection: flattened stream → routing logits
+        self.phi = nn.Parameter(torch.empty(k, m))
+        # Learnable bias (float32 for stability)
+        self.b = nn.Parameter(torch.zeros(m))
+        # Per-part learnable scale factors
+        self.alpha_pre  = nn.Parameter(torch.ones(1))
+        self.alpha_post = nn.Parameter(torch.ones(1))
+        self.alpha_res  = nn.Parameter(torch.ones(1))
+
+        nn.init.normal_(self.phi, std=0.02)
+
+    # ------------------------------------------------------------------
+
+    def _coeffs(self, x: torch.Tensor):
+        """Compute (h_pre, h_post, h_res) from x: (..., n, c).
+
+        Uses self.n / self.c (fixed at construction) so torch.compile(dynamic=False)
+        sees fully-static shapes in the coefficient computation graph.
+        """
+        n, c = self.n, self.c
+        lead = x.shape[:-2]   # (T,) for varlen; (B,S) for SDPA
+        x_mat = x.reshape(-1, n * c).float()   # (T, k)
+
+        # RMS-norm over the flattened dimension, then project
+        invr = torch.rsqrt(x_mat.pow(2).mean(dim=-1, keepdim=True) + self.rms_eps)
+        mix  = (x_mat @ self.phi.float()) * invr   # (T, m)
+
+        # Split into three parts
+        pre_logits  = mix[:, :n]     * self.alpha_pre.float()  + self.b[:n].float()
+        post_logits = mix[:, n:2*n]  * self.alpha_post.float() + self.b[n:2*n].float()
+        res_logits  = mix[:, 2*n:].view(-1, n, n) * self.alpha_res.float() + self.b[2*n:].float().view(n, n)
+
+        h_pre  = torch.sigmoid(pre_logits)                                    # (T, n)
+        h_post = torch.sigmoid(post_logits) * self.post_mult                  # (T, n)
+        h_res  = _mhc_sinkhorn(res_logits, self.tmax, self.sinkhorn_eps)      # (T, n, n)
+
+        # Restore leading dims (no-op for varlen where lead=(T,) already)
+        h_pre  = h_pre.reshape(*lead, n)
+        h_post = h_post.reshape(*lead, n)
+        h_res  = h_res.reshape(*lead, n, n)
+        return h_pre, h_post, h_res
+
+    def forward(self, x: torch.Tensor, **layer_kwargs) -> torch.Tensor:
+        """
+        Args:
+            x:            Multi-stream state ``(..., n, C)`` where C = hidden_size.
+            **layer_kwargs: Passed through verbatim to the wrapped sublayer.
+
+        Returns:
+            Updated multi-stream state ``(..., n, C)``.
+        """
+        h_pre, h_post, h_res = self._coeffs(x)
+
+        # Pre-aggregate: h_pre-weighted sum over stream dim → (..., C) at full width
+        x_in = (x * h_pre.unsqueeze(-1)).sum(dim=-2)
+
+        # Run sublayer on full-width single-stream input
+        f_out = self.layer(x_in, **layer_kwargs)  # (..., C)
+
+        # Post-aggregate: h_res @ x + h_post^T * f_out  (paper eq. 2)
+        # h_res: (..., n, n)  x: (..., n, C) → (..., n, C)
+        # h_post: (..., n) → (..., n, 1) broadcast with f_out (..., 1, C) → (..., n, C)
+        x_out = torch.einsum("...oi,...ic->...oc", h_res, x) + h_post.unsqueeze(-1) * f_out.unsqueeze(-2)
+        return x_out
+
+
 class ModernBertEmbeddings(nn.Module):
     def __init__(self, config: ModernBertConfig):
         super().__init__()
@@ -230,7 +386,7 @@ class ModernBertEmbeddings(nn.Module):
             config.hidden_size,
             padding_idx=config.pad_token_id,
         )
-        self.norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.drop = nn.Dropout(config.embedding_dropout)
 
     def forward(self, input_ids: torch.LongTensor) -> torch.Tensor:
@@ -422,22 +578,69 @@ class ModernBertAttention(nn.Module):
         return self.out_drop(self.Wo(y))
 
 
+class _NormedAttn(nn.Module):
+    """Thin wrapper combining pre-norm + attention for use inside MHCLayer."""
+
+    def __init__(self, norm: nn.Module, attn: ModernBertAttention) -> None:
+        super().__init__()
+        self.norm = norm
+        self.attn = attn
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        return self.attn(self.norm(x), **kwargs)
+
+
+class _NormedMLP(nn.Module):
+    """Thin wrapper combining pre-norm + MLP for use inside MHCLayer."""
+
+    def __init__(self, norm: nn.Module, mlp: nn.Module) -> None:
+        super().__init__()
+        self.norm = norm
+        self.mlp = mlp
+
+    def forward(self, x: torch.Tensor, **_kwargs) -> torch.Tensor:
+        return self.mlp(self.norm(x))
+
+
 class ModernBertEncoderLayer(nn.Module):
     def __init__(self, config: ModernBertConfig, layer_idx: int):
         super().__init__()
         self.attention_type = config.layer_types[layer_idx]
-        self.attn_norm = (
-            nn.Identity()
-            if layer_idx == 0
-            else nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
-        )
-        self.attn = ModernBertAttention(config)
-        self.mlp_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
-        self.mlp = (
-            ModernBertSwiGLUMLP(config)
-            if config.mlp_activation == "swiglu"
-            else ModernBertMLP(config)
-        )
+        self.use_mhc = USE_MHC
+
+        if USE_MHC:
+            # Paper §3: the sublayer F operates at the FULL hidden_size C.
+            # h_pre aggregates n streams → one C-dim vector fed into the
+            # unmodified attention/MLP.  No inner_cfg needed.
+            n = config.mhc_n
+            c = config.hidden_size  # full width — matches paper exactly
+            attn_norm = (
+                nn.Identity()
+                if layer_idx == 0
+                else nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
+            )
+            mlp_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
+            attn = ModernBertAttention(config)
+            mlp = (
+                ModernBertSwiGLUMLP(config)
+                if config.mlp_activation == "swiglu"
+                else ModernBertMLP(config)
+            )
+            self.mhc_attn = MHCLayer(_NormedAttn(attn_norm, attn), n=n, c=c)
+            self.mhc_mlp  = MHCLayer(_NormedMLP(mlp_norm, mlp),   n=n, c=c)
+        else:
+            self.attn_norm = (
+                nn.Identity()
+                if layer_idx == 0
+                else nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
+            )
+            self.attn = ModernBertAttention(config)
+            self.mlp_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
+            self.mlp = (
+                ModernBertSwiGLUMLP(config)
+                if config.mlp_activation == "swiglu"
+                else ModernBertMLP(config)
+            )
 
     def forward(
         self,
@@ -448,6 +651,21 @@ class ModernBertEncoderLayer(nn.Module):
         max_seqlen: Optional[int] = None,
         window_size: Optional[tuple[int, int]] = None,
     ) -> torch.Tensor:
+        if self.use_mhc:
+            # x: (T, n, c) — multi-stream state
+            # MHCLayer returns the updated multi-stream state in-place of the residual.
+            # The residual connection is embedded inside MHCLayer (h_res mixing).
+            x = self.mhc_attn(
+                x,
+                cos_sin=cos_sin,
+                attn_mask=attn_mask,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                window_size=window_size,
+            )
+            x = self.mhc_mlp(x)
+            return x
+
         x = x + self.attn(
             self.attn_norm(x),
             cos_sin=cos_sin,
@@ -464,6 +682,7 @@ class ModernBertModel(nn.Module):
     def __init__(self, config: ModernBertConfig):
         super().__init__()
         self.config = config
+        self.use_mhc = USE_MHC
         self.embeddings = ModernBertEmbeddings(config)
         self.layers = nn.ModuleList(
             [ModernBertEncoderLayer(config, i) for i in range(config.num_hidden_layers)]
@@ -476,7 +695,9 @@ class ModernBertModel(nn.Module):
             self.x0_lambdas = nn.Parameter(torch.zeros(config.num_hidden_layers))
         else:
             self.register_parameter("x0_lambdas", None)
-        self.final_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+        # final_norm and rotary_emb are identical to baseline in mHC:
+        # the sublayer and the collapsed output both operate at full hidden_size.
+        self.final_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.rotary_emb = ModernBertRotaryEmbedding(config)
 
     def forward(
@@ -490,8 +711,14 @@ class ModernBertModel(nn.Module):
         # ---- varlen (flash-attention) path --------------------------------
         if _cu_seqlens is not None:
             device = input_ids.device
-            x = self.embeddings(input_ids)  # (total_tokens, hidden)
+            x = self.embeddings(input_ids)  # (total_tokens, hidden_size)
             x0 = x if self.x0_lambdas is not None else None
+
+            if self.use_mhc:
+                # Paper §3: expand (T, C) → (T, n, C) by repeating the embedding
+                # across n streams.  All streams start identical and specialise
+                # during training via the learned h_res mixing.
+                x = x.unsqueeze(1).expand(-1, self.config.mhc_n, -1).contiguous()
 
             # Pre-compute RoPE tables up to max_position_embeddings (fixed size
             # avoids graph breaks / recompilation) and index by _position_ids.
@@ -534,7 +761,12 @@ class ModernBertModel(nn.Module):
                     window_size=windows[lt],
                 )
 
-            return self.final_norm(x)
+            if self.use_mhc:
+                # Collapse (T, n, C) → (T, C): mean over streams, then norm.
+                x = self.final_norm(x.mean(dim=1))
+            else:
+                x = self.final_norm(x)
+            return x
 
         # ---- SDPA (fallback) path -----------------------------------------
         _, seq_len = input_ids.shape
@@ -546,6 +778,10 @@ class ModernBertModel(nn.Module):
 
         x = self.embeddings(input_ids)
         x0 = x if self.x0_lambdas is not None else None
+
+        if self.use_mhc:
+            # (B, S, C) → (B, S, n, C)
+            x = x.unsqueeze(2).expand(-1, -1, self.config.mhc_n, -1).contiguous()
 
         attn_masks = {
             "full_attention": _full_attention_mask(attention_mask),
@@ -580,7 +816,12 @@ class ModernBertModel(nn.Module):
             layer_type = layer.attention_type
             x = layer(x, attn_mask=attn_masks[layer_type], cos_sin=rope[layer_type])
 
-        return self.final_norm(x)
+        if self.use_mhc:
+            # Collapse (B, S, n, C) → (B, S, C): mean over streams, then norm.
+            x = self.final_norm(x.mean(dim=2))
+        else:
+            x = self.final_norm(x)
+        return x
 
 
 class ModernBertPredictionHead(nn.Module):
@@ -591,7 +832,7 @@ class ModernBertPredictionHead(nn.Module):
             config.hidden_size,
             bias=config.classifier_bias,
         )
-        self.norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.act = _get_activation(config.classifier_activation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -631,26 +872,39 @@ class ModernBertForMaskedLM(nn.Module):
         )
 
         for module in self.modules():
-            if isinstance(module, nn.LayerNorm):
-                if module.weight is not None:
+            if module.__class__.__name__ == "RMSNorm":
+                if getattr(module, "weight", None) is not None:
                     nn.init.ones_(module.weight)
-                if module.bias is not None:
+                if getattr(module, "bias", None) is not None:
                     nn.init.zeros_(module.bias)
 
         for layer in self.model.layers:
-            nn.init.uniform_(layer.attn.Wqkv.weight, -bound, bound)
-            nn.init.zeros_(layer.attn.Wo.weight)
-            nn.init.uniform_(layer.mlp.Wi.weight, -bound, bound)
-            nn.init.zeros_(layer.mlp.Wo.weight)
+            if USE_MHC:
+                # Initialise the inner attn/MLP accessed via MHCLayer wrappers.
+                attn = layer.mhc_attn.layer.attn
+                mlp  = layer.mhc_mlp.layer.mlp
+            else:
+                attn = layer.attn
+                mlp  = layer.mlp
 
-            if layer.attn.Wqkv.bias is not None:
-                nn.init.zeros_(layer.attn.Wqkv.bias)
-            if layer.attn.Wo.bias is not None:
-                nn.init.zeros_(layer.attn.Wo.bias)
-            if layer.mlp.Wi.bias is not None:
-                nn.init.zeros_(layer.mlp.Wi.bias)
-            if layer.mlp.Wo.bias is not None:
-                nn.init.zeros_(layer.mlp.Wo.bias)
+            nn.init.uniform_(attn.Wqkv.weight, -bound, bound)
+            nn.init.zeros_(attn.Wo.weight)
+            nn.init.uniform_(mlp.Wi.weight, -bound, bound)
+            nn.init.zeros_(mlp.Wo.weight)
+
+            if attn.Wqkv.bias is not None:
+                nn.init.zeros_(attn.Wqkv.bias)
+            if attn.Wo.bias is not None:
+                nn.init.zeros_(attn.Wo.bias)
+            if mlp.Wi.bias is not None:
+                nn.init.zeros_(mlp.Wi.bias)
+            if mlp.Wo.bias is not None:
+                nn.init.zeros_(mlp.Wo.bias)
+
+            if USE_MHC:
+                # phi already initialised in MHCLayer.__init__ with normal_(0.02)
+                # b, alpha_* already set to zeros/ones; nothing extra needed here.
+                pass
 
         nn.init.uniform_(self.head.dense.weight, -bound, bound)
         if self.head.dense.bias is not None:
