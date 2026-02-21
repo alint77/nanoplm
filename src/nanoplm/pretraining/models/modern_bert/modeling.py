@@ -19,6 +19,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from nanoplm.pretraining.models.modern_bert.mhc_triton import mhc_coeffs_fused
+
 
 # ---------------------------------------------------------------------------
 # Manifold-Constrained Hyper-Connections (mHC) — POC flag
@@ -352,24 +354,21 @@ class MHCLayer(nn.Module):
         lead = x.shape[:-2]   # (T,) for varlen; (B,S) for SDPA
         x_mat = x.reshape(-1, n * c)   # (T, k) keep in native precision (bfloat16)
 
-        # RMS-norm over the flattened dimension, calculate in float32 for stability
-        invr = torch.rsqrt(x_mat.pow(2).float().mean(dim=-1, keepdim=True) + self.rms_eps)
-        # Project using native precision, then scale.
-        mix  = (x_mat @ self.phi.to(x_mat.dtype)).float() * invr   # (T, m)
+        # Paper Eq 5-6: matmul via cuBLAS + RMS norm (invr)
+        invr = torch.rsqrt(x_mat.pow(2).float().mean(dim=-1) + self.rms_eps)  # (T,)
+        mix = (x_mat @ self.phi.to(x_mat.dtype)).float()  # (T, m) — NOT premultiplied by invr
 
-        # Fused Splitting + Sigmoids + Sinkhorn iterations entirely in PyTorch for pure Dynamo integration
-        pre_logits  = mix[..., :n]     * self.alpha_pre.to(mix.dtype)  + self.b[:n].to(mix.dtype)
-        post_logits = mix[..., n:2*n]  * self.alpha_post.to(mix.dtype) + self.b[n:2*n].to(mix.dtype)
-        res_logits  = mix[..., 2*n:] * self.alpha_res.to(mix.dtype) + self.b[2*n:].to(mix.dtype)
+        # Paper Eq 7-10: fused Triton kernel for sigmoid + Sinkhorn
+        h_pre, h_post, h_res = mhc_coeffs_fused(
+            mix, invr,
+            self.alpha_pre, self.alpha_post, self.alpha_res,
+            self.b,
+            n=n, tmax=self.tmax, eps=self.sinkhorn_eps, post_mult=self.post_mult,
+        )
 
-        h_pre  = torch.sigmoid(pre_logits.float()).to(x.dtype)
-        h_post = (torch.sigmoid(post_logits.float()) * self.post_mult).to(x.dtype)
-        h_res  = _mhc_sinkhorn_unrolled(res_logits.float(), self.tmax, self.sinkhorn_eps).to(x.dtype)
-
-        # Restore leading dims (no-op for varlen where lead=(T,) already)
-        h_pre  = h_pre.reshape(*lead, n)
-        h_post = h_post.reshape(*lead, n)
-        h_res  = h_res.reshape(*lead, n, n)
+        h_pre = h_pre.to(x.dtype).reshape(*lead, n)
+        h_post = h_post.to(x.dtype).reshape(*lead, n)
+        h_res = h_res.to(x.dtype).reshape(*lead, n, n)
         return h_pre, h_post, h_res
 
     def forward(self, x: torch.Tensor, **layer_kwargs) -> torch.Tensor:
@@ -392,9 +391,7 @@ class MHCLayer(nn.Module):
         f_out_flat = f_out.unsqueeze(-2)  # (..., 1, C)
         hp = h_post.unsqueeze(-1)         # (..., n, 1)
 
-        # Replaced custom Triton bmm with explicit loops. Inductor correctly parses
-        # and unrolls nested loops to form a single optimal pointwise fusion block 
-        # without exceeding internal XBLOCK sizing parameters.
+        # h_res @ x + h_post * f_out — explicit loops for inductor fusion
         res_gather = torch.zeros_like(x)
         for i in range(self.n):
             acc = 0.0
