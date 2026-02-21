@@ -60,6 +60,8 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             use_resid_lambdas=config.use_resid_lambdas,
             use_x0_lambdas=config.use_x0_lambdas,
             use_qk_norm=config.use_qk_norm,
+            use_mhc=config.use_mhc,
+            mhc_n=config.mhc_n,
             resid_lambda_init=config.resid_lambda_init,
             x0_lambda_init=config.x0_lambda_init,
         )
@@ -95,6 +97,8 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             use_resid_lambdas=config.use_resid_lambdas,
             use_x0_lambdas=config.use_x0_lambdas,
             use_qk_norm=config.use_qk_norm,
+            use_mhc=config.use_mhc,
+            mhc_n=config.mhc_n,
             resid_lambda_init=config.resid_lambda_init,
             x0_lambda_init=config.x0_lambda_init,
         )

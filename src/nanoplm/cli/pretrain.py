@@ -318,6 +318,17 @@ def pretrain():
     help="Enable FP8 Linear matmuls in pure-torch/TE paths (CUDA only, best on H100+)",
 )
 @click.option(
+    "--use-mhc/--no-use-mhc",
+    default=False,
+    help="Enable Manifold-Constrained Hyper-Connections (mHC) (pure-torch only)",
+)
+@click.option(
+    "--mhc-n",
+    type=int,
+    default=4,
+    help="Number of residual streams for mHC",
+)
+@click.option(
     "--multi-gpu",
     is_flag=True,
     default=False,
@@ -469,6 +480,8 @@ def run(
     bf16: bool,
     tf32: bool,
     fp8: bool,
+    use_mhc: bool,
+    mhc_n: int,
     multi_gpu: bool,
     world_size: str,
     project_name: str,
@@ -531,6 +544,8 @@ def run(
         bf16=bf16,
         tf32=tf32,
         fp8=fp8,
+        use_mhc=use_mhc,
+        mhc_n=mhc_n,
         multi_gpu=multi_gpu,
         world_size=world_size,
         project_name=project_name,
@@ -553,6 +568,8 @@ def run(
         use_resid_lambdas=use_resid_lambdas,
         use_x0_lambdas=use_x0_lambdas,
         use_qk_norm=use_qk_norm,
+        use_mhc=use_mhc,
+        mhc_n=mhc_n,
     )
 
     if pure_torch and pure_te:
@@ -744,6 +761,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  use_resid_lambdas: false  # scales residual stream per layer\n"
         "  use_x0_lambdas: false  # blends initial embedding x0 per layer\n"
         "  use_qk_norm: false  # applies RMS norm to Q/K in attention\n"
+        "  use_mhc: false  # Manifold-Constrained Hyper-Connections (pure-torch only)\n"
+        "  mhc_n: 4  # number of residual streams for mHC\n"
         "\n"
         "pretraining:\n"
         "  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)\n"
@@ -910,6 +929,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         'use_static_inp_size',
         'gradient_clipping',
         'profiler_enabled',
+        'use_mhc',
     ]:
         if bool_key in kwargs:
             value = kwargs[bool_key]

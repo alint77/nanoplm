@@ -241,6 +241,10 @@ class PretrainingConfig:
     tf32: bool = True
     fp8: bool = False
 
+    # mHC (Manifold-Constrained Hyper-Connections) settings
+    use_mhc: bool = False
+    mhc_n: int = 4
+
     # MLM settings
     mlm_probability: float = 0.3
     mask_replace_prob: float = 0.8
