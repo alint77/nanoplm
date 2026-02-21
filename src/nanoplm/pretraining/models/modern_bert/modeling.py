@@ -16,6 +16,9 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
+
 
 # ---------------------------------------------------------------------------
 # Manifold-Constrained Hyper-Connections (mHC) — POC flag
@@ -238,24 +241,38 @@ def _position_ids_from_cu_seqlens(
 # ---------------------------------------------------------------------------
 
 
-def _mhc_sinkhorn(logits: torch.Tensor, tmax: int = 20, eps: float = 1e-6) -> torch.Tensor:
-    """Project logits to the doubly-stochastic manifold via Sinkhorn-Knopp.
+def _mhc_sinkhorn_unrolled(logits: torch.Tensor, tmax: int = 20, eps: float = 1e-6) -> torch.Tensor:
+    # Extract streams
+    r0 = logits[..., 0:4]
+    r1 = logits[..., 4:8]
+    r2 = logits[..., 8:12]
+    r3 = logits[..., 12:16]
 
-    Args:
-        logits: (..., n, n) raw residual-matrix logits.
-        tmax:   number of alternating normalisation iterations.
-        eps:    numerical stability addend.
+    r0 = torch.exp(r0 - torch.amax(r0, dim=-1, keepdim=True))
+    r1 = torch.exp(r1 - torch.amax(r1, dim=-1, keepdim=True))
+    r2 = torch.exp(r2 - torch.amax(r2, dim=-1, keepdim=True))
+    r3 = torch.exp(r3 - torch.amax(r3, dim=-1, keepdim=True))
 
-    Returns:
-        Doubly-stochastic matrix of same shape as *logits*.
-    """
-    mat = torch.softmax(logits, dim=-1) + eps  # row-softmax init + eps
-    # first column normalisation is baked into the loop
-    mat = mat / (mat.sum(dim=-2, keepdim=True) + eps)
-    for _ in range(tmax - 1):
-        mat = mat / (mat.sum(dim=-1, keepdim=True) + eps)
-        mat = mat / (mat.sum(dim=-2, keepdim=True) + eps)
-    return mat
+    for _ in range(tmax):
+        # Unrolled sum for denominator
+        s0 = r0[..., 0:1] + r0[..., 1:2] + r0[..., 2:3] + r0[..., 3:4]
+        s1 = r1[..., 0:1] + r1[..., 1:2] + r1[..., 2:3] + r1[..., 3:4]
+        s2 = r2[..., 0:1] + r2[..., 1:2] + r2[..., 2:3] + r2[..., 3:4]
+        s3 = r3[..., 0:1] + r3[..., 1:2] + r3[..., 2:3] + r3[..., 3:4]
+
+        r0 = r0 / (s0 + eps)
+        r1 = r1 / (s1 + eps)
+        r2 = r2 / (s2 + eps)
+        r3 = r3 / (s3 + eps)
+
+        c = r0 + r1 + r2 + r3 + eps
+        r0 = r0 / c
+        r1 = r1 / c
+        r2 = r2 / c
+        r3 = r3 / c
+
+    # Stack or concat back optimally
+    return torch.cat([r0, r1, r2, r3], dim=-1).view(*logits.shape[:-1], 4, 4)
 
 
 class MHCLayer(nn.Module):
@@ -333,25 +350,26 @@ class MHCLayer(nn.Module):
         """
         n, c = self.n, self.c
         lead = x.shape[:-2]   # (T,) for varlen; (B,S) for SDPA
-        x_mat = x.reshape(-1, n * c).float()   # (T, k)
+        x_mat = x.reshape(-1, n * c)   # (T, k) keep in native precision (bfloat16)
 
-        # RMS-norm over the flattened dimension, then project
-        invr = torch.rsqrt(x_mat.pow(2).mean(dim=-1, keepdim=True) + self.rms_eps)
-        mix  = (x_mat @ self.phi.float()) * invr   # (T, m)
+        # RMS-norm over the flattened dimension, calculate in float32 for stability
+        invr = torch.rsqrt(x_mat.pow(2).float().mean(dim=-1, keepdim=True) + self.rms_eps)
+        # Project using native precision, then scale.
+        mix  = (x_mat @ self.phi.to(x_mat.dtype)).float() * invr   # (T, m)
 
-        # Split into three parts
-        pre_logits  = mix[:, :n]     * self.alpha_pre.float()  + self.b[:n].float()
-        post_logits = mix[:, n:2*n]  * self.alpha_post.float() + self.b[n:2*n].float()
-        res_logits  = mix[:, 2*n:].view(-1, n, n) * self.alpha_res.float() + self.b[2*n:].float().view(n, n)
+        # Fused Splitting + Sigmoids + Sinkhorn iterations entirely in PyTorch for pure Dynamo integration
+        pre_logits  = mix[..., :n]     * self.alpha_pre.to(mix.dtype)  + self.b[:n].to(mix.dtype)
+        post_logits = mix[..., n:2*n]  * self.alpha_post.to(mix.dtype) + self.b[n:2*n].to(mix.dtype)
+        res_logits  = mix[..., 2*n:] * self.alpha_res.to(mix.dtype) + self.b[2*n:].to(mix.dtype)
 
-        h_pre  = torch.sigmoid(pre_logits)                                    # (T, n)
-        h_post = torch.sigmoid(post_logits) * self.post_mult                  # (T, n)
-        h_res  = _mhc_sinkhorn(res_logits, self.tmax, self.sinkhorn_eps)      # (T, n, n)
+        h_pre  = torch.sigmoid(pre_logits.float()).to(x.dtype)
+        h_post = (torch.sigmoid(post_logits.float()) * self.post_mult).to(x.dtype)
+        h_res  = _mhc_sinkhorn_unrolled(res_logits.float(), self.tmax, self.sinkhorn_eps).to(x.dtype)
 
         # Restore leading dims (no-op for varlen where lead=(T,) already)
-        h_pre  = h_pre.reshape(*lead, n).to(x.dtype)
-        h_post = h_post.reshape(*lead, n).to(x.dtype)
-        h_res  = h_res.reshape(*lead, n, n).to(x.dtype)
+        h_pre  = h_pre.reshape(*lead, n)
+        h_post = h_post.reshape(*lead, n)
+        h_res  = h_res.reshape(*lead, n, n)
         return h_pre, h_post, h_res
 
     def forward(self, x: torch.Tensor, **layer_kwargs) -> torch.Tensor:
@@ -371,11 +389,20 @@ class MHCLayer(nn.Module):
         # Run sublayer on full-width single-stream input
         f_out = self.layer(x_in, **layer_kwargs)  # (..., C)
 
-        # Post-aggregate: h_res @ x + h_post^T * f_out  (paper eq. 2)
-        # h_res: (..., n, n)  x: (..., n, C) → (..., n, C)
-        # h_post: (..., n) → (..., n, 1) broadcast with f_out (..., 1, C) → (..., n, C)
-        x_out = torch.einsum("...oi,...ic->...oc", h_res, x) + h_post.unsqueeze(-1) * f_out.unsqueeze(-2)
-        return x_out
+        f_out_flat = f_out.unsqueeze(-2)  # (..., 1, C)
+        hp = h_post.unsqueeze(-1)         # (..., n, 1)
+
+        # Replaced custom Triton bmm with explicit loops. Inductor correctly parses
+        # and unrolls nested loops to form a single optimal pointwise fusion block 
+        # without exceeding internal XBLOCK sizing parameters.
+        res_gather = torch.zeros_like(x)
+        for i in range(self.n):
+            acc = 0.0
+            for j in range(self.n):
+                acc = acc + h_res[..., i:i+1, j:j+1] * x[..., j:j+1, :]
+            res_gather[..., i:i+1, :] = acc
+            
+        return res_gather + hp * f_out_flat
 
 
 class ModernBertEmbeddings(nn.Module):
