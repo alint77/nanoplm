@@ -336,9 +336,9 @@ class MHCLayer(nn.Module):
         # Learnable bias (float32 for stability)
         self.b = nn.Parameter(torch.zeros(m))
         # Per-part learnable scale factors
-        self.alpha_pre  = nn.Parameter(torch.ones(1))
-        self.alpha_post = nn.Parameter(torch.ones(1))
-        self.alpha_res  = nn.Parameter(torch.ones(1))
+        self.alpha_pre  = nn.Parameter(torch.full((1,), 0.01))
+        self.alpha_post = nn.Parameter(torch.full((1,), 0.01))
+        self.alpha_res  = nn.Parameter(torch.full((1,), 0.01))
 
         nn.init.normal_(self.phi, std=0.02)
 
@@ -356,7 +356,7 @@ class MHCLayer(nn.Module):
 
         # Paper Eq 5-6: matmul via cuBLAS + RMS norm (invr)
         invr = torch.rsqrt(x_mat.pow(2).float().mean(dim=-1) + self.rms_eps)  # (T,)
-        mix = (x_mat @ self.phi.to(x_mat.dtype)).float()  # (T, m) — NOT premultiplied by invr
+        mix = (x_mat @ self.phi.to(x_mat.dtype)).float()  # (T, m)
 
         # Paper Eq 7-10: fused Triton kernel for sigmoid + Sinkhorn
         h_pre, h_post, h_res = mhc_coeffs_fused(
