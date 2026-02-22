@@ -334,9 +334,9 @@ class MHCLayer(nn.Module):
         # Learnable bias (float32 for stability)
         self.b = nn.Parameter(torch.zeros(m))
         # Per-part learnable scale factors
-        self.alpha_pre  = nn.Parameter(torch.ones(1))
-        self.alpha_post = nn.Parameter(torch.ones(1))
-        self.alpha_res  = nn.Parameter(torch.ones(1))
+        self.alpha_pre  = nn.Parameter(torch.full((1,), 0.01))
+        self.alpha_post = nn.Parameter(torch.full((1,), 0.01))
+        self.alpha_res  = nn.Parameter(torch.full((1,), 0.01))
 
         nn.init.normal_(self.phi, std=0.02)
 
