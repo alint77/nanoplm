@@ -418,6 +418,17 @@ def pretrain():
     help="Enable NanoChat-style RMS QK normalization in attention",
 )
 @click.option(
+    "--use-mhc/--no-use-mhc",
+    default=False,
+    help="Enable multi-stream residual connections (Manifold-Constrained Hyper-Connections). Works only on pure-torch and only one of resid_lambdas or mHC should be enabled.",
+)
+@click.option(
+    "--mhc-n",
+    type=int,
+    default=4,
+    help="Number of residual streams for mHC",
+)
+@click.option(
     "--pure-torch",
     is_flag=True,
     default=False,
@@ -487,6 +498,8 @@ def run(
     use_resid_lambdas: bool,
     use_x0_lambdas: bool,
     use_qk_norm: bool,
+    use_mhc: bool,
+    mhc_n: int,
     pure_torch: bool,
     pure_te: bool,
 ):
@@ -553,6 +566,8 @@ def run(
         use_resid_lambdas=use_resid_lambdas,
         use_x0_lambdas=use_x0_lambdas,
         use_qk_norm=use_qk_norm,
+        use_mhc=use_mhc,
+        mhc_n=mhc_n,
     )
 
     if pure_torch and pure_te:
@@ -744,6 +759,9 @@ def get_yaml(output: Optional[str], force: bool):
         "  use_resid_lambdas: false  # scales residual stream per layer\n"
         "  use_x0_lambdas: false  # blends initial embedding x0 per layer\n"
         "  use_qk_norm: false  # applies RMS norm to Q/K in attention\n"
+        "  # mHC options (works only on pure-torch; only one of resid_lambdas or mHC should be enabled)\n"
+        "  use_mhc: false\n"
+        "  mhc_n: 4\n"
         "\n"
         "pretraining:\n"
         "  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)\n"

@@ -22,12 +22,10 @@ import triton.language as tl
 
 # ---------------------------------------------------------------------------
 # Manifold-Constrained Hyper-Connections (mHC) — POC flag
-# Set USE_MHC=True to enable multi-stream residual connections.
 # Only the residual-stream expansion is implemented; resid_lambdas and
 # x0_lambdas are assumed False.  See arXiv:2512.24880.
 # ---------------------------------------------------------------------------
-USE_MHC: bool = True
-MHC_N: int = 4  # number of residual streams (n in the paper)
+
 
 _HAS_FLASH_VARLEN = False
 _flash_varlen_fn = None
@@ -96,8 +94,9 @@ class ModernBertConfig:
     use_qk_norm: bool = False
     resid_lambda_init: float = 1.0
     x0_lambda_init: float = 0.1
-    # mHC settings (used only when USE_MHC=True at module level)
-    mhc_n: int = MHC_N  # number of residual streams
+    # mHC settings (works only on pure-torch; only one of resid_lambdas or mHC should be enabled)
+    use_mhc: bool = False
+    mhc_n: int = 4  # number of residual streams
 
     head_dim: int = field(init=False)
     sliding_window: int = field(init=False)
@@ -633,9 +632,9 @@ class ModernBertEncoderLayer(nn.Module):
     def __init__(self, config: ModernBertConfig, layer_idx: int):
         super().__init__()
         self.attention_type = config.layer_types[layer_idx]
-        self.use_mhc = USE_MHC
+        self.use_mhc = config.use_mhc
 
-        if USE_MHC:
+        if self.use_mhc:
             # Paper §3: the sublayer F operates at the FULL hidden_size C.
             # h_pre aggregates n streams → one C-dim vector fed into the
             # unmodified attention/MLP.  No inner_cfg needed.
@@ -709,7 +708,7 @@ class ModernBertModel(nn.Module):
     def __init__(self, config: ModernBertConfig):
         super().__init__()
         self.config = config
-        self.use_mhc = USE_MHC
+        self.use_mhc = config.use_mhc
         self.embeddings = ModernBertEmbeddings(config)
         self.layers = nn.ModuleList(
             [ModernBertEncoderLayer(config, i) for i in range(config.num_hidden_layers)]
@@ -906,8 +905,10 @@ class ModernBertForMaskedLM(nn.Module):
                     nn.init.zeros_(module.bias)
 
         for layer in self.model.layers:
-            if USE_MHC:
+            if self.config.use_mhc:
                 # Initialise the inner attn/MLP accessed via MHCLayer wrappers.
+                # In mHC variant, self.layer.mhc_attn.layer is the _NormedAttn
+                # which has a .attn member.
                 attn = layer.mhc_attn.layer.attn
                 mlp  = layer.mhc_mlp.layer.mlp
             else:
@@ -928,7 +929,7 @@ class ModernBertForMaskedLM(nn.Module):
             if mlp.Wo.bias is not None:
                 nn.init.zeros_(mlp.Wo.bias)
 
-            if USE_MHC:
+            if self.config.use_mhc:
                 # phi already initialised in MHCLayer.__init__ with normal_(0.02)
                 # b, alpha_* already set to zeros/ones; nothing extra needed here.
                 pass
