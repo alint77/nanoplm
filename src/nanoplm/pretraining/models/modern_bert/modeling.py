@@ -16,8 +16,12 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import triton
-import triton.language as tl
+
+from nanoplm.pretraining.models.modern_bert.triton_mhc import (
+    mhc_coeffs,
+    mhc_post_distribute,
+    mhc_pre_aggregate,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -235,45 +239,6 @@ def _position_ids_from_cu_seqlens(
     return torch.arange(total, device=device, dtype=torch.int32) - offsets
 
 
-# ---------------------------------------------------------------------------
-# mHC building blocks (pure PyTorch reference implementation)
-# ---------------------------------------------------------------------------
-
-
-def _mhc_sinkhorn_unrolled(logits: torch.Tensor, tmax: int = 20, eps: float = 1e-6) -> torch.Tensor:
-    # Extract streams
-    r0 = logits[..., 0:4]
-    r1 = logits[..., 4:8]
-    r2 = logits[..., 8:12]
-    r3 = logits[..., 12:16]
-
-    r0 = torch.exp(r0 - torch.amax(r0, dim=-1, keepdim=True))
-    r1 = torch.exp(r1 - torch.amax(r1, dim=-1, keepdim=True))
-    r2 = torch.exp(r2 - torch.amax(r2, dim=-1, keepdim=True))
-    r3 = torch.exp(r3 - torch.amax(r3, dim=-1, keepdim=True))
-
-    for _ in range(tmax):
-        # Unrolled sum for denominator
-        s0 = r0[..., 0:1] + r0[..., 1:2] + r0[..., 2:3] + r0[..., 3:4]
-        s1 = r1[..., 0:1] + r1[..., 1:2] + r1[..., 2:3] + r1[..., 3:4]
-        s2 = r2[..., 0:1] + r2[..., 1:2] + r2[..., 2:3] + r2[..., 3:4]
-        s3 = r3[..., 0:1] + r3[..., 1:2] + r3[..., 2:3] + r3[..., 3:4]
-
-        r0 = r0 / (s0 + eps)
-        r1 = r1 / (s1 + eps)
-        r2 = r2 / (s2 + eps)
-        r3 = r3 / (s3 + eps)
-
-        c = r0 + r1 + r2 + r3 + eps
-        r0 = r0 / c
-        r1 = r1 / c
-        r2 = r2 / c
-        r3 = r3 / c
-
-    # Stack or concat back optimally
-    return torch.cat([r0, r1, r2, r3], dim=-1).view(*logits.shape[:-1], 4, 4)
-
-
 class MHCLayer(nn.Module):
     """Manifold-Constrained Hyper-Connections wrapper (arXiv:2512.24880).
 
@@ -347,29 +312,18 @@ class MHCLayer(nn.Module):
         Uses self.n / self.c (fixed at construction) so torch.compile(dynamic=False)
         sees fully-static shapes in the coefficient computation graph.
         """
-        n, c = self.n, self.c
-        lead = x.shape[:-2]   # (T,) for varlen; (B,S) for SDPA
-        x_mat = x.reshape(-1, n * c)   # (T, k) keep in native precision (bfloat16)
-
-        # RMS-norm over the flattened dimension, calculate in float32 for stability
-        invr = torch.rsqrt(x_mat.pow(2).float().mean(dim=-1, keepdim=True) + self.rms_eps)
-        # Project using native precision, then scale.
-        mix  = (x_mat @ self.phi.to(x_mat.dtype)).float() * invr   # (T, m)
-
-        # Fused Splitting + Sigmoids + Sinkhorn iterations entirely in PyTorch for pure Dynamo integration
-        pre_logits  = mix[..., :n]     * self.alpha_pre.to(mix.dtype)  + self.b[:n].to(mix.dtype)
-        post_logits = mix[..., n:2*n]  * self.alpha_post.to(mix.dtype) + self.b[n:2*n].to(mix.dtype)
-        res_logits  = mix[..., 2*n:] * self.alpha_res.to(mix.dtype) + self.b[2*n:].to(mix.dtype)
-
-        h_pre  = torch.sigmoid(pre_logits.float()).to(x.dtype)
-        h_post = (torch.sigmoid(post_logits.float()) * self.post_mult).to(x.dtype)
-        h_res  = _mhc_sinkhorn_unrolled(res_logits.float(), self.tmax, self.sinkhorn_eps).to(x.dtype)
-
-        # Restore leading dims (no-op for varlen where lead=(T,) already)
-        h_pre  = h_pre.reshape(*lead, n)
-        h_post = h_post.reshape(*lead, n)
-        h_res  = h_res.reshape(*lead, n, n)
-        return h_pre, h_post, h_res
+        return mhc_coeffs(
+            x=x,
+            phi=self.phi,
+            alpha_pre=self.alpha_pre,
+            alpha_post=self.alpha_post,
+            alpha_res=self.alpha_res,
+            b=self.b,
+            tmax=self.tmax,
+            rms_eps=self.rms_eps,
+            sinkhorn_eps=self.sinkhorn_eps,
+            post_mult=self.post_mult,
+        )
 
     def forward(self, x: torch.Tensor, **layer_kwargs) -> torch.Tensor:
         """
@@ -383,25 +337,12 @@ class MHCLayer(nn.Module):
         h_pre, h_post, h_res = self._coeffs(x)
 
         # Pre-aggregate: h_pre-weighted sum over stream dim → (..., C) at full width
-        x_in = (x * h_pre.unsqueeze(-1)).sum(dim=-2)
+        x_in = mhc_pre_aggregate(x, h_pre)
 
         # Run sublayer on full-width single-stream input
         f_out = self.layer(x_in, **layer_kwargs)  # (..., C)
 
-        f_out_flat = f_out.unsqueeze(-2)  # (..., 1, C)
-        hp = h_post.unsqueeze(-1)         # (..., n, 1)
-
-        # Replaced custom Triton bmm with explicit loops. Inductor correctly parses
-        # and unrolls nested loops to form a single optimal pointwise fusion block 
-        # without exceeding internal XBLOCK sizing parameters.
-        res_gather = torch.zeros_like(x)
-        for i in range(self.n):
-            acc = 0.0
-            for j in range(self.n):
-                acc = acc + h_res[..., i:i+1, j:j+1] * x[..., j:j+1, :]
-            res_gather[..., i:i+1, :] = acc
-            
-        return res_gather + hp * f_out_flat
+        return mhc_post_distribute(x, f_out, h_post, h_res)
 
 
 class ModernBertEmbeddings(nn.Module):
