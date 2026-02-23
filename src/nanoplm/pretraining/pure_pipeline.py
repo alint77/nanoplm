@@ -249,20 +249,61 @@ def _make_pure_profiler(
 # FLOPs estimation
 # ---------------------------------------------------------------------------
 
-def _estimate_model_flops_per_token(
-    num_layers: int,
-    hidden_size: int,
-    intermediate_size: int,
-    seq_len: int,
-    vocab_size: int,
-) -> int:
-    """Training FLOPs per token (forward + ~2x backward)."""
-    per_layer = (
-        8 * hidden_size ** 2
-        + 4 * seq_len * hidden_size
-        + 6 * hidden_size * intermediate_size
-    )
-    forward_flops = num_layers * per_layer + 2 * vocab_size * hidden_size
+def _estimate_model_flops_per_token(config, seq_len: int) -> int:
+    """Training FLOPs per token (forward + backward ≈ 3× forward).
+
+    Each matmul contributes 2 FLOPs per element (multiply + accumulate) in forward.
+    Backward is ~2× forward for matmuls => total 6 FLOPs per matmul element.
+    Attention QK and AV matmuls scale with effective sequence length per layer
+    (capped by sliding window where applicable).
+
+    Ref: https://arxiv.org/abs/2204.02311 (PaLM)
+    Ref: https://medium.com/@dzmitrybahdanau/the-flops-calculus-of-language-model-training-3b19c1f025e4
+    """
+    h = config.hidden_size
+    ff = config.intermediate_size
+    n_layers = config.num_hidden_layers
+    V = config.vocab_size
+    n_heads = config.num_attention_heads
+    head_dim = h // n_heads
+    sliding_window = config.local_attention // 2
+
+    # -- Attention matmul FLOPs per layer (varies with window size) --
+    # QK matmul: (S, h) × (h, S) => 2*h*S FLOPs per token
+    # AV matmul: (S, S) × (S, h) => 2*h*S FLOPs per token
+    # Total: 4*h*effective_S per token per layer (forward only)
+    attn_flops = 0
+    for layer_type in config.layer_types:
+        if layer_type == "full_attention":
+            effective_seq = seq_len
+        else:
+            effective_seq = min(2 * sliding_window, seq_len)
+        attn_flops += 4 * h * effective_seq
+
+    # -- Attention projection FLOPs (same for all layers) --
+    # Wqkv: h -> 3h  => 2 * h * 3h = 6h²
+    # Wo:   h -> h    => 2 * h * h  = 2h²
+    # Total: 8h² per layer
+    attn_proj_flops = n_layers * 8 * h * h
+
+    # -- MLP FLOPs --
+    # swiglu/glu: Wi is h -> 2*ff, Wo is ff -> h => 2*h*2*ff + 2*ff*h = 6*h*ff
+    # srelu:      Wi is h -> ff,   Wo is ff -> h => 2*h*ff   + 2*ff*h = 4*h*ff
+    if config.mlp_activation == "srelu":
+        mlp_flops_per_layer = 4 * h * ff
+    else:
+        mlp_flops_per_layer = 6 * h * ff
+    mlp_flops = n_layers * mlp_flops_per_layer
+
+    # -- LM head (decoder): h -> V --
+    # Not counted when tied (it's the same weight as embedding), but the matmul
+    # still happens in forward, so we count it.
+    head_flops = 2 * V * h
+
+    # -- Prediction head dense: h -> h --
+    pred_head_flops = 2 * h * h
+
+    forward_flops = attn_proj_flops + attn_flops + mlp_flops + head_flops + pred_head_flops
     return 3 * forward_flops
 
 
@@ -890,10 +931,7 @@ def run_pure_pretraining(
     # ---- MFU estimation ----
     _raw = model if hasattr(model, "config") else getattr(model, "_orig_mod", model)
     _cfg = _raw.config
-    _flops_per_token = _estimate_model_flops_per_token(
-        _cfg.num_hidden_layers, _cfg.hidden_size, _cfg.intermediate_size,
-        manifest.max_seq_len, _cfg.vocab_size,
-    )
+    _flops_per_token = _estimate_model_flops_per_token(_cfg, manifest.max_seq_len)
     _peak_flops = H100_PEAK_TFLOPS * 1e12
     logger.info(f"MFU estimation: {_flops_per_token:,} training FLOPs/token, H100 peak = {H100_PEAK_TFLOPS} TFLOPS")
 

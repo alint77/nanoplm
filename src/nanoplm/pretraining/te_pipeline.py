@@ -548,13 +548,7 @@ def run_te_pretraining(
     )
 
     _mb_cfg = orig_model.config
-    _flops_per_token = _estimate_model_flops_per_token(
-        num_layers=_mb_cfg.num_hidden_layers,
-        hidden_size=_mb_cfg.hidden_size,
-        intermediate_size=_mb_cfg.intermediate_size,
-        seq_len=manifest.max_seq_len,
-        vocab_size=_mb_cfg.vocab_size,
-    )
+    _flops_per_token = _estimate_model_flops_per_token(_mb_cfg, manifest.max_seq_len)
     _peak_flops_per_gpu = H100_PEAK_TFLOPS * 1e12
     logger.info(
         f"MFU estimation: {_flops_per_token:,} training FLOPs/token, "

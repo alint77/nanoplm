@@ -36,6 +36,8 @@ if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
     except ImportError:
         pass
 
+USE_TRITON_SRELU = True
+
 if not _HAS_FLASH_VARLEN:
     try:
         # FA2 (Ampere+, RTX 30xx/40xx/50xx)
@@ -127,9 +129,9 @@ class ModernBertConfig:
         self.head_dim = self.hidden_size // self.num_attention_heads
         self.sliding_window = self.local_attention // 2
         self.mlp_activation = self.mlp_activation.lower()
-        if self.mlp_activation not in {"swiglu", "glu"}:
+        if self.mlp_activation not in {"swiglu", "glu", "srelu"}:
             raise ValueError(
-                f"Unsupported mlp_activation: {self.mlp_activation}. Supported: ['swiglu', 'glu']"
+                f"Unsupported mlp_activation: {self.mlp_activation}. Supported: ['swiglu', 'glu', 'srelu']"
             )
         self.canon_layer_set = _parse_canon_layers_mode(self.canon_layers_mode)
         if not self.use_canon_layers:
@@ -427,6 +429,52 @@ class ModernBertMLP(nn.Module):
         return self.Wo(self.drop(self.act(x_proj) * gate))
 
 
+class ModernBertSReluMLP(nn.Module):
+    """MLP using relu(x)^2 activation (no gating).
+
+    When USE_TRITON_SRELU is True, uses a fused Triton kernel for
+    relu(x @ Wi.T)^2 in a single pass.  Wo is stored as (intermediate, hidden)
+    to match the kernel layout (post @ Wo).
+
+    When USE_TRITON_SRELU is False, uses plain PyTorch ops for benchmarking.
+    """
+
+    def __init__(self, config: ModernBertConfig):
+        super().__init__()
+        self.Wi = nn.Linear(
+            config.hidden_size,
+            config.intermediate_size,
+            bias=config.mlp_bias,
+        )
+        self.Wo_weight = nn.Parameter(
+            torch.empty(config.intermediate_size, config.hidden_size)
+        )
+        self.Wo_bias = (
+            nn.Parameter(torch.zeros(config.hidden_size))
+            if config.mlp_bias
+            else None
+        )
+        self.drop = nn.Dropout(config.mlp_dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if USE_TRITON_SRELU:
+            from nanoplm.pretraining.models.modern_bert.triton_kernels import FusedLinearReLUSquare
+            out = FusedLinearReLUSquare.apply(x, self.Wi.weight, self.Wo_weight)
+        else:
+            h = F.relu(self.Wi(x))
+            h = h * h
+            out = h @ self.Wo_weight
+        if self.Wo_bias is not None:
+            out = out + self.Wo_bias
+        return self.drop(out)
+
+
 class ModernBertSwiGLUMLP(nn.Module):
     def __init__(self, config: ModernBertConfig):
         super().__init__()
@@ -614,11 +662,12 @@ class ModernBertEncoderLayer(nn.Module):
             if "c" in config.canon_layer_set
             else None
         )
-        self.mlp = (
-            ModernBertSwiGLUMLP(config)
-            if config.mlp_activation == "swiglu"
-            else ModernBertMLP(config)
-        )
+        if config.mlp_activation == "srelu":
+            self.mlp = ModernBertSReluMLP(config)
+        elif config.mlp_activation == "swiglu":
+            self.mlp = ModernBertSwiGLUMLP(config)
+        else:
+            self.mlp = ModernBertMLP(config)
 
     def forward(
         self,
@@ -858,7 +907,10 @@ class ModernBertForMaskedLM(nn.Module):
             nn.init.uniform_(layer.attn.Wqkv.weight, -bound, bound)
             nn.init.zeros_(layer.attn.Wo.weight)
             nn.init.uniform_(layer.mlp.Wi.weight, -bound, bound)
-            nn.init.zeros_(layer.mlp.Wo.weight)
+            if hasattr(layer.mlp, "Wo"):
+                nn.init.zeros_(layer.mlp.Wo.weight)
+            else:
+                nn.init.zeros_(layer.mlp.Wo_weight)
 
             if layer.attn.Wqkv.bias is not None:
                 nn.init.zeros_(layer.attn.Wqkv.bias)
@@ -866,8 +918,11 @@ class ModernBertForMaskedLM(nn.Module):
                 nn.init.zeros_(layer.attn.Wo.bias)
             if layer.mlp.Wi.bias is not None:
                 nn.init.zeros_(layer.mlp.Wi.bias)
-            if layer.mlp.Wo.bias is not None:
-                nn.init.zeros_(layer.mlp.Wo.bias)
+            if hasattr(layer.mlp, "Wo"):
+                if layer.mlp.Wo.bias is not None:
+                    nn.init.zeros_(layer.mlp.Wo.bias)
+            elif layer.mlp.Wo_bias is not None:
+                nn.init.zeros_(layer.mlp.Wo_bias)
 
         nn.init.uniform_(self.head.dense.weight, -bound, bound)
         if self.head.dense.bias is not None:
