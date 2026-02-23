@@ -116,14 +116,15 @@ class TEModernBertEncoderLayer(nn.Module):
             qk_norm_type="RMSNorm" if config.use_qk_norm else None,
         )
 
-        # Fused LayerNorm + FC1 + SwiGLU + FC2.
+        # Fused LayerNorm + FC1 + activation + FC2.
+        te_mlp_activation = "srelu" if config.mlp_activation == "srelu" else "swiglu"
         self.mlp = te.LayerNormMLP(
             hidden_size=config.hidden_size,
             ffn_hidden_size=config.intermediate_size,
             eps=config.norm_eps,
             bias=config.mlp_bias,
             normalization="RMSNorm",
-            activation="swiglu",
+            activation=te_mlp_activation,
             init_method=_init,
             output_layer_init_method=_output_init,
         )
