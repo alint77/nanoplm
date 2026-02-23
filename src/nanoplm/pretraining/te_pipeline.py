@@ -525,6 +525,8 @@ def run_te_pretraining(
             wandb_enabled = wandb.run is not None
             if wandb_enabled:
                 wandb.define_metric("train/global_step")
+                wandb.define_metric("time_elapsed_sec", step_metric="train/global_step", step_sync=True)
+                wandb.define_metric("train/time_elapsed_sec", step_metric="train/global_step", step_sync=True)
                 wandb.define_metric("*", step_metric="train/global_step", step_sync=True)
         except Exception as exc:
             logger.warning(f"W&B init failed, continuing without logging. Error: {exc}")
@@ -555,6 +557,7 @@ def run_te_pretraining(
         f"MFU estimation: {_flops_per_token:,} training FLOPs/token, "
         f"H100 peak = {H100_PEAK_TFLOPS} TFLOPS"
     )
+    _run_t0 = time.perf_counter()
 
     logger.info(
         "Starting Transformer Engine training: "
@@ -757,6 +760,7 @@ def run_te_pretraining(
                         )
                 if should_log and is_main:
                     waste_pct = (1.0 - tok / max(raw_tok, 1)) * 100
+                    wall_elapsed = time.perf_counter() - _run_t0
                     payload = {
                         "train/global_step": global_step,
                         "train/loss": loss_to_log,
@@ -767,7 +771,8 @@ def run_te_pretraining(
                         "train/step_real_tokens": int(tok),
                         "train/step_raw_tokens": int(raw_tok),
                         "train/packing_waste_pct": waste_pct,
-                        "train/dt": dt,
+                        "time_elapsed_sec": wall_elapsed,
+                        "train/time_elapsed_sec": wall_elapsed,
                     }
                     if muon_lr is not None:
                         payload["train/muon_lr"] = muon_lr

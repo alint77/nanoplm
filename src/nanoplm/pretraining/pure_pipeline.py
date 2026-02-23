@@ -908,6 +908,8 @@ def run_pure_pretraining(
             wandb_enabled = wandb.run is not None
             if wandb_enabled:
                 wandb.define_metric("train/global_step")
+                wandb.define_metric("time_elapsed_sec", step_metric="train/global_step", step_sync=True)
+                wandb.define_metric("train/time_elapsed_sec", step_metric="train/global_step", step_sync=True)
                 wandb.define_metric("*", step_metric="train/global_step", step_sync=True)
         except Exception as exc:
             logger.warning(f"W&B init failed, continuing without logging. Error: {exc}")
@@ -1131,11 +1133,12 @@ def run_pure_pretraining(
                 if should_log and is_main:
                     waste = (1.0 - tok / max(raw_tok, 1)) * 100
                     muon_str = f"muon_lr={muon_lr:.2e} " if muon_lr is not None else ""
+                    wall_elapsed = time.perf_counter() - _run_t0
                     logger.info(
                         f"[step {global_step}/{total_steps}] "
                         f"loss={avg_loss:.4f} lr={learning_rate:.2e} {muon_str}"
                         f"grad_norm={grad_norm_val:.4f} tok/s={tps:,} "
-                        f"dt={dt*1000:.2f}ms wall={time.perf_counter()-_run_t0:.1f}s waste={waste:.1f}% "
+                        f"dt={dt*1000:.2f}ms wall={wall_elapsed:.1f}s waste={waste:.1f}% "
                         f"h100_mfu={mfu:.2%} {vram_log}"
                     )
                     payload = {
@@ -1148,7 +1151,8 @@ def run_pure_pretraining(
                         "train/step_real_tokens": int(tok),
                         "train/step_raw_tokens": int(raw_tok),
                         "train/packing_waste_pct": waste,
-                        "train/dt": dt,
+                        "time_elapsed_sec": wall_elapsed,
+                        "train/time_elapsed_sec": wall_elapsed,
                     }
                     if muon_lr is not None:
                         payload["train/muon_lr"] = muon_lr
