@@ -917,15 +917,17 @@ def run_pure_pretraining(
     optimizer.zero_grad(set_to_none=True)
 
     global_step = start_step
-    accum_loss = torch.tensor(0.0, device=device)
+    accum_loss = torch.zeros((), device=device)
     window_loss = 0.0
     window_steps = 0
-    token_count = torch.tensor(0, dtype=torch.long, device=device)
-    raw_token_count = 0
+    token_count = torch.zeros((), dtype=torch.long, device=device)
+    raw_token_count = torch.zeros((), dtype=torch.long, device=device)
     token_t0: Optional[float] = None
+    have_tokens_since_log = False
     first_step_of_run = True
 
     epoch_setter = train_ds if use_packing else train_sampler
+    throughput_buf = torch.empty(3, device=device, dtype=torch.float32)
 
     profiler_ctx, profiler_step_cb = _make_pure_profiler(pretrain_config, output_dir, is_main)
 
@@ -943,45 +945,25 @@ def run_pure_pretraining(
                     has_batch = False
                     batch = None
 
-                # Token packing can still yield uneven batch counts per rank. If any rank
-                # runs out early, stop this epoch on all ranks to avoid collective deadlock.
-                if distributed and dist.is_initialized():
-                    has_batch_t = torch.tensor(
-                        1 if has_batch else 0,
-                        device=device,
-                        dtype=torch.int32,
-                    )
-                    dist.all_reduce(has_batch_t, op=dist.ReduceOp.MIN)
-                    if int(has_batch_t.item()) == 0:
-                        if is_main and micro_step + 1 < synced_len:
-                            logger.warning(
-                                "Ending epoch early at micro_step=%s due to uneven packed batches across ranks "
-                                "(configured=%s).",
-                                micro_step,
-                                synced_len,
-                            )
-                        break
-                elif not has_batch:
-                    break
-
                 if not has_batch:
                     break
 
                 if resume_micro_step > 0 and epoch == resume_epoch and micro_step < resume_micro_step:
                     continue
 
+                batch = _move_batch_to_device(batch, device)
+
                 if distributed and N_PREFETCH_LAYERS_FSDP2 > 1:
                     model.unshard()
-
-                batch = _move_batch_to_device(batch, device)
 
                 # FSDP2: only reduce-scatter gradients at accumulation boundaries
                 if distributed:
                     sync = (micro_step + 1) % inferred_grad_accum_steps == 0 or micro_step + 1 == synced_len
                     model.set_requires_gradient_sync(sync)
 
-                if raw_token_count == 0:
+                if not have_tokens_since_log:
                     token_t0 = time.perf_counter()
+                    have_tokens_since_log = True
 
                 # Token counting
                 if "num_valid_tokens" in batch:
@@ -1063,31 +1045,33 @@ def run_pure_pretraining(
                 profiler_step_cb(global_step)
                 window_loss += accum_loss.item()
                 window_steps += 1
-                accum_loss = torch.tensor(0.0, device=device)
-
-                # ---- Throughput / MFU ----
-                t1 = time.perf_counter()
-                elapsed = t1 - (token_t0 or t1)
-                tok, raw_tok = float(token_count.item()), float(raw_token_count)
-
-                if distributed and dist.is_initialized():
-                    buf = torch.tensor([tok, raw_tok, elapsed], device=device)
-                    dist.all_reduce(buf[:2], op=dist.ReduceOp.SUM)
-                    dist.all_reduce(buf[2:], op=dist.ReduceOp.MAX)
-                    tok, raw_tok, elapsed = buf[0].item(), buf[1].item(), buf[2].item()
-
-                tps = tok / max(elapsed, 1e-9)
-                raw_tps = raw_tok / max(elapsed, 1e-9)
-                mfu = (raw_tps * _flops_per_token / max(effective_world_size, 1)) / _peak_flops
-
-                token_count = torch.tensor(0, dtype=torch.long, device=device)
-                raw_token_count = 0
-                token_t0 = None
+                accum_loss.zero_()
 
                 # ---- Logging ----
                 should_log = global_step % logging_steps == 0
                 vram_log = ""
+                tps = raw_tps = mfu = tok = raw_tok = 0.0
                 if should_log:
+                    t1 = time.perf_counter()
+                    elapsed = t1 - (token_t0 or t1)
+                    throughput_buf[0] = token_count.to(dtype=torch.float32)
+                    throughput_buf[1] = raw_token_count.to(dtype=torch.float32)
+                    throughput_buf[2] = max(elapsed, 1e-9)
+                    if distributed and dist.is_initialized():
+                        dist.all_reduce(throughput_buf[:2], op=dist.ReduceOp.SUM)
+                        dist.all_reduce(throughput_buf[2:], op=dist.ReduceOp.MAX)
+                    tok = float(throughput_buf[0].item())
+                    raw_tok = float(throughput_buf[1].item())
+                    elapsed = float(throughput_buf[2].item())
+                    tps = tok / max(elapsed, 1e-9)
+                    raw_tps = raw_tok / max(elapsed, 1e-9)
+                    mfu = (raw_tps * _flops_per_token / max(effective_world_size, 1)) / _peak_flops
+
+                    token_count.zero_()
+                    raw_token_count.zero_()
+                    token_t0 = None
+                    have_tokens_since_log = False
+
                     vram_log = _format_vram_for_log(
                         device=device,
                         distributed=distributed,

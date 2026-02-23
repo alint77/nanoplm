@@ -587,17 +587,19 @@ def run_te_pretraining(
     optimizer.zero_grad(set_to_none=True)
 
     global_step = start_step
-    accum_loss = torch.tensor(0.0, device=device)
+    accum_loss = torch.zeros((), device=device)
     window_loss = 0.0
     window_steps = 0
 
     token_count = torch.tensor(0, dtype=torch.long, device=device)
-    raw_token_count = 0
+    raw_token_count = torch.zeros((), dtype=torch.long, device=device)
     token_t0: Optional[float] = None
+    have_tokens_since_log = False
     first_step_of_run = True
 
     # When packing, TokenPackingDataset holds the DistributedSampler; call set_epoch on it.
     _epoch_setter = train_ds if use_packing else train_sampler
+    throughput_buf = torch.empty(3, device=device, dtype=torch.float32)
 
     profiler_ctx, profiler_step_cb = _make_te_profiler(pretrain_config, output_dir, is_main)
 
@@ -615,37 +617,16 @@ def run_te_pretraining(
                     has_batch = False
                     batch = None
 
-                # Token packing can still yield uneven batch counts per rank. If any rank
-                # runs out early, stop this epoch on all ranks to avoid collective deadlock.
-                if distributed and dist.is_initialized():
-                    has_batch_t = torch.tensor(
-                        1 if has_batch else 0,
-                        device=device,
-                        dtype=torch.int32,
-                    )
-                    dist.all_reduce(has_batch_t, op=dist.ReduceOp.MIN)
-                    if int(has_batch_t.item()) == 0:
-                        if is_main and micro_step + 1 < synced_train_loader_len:
-                            logger.warning(
-                                "Ending epoch early at micro_step=%s due to uneven packed batches across ranks "
-                                "(configured=%s).",
-                                micro_step,
-                                synced_train_loader_len,
-                            )
-                        break
-                elif not has_batch:
-                    break
-
                 if not has_batch:
                     break
 
                 if resume_micro_step > 0 and epoch == resume_epoch and micro_step < resume_micro_step:
                     continue
 
+                batch = _move_batch_to_device(batch, device)
+
                 if distributed and N_PREFETCH_LAYERS_FSDP2 > 1:
                     model.unshard()
-
-                batch = _move_batch_to_device(batch, device)
 
                 # FSDP2: only reduce-scatter gradients at accumulation boundaries.
                 if distributed:
@@ -655,8 +636,9 @@ def run_te_pretraining(
                     )
                     model.set_requires_gradient_sync(_is_sync_step)
 
-                if raw_token_count == 0:
+                if not have_tokens_since_log:
                     token_t0 = time.perf_counter()
+                    have_tokens_since_log = True
 
                 if "num_valid_tokens" in batch:
                     token_count += batch["num_valid_tokens"]
@@ -737,40 +719,37 @@ def run_te_pretraining(
                 profiler_step_cb(global_step)
                 window_loss += accum_loss.item()
                 window_steps += 1
-                accum_loss = torch.tensor(0.0, device=device)
-
-                t1 = time.perf_counter()
-                if token_t0 is None:
-                    token_t0 = t1
-                elapsed = t1 - token_t0
-                tok = float(token_count.item())
-                raw_tok = float(raw_token_count)
-
-                if distributed and dist.is_initialized():
-                    tok_tensor = torch.tensor(tok, device=device)
-                    raw_tok_tensor = torch.tensor(raw_tok, device=device)
-                    elapsed_tensor = torch.tensor(float(elapsed), device=device)
-                    dist.all_reduce(tok_tensor, op=dist.ReduceOp.SUM)
-                    dist.all_reduce(raw_tok_tensor, op=dist.ReduceOp.SUM)
-                    dist.all_reduce(elapsed_tensor, op=dist.ReduceOp.MAX)
-                    tok = tok_tensor.item()
-                    raw_tok = raw_tok_tensor.item()
-                    elapsed = elapsed_tensor.item()
-
-                tokens_per_sec = tok / max(elapsed, 1e-9)
-                raw_tokens_per_sec = raw_tok / max(elapsed, 1e-9)
-
-                achieved_flops_per_sec = raw_tokens_per_sec * _flops_per_token
-                per_gpu_flops = achieved_flops_per_sec / max(effective_world_size, 1)
-                mfu = per_gpu_flops / _peak_flops_per_gpu
-
-                token_count = torch.tensor(0, dtype=torch.long, device=device)
-                raw_token_count = 0
-                token_t0 = None
+                accum_loss.zero_()
 
                 should_log = global_step % logging_steps == 0
                 vram_log = ""
+                tokens_per_sec = raw_tokens_per_sec = mfu = tok = raw_tok = 0.0
                 if should_log:
+                    t1 = time.perf_counter()
+                    if token_t0 is None:
+                        token_t0 = t1
+                    elapsed = t1 - token_t0
+                    throughput_buf[0] = token_count.to(dtype=torch.float32)
+                    throughput_buf[1] = raw_token_count.to(dtype=torch.float32)
+                    throughput_buf[2] = max(elapsed, 1e-9)
+                    if distributed and dist.is_initialized():
+                        dist.all_reduce(throughput_buf[:2], op=dist.ReduceOp.SUM)
+                        dist.all_reduce(throughput_buf[2:], op=dist.ReduceOp.MAX)
+                    tok = float(throughput_buf[0].item())
+                    raw_tok = float(throughput_buf[1].item())
+                    elapsed = float(throughput_buf[2].item())
+                    tokens_per_sec = tok / max(elapsed, 1e-9)
+                    raw_tokens_per_sec = raw_tok / max(elapsed, 1e-9)
+
+                    achieved_flops_per_sec = raw_tokens_per_sec * _flops_per_token
+                    per_gpu_flops = achieved_flops_per_sec / max(effective_world_size, 1)
+                    mfu = per_gpu_flops / _peak_flops_per_gpu
+
+                    token_count.zero_()
+                    raw_token_count.zero_()
+                    token_t0 = None
+                    have_tokens_since_log = False
+
                     vram_log = _format_vram_for_log(
                         device=device,
                         distributed=distributed,
