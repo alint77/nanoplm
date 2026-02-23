@@ -9,6 +9,7 @@ The model is intentionally small and readable:
 
 from __future__ import annotations
 
+import itertools
 import math
 from dataclasses import dataclass, field
 from typing import Optional
@@ -97,6 +98,7 @@ class ModernBertConfig:
     # mHC settings (works only on pure-torch; only one of resid_lambdas or mHC should be enabled)
     use_mhc: bool = False
     mhc_n: int = 4  # number of residual streams
+    mhc_residual_mode: str = "sinkhorn"  # "sinkhorn" (mHC) or "lite" (mHC-lite)
 
     head_dim: int = field(init=False)
     sliding_window: int = field(init=False)
@@ -116,6 +118,11 @@ class ModernBertConfig:
         if self.mlp_activation not in {"swiglu", "glu"}:
             raise ValueError(
                 f"Unsupported mlp_activation: {self.mlp_activation}. Supported: ['swiglu', 'glu']"
+            )
+        self.mhc_residual_mode = self.mhc_residual_mode.lower()
+        if self.mhc_residual_mode not in {"sinkhorn", "lite"}:
+            raise ValueError(
+                f"Unsupported mhc_residual_mode: {self.mhc_residual_mode}. Supported: ['sinkhorn', 'lite']"
             )
         self.layer_types = [
             "full_attention" if i % attn_stride == 0 else "sliding_attention"
@@ -274,6 +281,24 @@ def _mhc_sinkhorn_unrolled(logits: torch.Tensor, tmax: int = 20, eps: float = 1e
     return torch.cat([r0, r1, r2, r3], dim=-1).view(*logits.shape[:-1], 4, 4)
 
 
+def _mhc_sinkhorn_generic(logits: torch.Tensor, n: int, tmax: int = 20, eps: float = 1e-6) -> torch.Tensor:
+    mat = logits.reshape(*logits.shape[:-1], n, n)
+    mat = torch.exp(mat - torch.amax(mat, dim=-1, keepdim=True))
+    for _ in range(tmax):
+        mat = mat / (mat.sum(dim=-1, keepdim=True) + eps)
+        mat = mat / (mat.sum(dim=-2, keepdim=True) + eps)
+    return mat
+
+
+def _mhc_permutation_matrices(n: int) -> torch.Tensor:
+    if n < 1:
+        raise ValueError(f"mhc_n must be >= 1, got {n}")
+    perms = list(itertools.permutations(range(n)))
+    index = torch.tensor(perms, dtype=torch.long)
+    eye = torch.eye(n, dtype=torch.float32)
+    return eye[index]
+
+
 class MHCLayer(nn.Module):
     """Manifold-Constrained Hyper-Connections wrapper (arXiv:2512.24880).
 
@@ -286,8 +311,9 @@ class MHCLayer(nn.Module):
     - The state ``x ∈ R^{n×C}`` has n streams each of size hidden_size.
     - Pre-aggregation ``h_pre @ x → (1, C)`` feeds the sublayer at full width.
     - The sublayer is identical to the baseline (no parameter reduction).
-    - Only the routing projections (phi) are added: phi ∈ R^{nC × (n²+2n)},
-      which is negligible overhead (e.g. 3072×24 for n=4, C=768).
+    - Only the routing projections (phi) are added:
+      - sinkhorn mode (mHC): ``phi ∈ R^{nC × (n²+2n)}``
+      - lite mode (mHC-lite): ``phi ∈ R^{nC × (n!+2n)}``
 
     Forward:
         1. Compute routing coefficients from the flattened n×C state via
@@ -301,6 +327,7 @@ class MHCLayer(nn.Module):
         n:          Number of residual streams (``MHC_N``).
         c:          Full per-stream channel dimension (= ``hidden_size``).
         tmax:       Sinkhorn-Knopp iterations (default 20).
+        residual_mode: Residual mixing mode: ``sinkhorn`` (mHC) or ``lite`` (mHC-lite).
         rms_eps:    Epsilon for RMS normalisation of the flattened state.
         sinkhorn_eps: Epsilon inside Sinkhorn iterations.
         post_mult:  Scale applied to ``h_post`` after sigmoid (default 2).
@@ -312,6 +339,7 @@ class MHCLayer(nn.Module):
         n: int,
         c: int,
         tmax: int = 20,
+        residual_mode: str = "sinkhorn",
         rms_eps: float = 1e-6,
         sinkhorn_eps: float = 1e-6,
         post_mult: float = 2.0,
@@ -321,23 +349,59 @@ class MHCLayer(nn.Module):
         self.n = n
         self.c = c
         self.tmax = tmax
+        self.residual_mode = residual_mode.lower()
         self.rms_eps = rms_eps
         self.sinkhorn_eps = sinkhorn_eps
         self.post_mult = post_mult
 
-        k = n * c            # flattened stream dimension
-        m = n * n + 2 * n    # total routing outputs: h_res (n²) + h_pre (n) + h_post (n)
+        if self.residual_mode not in {"sinkhorn", "lite"}:
+            raise ValueError(
+                f"Unsupported mHC residual mode '{self.residual_mode}'. "
+                "Expected one of: ['sinkhorn', 'lite']."
+            )
 
-        # Learnable projection: flattened stream → routing logits
-        self.phi = nn.Parameter(torch.empty(k, m))
-        # Learnable bias (float32 for stability)
+        k = n * c  # flattened stream dimension
+        if self.residual_mode == "sinkhorn":
+            self.num_res_coeffs = n * n
+            self.register_buffer("perm_mats", torch.empty(0), persistent=False)
+        else:
+            self.num_res_coeffs = math.factorial(n)
+            self.register_buffer("perm_mats", _mhc_permutation_matrices(n), persistent=False)
+        m = self.num_res_coeffs + 2 * n  # h_res + h_pre + h_post
+
+        # Learnable projection: flattened stream → routing logits.
+        # DeepSeek mHC (sinkhorn): phi uses standard normal init (tfloat32 in paper).
+        # mHC-lite: phi zero-initialized so block = identity residual at init.
+        self.phi = nn.Parameter(torch.zeros(k, m))
+        if self.residual_mode == "sinkhorn":
+            nn.init.normal_(self.phi, std=0.02)
+
+        # Learnable bias (float32 for stability).
         self.b = nn.Parameter(torch.zeros(m))
-        # Per-part learnable scale factors
+        # Per-part learnable scale factors; both papers initialise all to 0.01.
         self.alpha_pre  = nn.Parameter(torch.full((1,), 0.01))
         self.alpha_post = nn.Parameter(torch.full((1,), 0.01))
         self.alpha_res  = nn.Parameter(torch.full((1,), 0.01))
 
-        nn.init.normal_(self.phi, std=0.02)
+        # Bias initialisation — both mHC papers agree on "identity at init":
+        # b_pre and b_post: all -1 except stream-0 entry = +1.
+        with torch.no_grad():
+            self.b[:n].fill_(-1.0)
+            self.b[0] = 1.0          # b_pre identity stream
+            self.b[n:2 * n].fill_(-1.0)
+            self.b[n] = 1.0          # b_post identity stream
+
+            if self.residual_mode == "sinkhorn":
+                # DeepSeek mHC §A: b_res diagonal → 0, off-diagonal → -8.
+                # After exp() inside SK this approximates the identity matrix.
+                self.b[2 * n :].fill_(-8.0)
+                for i in range(n):
+                    self.b[2 * n + i * n + i] = 0.0
+            else:
+                # mHC-lite §5: identity permutation entry → 0, all others → -8.
+                # After softmax() weights concentrate on the identity permutation.
+                self.b[2 * n :].fill_(-8.0)
+                self.b[2 * n] = 0.0  # identity perm is first in itertools.permutations
 
     # ------------------------------------------------------------------
 
@@ -351,19 +415,32 @@ class MHCLayer(nn.Module):
         lead = x.shape[:-2]   # (T,) for varlen; (B,S) for SDPA
         x_mat = x.reshape(-1, n * c)   # (T, k) keep in native precision (bfloat16)
 
-        # RMS-norm over the flattened dimension, calculate in float32 for stability
+        # Both mHC papers use the same fused kernel structure (DeepSeek mHC eq:fuse:5-7):
+        #   raw = x̂ @ phi            (project in native dtype)
+        #   r   = rms(x̂)             (scalar per token, float32)
+        #   mix = (1/r) * α * raw + b
+        # Dividing the projected output by rms(x̂) is algebraically equivalent to
+        # projecting the RMSNorm'd input, but avoids materialising a large float32
+        # (T, k) intermediate — only (T, 1) invr and (T, m) mix are needed.
         invr = torch.rsqrt(x_mat.pow(2).float().mean(dim=-1, keepdim=True) + self.rms_eps)
-        # Project using native precision, then scale.
-        mix  = (x_mat @ self.phi.to(x_mat.dtype)).float() * invr   # (T, m)
+        mix = (x_mat @ self.phi.to(x_mat.dtype)).float() * invr       # (T, m)
 
-        # Fused Splitting + Sigmoids + Sinkhorn iterations entirely in PyTorch for pure Dynamo integration
+        # Fused splitting + coefficient transforms for pure Dynamo integration.
         pre_logits  = mix[..., :n]     * self.alpha_pre.to(mix.dtype)  + self.b[:n].to(mix.dtype)
         post_logits = mix[..., n:2*n]  * self.alpha_post.to(mix.dtype) + self.b[n:2*n].to(mix.dtype)
         res_logits  = mix[..., 2*n:] * self.alpha_res.to(mix.dtype) + self.b[2*n:].to(mix.dtype)
 
         h_pre  = torch.sigmoid(pre_logits.float()).to(x.dtype)
         h_post = (torch.sigmoid(post_logits.float()) * self.post_mult).to(x.dtype)
-        h_res  = _mhc_sinkhorn_unrolled(res_logits.float(), self.tmax, self.sinkhorn_eps).to(x.dtype)
+        if self.residual_mode == "sinkhorn":
+            if n == 4 and self.num_res_coeffs == 16:
+                h_res = _mhc_sinkhorn_unrolled(res_logits.float(), self.tmax, self.sinkhorn_eps)
+            else:
+                h_res = _mhc_sinkhorn_generic(res_logits.float(), n, self.tmax, self.sinkhorn_eps)
+        else:
+            res_coeff = torch.softmax(res_logits.float(), dim=-1)
+            h_res = torch.einsum("...r,rij->...ij", res_coeff, self.perm_mats.to(res_coeff.device))
+        h_res = h_res.to(x.dtype)
 
         # Restore leading dims (no-op for varlen where lead=(T,) already)
         h_pre  = h_pre.reshape(*lead, n)
@@ -652,8 +729,18 @@ class ModernBertEncoderLayer(nn.Module):
                 if config.mlp_activation == "swiglu"
                 else ModernBertMLP(config)
             )
-            self.mhc_attn = MHCLayer(_NormedAttn(attn_norm, attn), n=n, c=c)
-            self.mhc_mlp  = MHCLayer(_NormedMLP(mlp_norm, mlp),   n=n, c=c)
+            self.mhc_attn = MHCLayer(
+                _NormedAttn(attn_norm, attn),
+                n=n,
+                c=c,
+                residual_mode=config.mhc_residual_mode,
+            )
+            self.mhc_mlp  = MHCLayer(
+                _NormedMLP(mlp_norm, mlp),
+                n=n,
+                c=c,
+                residual_mode=config.mhc_residual_mode,
+            )
         else:
             self.attn_norm = (
                 nn.Identity()

@@ -46,6 +46,7 @@ class ProtModernBertMLMConfig:
     # mHC settings (works only on pure-torch; only one of resid_lambdas or mHC should be enabled)
     use_mhc: bool = False
     mhc_n: int = 4
+    mhc_residual_mode: str = "sinkhorn"
 
 class ProtModernBertMLM(ModernBertForMaskedLM):
 

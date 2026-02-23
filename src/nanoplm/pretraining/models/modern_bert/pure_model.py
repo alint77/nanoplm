@@ -64,6 +64,7 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             x0_lambda_init=config.x0_lambda_init,
             use_mhc=config.use_mhc,
             mhc_n=config.mhc_n,
+            mhc_residual_mode=config.mhc_residual_mode,
         )
 
         super().__init__(mb_config)
@@ -101,6 +102,7 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             x0_lambda_init=config.x0_lambda_init,
             use_mhc=config.use_mhc,
             mhc_n=config.mhc_n,
+            mhc_residual_mode=config.mhc_residual_mode,
         )
 
         super().__init__(mb_config)

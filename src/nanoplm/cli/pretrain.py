@@ -429,6 +429,12 @@ def pretrain():
     help="Number of residual streams for mHC",
 )
 @click.option(
+    "--mhc-residual-mode",
+    type=click.Choice(["sinkhorn", "lite"], case_sensitive=False),
+    default="sinkhorn",
+    help="Residual mixing mode for mHC: 'sinkhorn' (mHC) or 'lite' (mHC-lite)",
+)
+@click.option(
     "--pure-torch",
     is_flag=True,
     default=False,
@@ -500,6 +506,7 @@ def run(
     use_qk_norm: bool,
     use_mhc: bool,
     mhc_n: int,
+    mhc_residual_mode: str,
     pure_torch: bool,
     pure_te: bool,
 ):
@@ -568,6 +575,7 @@ def run(
         use_qk_norm=use_qk_norm,
         use_mhc=use_mhc,
         mhc_n=mhc_n,
+        mhc_residual_mode=mhc_residual_mode,
     )
 
     if pure_torch and pure_te:
@@ -762,6 +770,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  # mHC options (works only on pure-torch; only one of resid_lambdas or mHC should be enabled)\n"
         "  use_mhc: false\n"
         "  mhc_n: 4\n"
+        "  mhc_residual_mode: \"lite\"  # \"sinkhorn\" (mHC) or \"lite\" (mHC-lite)\n"
         "\n"
         "pretraining:\n"
         "  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)\n"
