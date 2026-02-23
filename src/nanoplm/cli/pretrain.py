@@ -141,6 +141,11 @@ def pretrain():
     help="Weight decay"
 )
 @click.option(
+    "--gradient-clipping/--no-gradient-clipping",
+    default=True,
+    help="Enable gradient clipping with max norm 1.0",
+)
+@click.option(
     "--warmup-steps",
     type=int,
     default=350,
@@ -444,6 +449,7 @@ def run(
     num_epochs: int,
     learning_rate: float,
     weight_decay: float,
+    gradient_clipping: bool,
     warmup_steps: int,
     lr_decay_to_fraction: float,
     lr_schedule: str,
@@ -507,6 +513,7 @@ def run(
         num_epochs=num_epochs,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
+        max_grad_norm=1.0 if gradient_clipping else float("inf"),
         warmup_steps=warmup_steps,
         lr_decay_to_fraction=lr_decay_to_fraction,
         lr_schedule=lr_schedule,
@@ -788,6 +795,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
         "  learning_rate: 1e-4  # AdamW LR (Muon uses muon_learning_rate)\n"
+        "  max_grad_norm: 1.0  # set to .inf (equivalent to float(\"inf\")) to disable clipping\n"
         "  warmup_steps: 350\n"
         "  lr_decay_to_fraction: 0.1\n"
         "  lr_schedule: \"Linear\" # Linear or Cosine \n" 
@@ -893,6 +901,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
     float_fields = [
         "learning_rate",
         "weight_decay",
+        "max_grad_norm",
         "adam_beta1",
         "adam_beta2",
         "adam_epsilon",
@@ -902,12 +911,38 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         "muon_eps",
         "min_lr",
     ]
+
+    def _parse_float_like(raw_value: Any, field_name: str) -> float:
+        if not isinstance(raw_value, str):
+            return float(raw_value)
+
+        stripped = raw_value.strip().lower()
+        if stripped in {
+            'float("inf")',
+            "float('inf')",
+            "inf",
+            "+inf",
+            "infinity",
+            "+infinity",
+            ".inf",
+        }:
+            return float("inf")
+        if stripped in {
+            'float("-inf")',
+            "float('-inf')",
+            "-inf",
+            "-infinity",
+            "-.inf",
+        }:
+            return float("-inf")
+        try:
+            return float(raw_value)
+        except ValueError as exc:
+            raise ValueError(f"Invalid {field_name} value: {raw_value}. Must be a number.") from exc
+
     for field in float_fields:
-        if isinstance(kwargs.get(field), str):
-            try:
-                kwargs[field] = float(kwargs[field])
-            except ValueError as exc:
-                raise ValueError(f"Invalid {field} value: {kwargs[field]}. Must be a number.") from exc
+        if field in kwargs and kwargs[field] is not None:
+            kwargs[field] = _parse_float_like(kwargs[field], field)
 
     # Ensure warmup_steps is int (YAML may load as int or float).
     if "warmup_steps" in kwargs and kwargs["warmup_steps"] is not None:

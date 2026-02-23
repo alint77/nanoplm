@@ -219,6 +219,8 @@ class PretrainingConfig:
     adam_epsilon: float = 1e-8
     learning_rate: float = 1e-3
     weight_decay: float = 0.0
+    # Gradient clipping threshold (L2 norm). Set float("inf") to disable clipping.
+    max_grad_norm: float = 1.0
     # Muon-specific hyperparameters (used only when optimizer == "muon" or "normuon").
     # Plain learning_rate/weight_decay/adam_* are used for the AdamW sub-optimizer.
     muon_learning_rate: float = 2e-2
@@ -571,6 +573,7 @@ def run_pretraining(
         "num_train_epochs": num_epochs,
         "learning_rate": pretrain_config.learning_rate,
         "weight_decay": pretrain_config.weight_decay,
+        "max_grad_norm": pretrain_config.max_grad_norm,
         "logging_strategy": "steps",
         "logging_steps": logging_steps,
         "logging_dir": Path(output_dir) / "logs",

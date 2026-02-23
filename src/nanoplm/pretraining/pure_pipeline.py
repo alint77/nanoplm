@@ -816,6 +816,11 @@ def run_pure_pretraining(
         f"Precision config: bf16={use_bf16}, fp16={use_fp16}, "
         f"tf32={(pretrain_config.tf32 and device.type == 'cuda')}, fp8={pretrain_config.fp8}"
     )
+    max_grad_norm = float(pretrain_config.max_grad_norm)
+    logger.info(
+        "Gradient clipping: "
+        f"{'disabled (max_grad_norm=inf)' if math.isinf(max_grad_norm) else f'max_grad_norm={max_grad_norm}'}"
+    )
 
     # ---- Training loop ----
     model.train()
@@ -939,7 +944,8 @@ def run_pure_pretraining(
             # Optimizer step
             if scaler is not None and scaler.is_enabled():
                 scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
+            grad_norm_t = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            grad_norm = grad_norm_t.item() if isinstance(grad_norm_t, torch.Tensor) else float(grad_norm_t)
 
             step_skipped = False
             if scaler is not None and scaler.is_enabled():
