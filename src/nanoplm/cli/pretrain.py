@@ -112,14 +112,14 @@ def pretrain():
 @click.option(
     "--ckp-dir",
     type=str,
-    default="output/pretraining",
+    default="output/pretraining_checkpoints",
     help="Checkpoint directory"
 )
 # Training hyperparameters
 @click.option(
     "--micro-batch-size",
     type=int,
-    default=32,
+    default=64,
     help="Per-device micro-batch size (samples per GPU per forward pass)",
 )
 @click.option(
@@ -142,13 +142,13 @@ def pretrain():
 )
 @click.option(
     "--gradient-clipping/--no-gradient-clipping",
-    default=True,
+    default=False,
     help="Enable gradient clipping with max norm 1.0",
 )
 @click.option(
     "--warmup-steps",
     type=int,
-    default=350,
+    default=302,
     help="Number of warmup steps"
 )
 @click.option(
@@ -160,19 +160,19 @@ def pretrain():
 @click.option(
     "--lr-schedule",
     type=click.Choice(["linear", "cosine"], case_sensitive=False),
-    default="Linear",
+    default="cosine",
     help="Learning rate schedule to use after warmup"
 )
 @click.option(
     "--global-batch-size",
     type=int,
-    default=2 ** 20,
+    default=256000,
     help="Target tokens per optimizer step (grad_accum inferred automatically)",
 )
 @click.option(
     "--optimizer",
     type=click.Choice(["adamw", "stable_adamw", "muon", "normuon"], case_sensitive=False),
-    default="adamw",
+    default="normuon",
     help="Optimizer to use"
 )
 @click.option(
@@ -212,7 +212,7 @@ def pretrain():
 )
 @click.option(
     "--muon-use-polar-express/--no-muon-use-polar-express",
-    default=False,
+    default=True,
     help="Use Polar Express orthogonalization for Muon/NorMuon (used only when optimizer=muon or normuon)",
 )
 @click.option(
@@ -283,7 +283,7 @@ def pretrain():
 @click.option(
     "--num-workers",
     type=Union[int, str],
-    default=None,
+    default="auto",
     help="Number of DataLoader workers. Use 'auto' to use all available CPUs"
 )
 @click.option(
@@ -294,12 +294,12 @@ def pretrain():
 )
 @click.option(
     "--use-packing/--no-packing",
-    default=False,
+    default=True,
     help="Enable sequence packing to eliminate padding waste (requires flash attention)"
 )
 @click.option(
     "--use-static-inp-size/--no-use-static-inp-size",
-    default=False,
+    default=True,
     help="When packing is enabled, use fixed flat token size + bucketed cu_seqlens/max_seqlen for static-shape execution",
 )
 @click.option(
@@ -320,13 +320,13 @@ def pretrain():
 @click.option(
     "--multi-gpu",
     is_flag=True,
-    default=False,
+    default=True,
     help="Enable multi-GPU training"
 )
 @click.option(
     "--world-size",
     type=str,
-    default="1",
+    default="auto",
     help="Total number of processes for distributed training; use 'auto' to use all available GPUs"
 )
 @click.option(
@@ -339,25 +339,25 @@ def pretrain():
 @click.option(
     "--hidden-size",
     type=int,
-    default=1024,
+    default=768,
     help="Model hidden size"
 )
 @click.option(
     "--intermediate-size",
     type=int,
-    default=2048,
+    default=1536,
     help="Intermediate (FFN) size",
 )
 @click.option(
     "--num-hidden-layers",
     type=int,
-    default=16,
+    default=12,
     help="Number of transformer layers",
 )
 @click.option(
     "--num-attention-heads",
     type=int,
-    default=16,
+    default=8,
     help="Number of attention heads",
 )
 @click.option(
@@ -404,12 +404,12 @@ def pretrain():
 )
 @click.option(
     "--use-resid-lambdas/--no-use-resid-lambdas",
-    default=False,
+    default=True,
     help="Enable per-layer residual scaling (resid_lambdas)",
 )
 @click.option(
     "--use-x0-lambdas/--no-use-x0-lambdas",
-    default=False,
+    default=True,
     help="Enable per-layer x0 shortcut scaling (x0_lambdas)",
 )
 @click.option(
@@ -419,13 +419,13 @@ def pretrain():
 )
 @click.option(
     "--use-canon-layers/--no-use-canon-layers",
-    default=False,
+    default=True,
     help="Enable bidirectional Canon-ABCD local mixing layers (pure-torch path only)",
 )
 @click.option(
     "--canon-layers-mode",
     type=str,
-    default="abcd",
+    default="ac",
     help="Subset of Canon insertion points to enable (A/B/C/D), e.g. 'abcd' or 'ac'",
 )
 @click.option(
@@ -754,10 +754,10 @@ def get_yaml(output: Optional[str], force: bool):
         "# This will generate binary shards and a .data_manifest file.\n"
         "\n"
         "model:\n"
-        "  hidden_size: 1024\n"
-        "  intermediate_size: 2048\n"
-        "  num_hidden_layers: 16\n"
-        "  num_attention_heads: 16\n"
+        "  hidden_size: 768\n"
+        "  intermediate_size: 1536\n"
+        "  num_hidden_layers: 12\n"
+        "  num_attention_heads: 8\n"
         "  vocab_size: 32\n"
         "  mlp_activation: \"swiglu\"\n"
         "  mlp_dropout: 0.0\n"
@@ -766,11 +766,11 @@ def get_yaml(output: Optional[str], force: bool):
         "  attention_dropout: 0.0\n"
         "  classifier_activation: \"gelu\"\n"
         "  # The options below only work on pure-torch and TE pipelines\n"
-        "  use_resid_lambdas: false  # scales residual stream per layer\n"
-        "  use_x0_lambdas: false  # blends initial embedding x0 per layer\n"
+        "  use_resid_lambdas: true  # scales residual stream per layer\n"
+        "  use_x0_lambdas: true  # blends initial embedding x0 per layer\n"
         "  use_qk_norm: false  # applies RMS norm to Q/K in attention\n"
-        "  use_canon_layers: false  # enables bidirectional Canon-ABCD (pure_torch only)\n"
-        "  canon_layers_mode: \"abcd\"  # subset of Canon sites: A/B/C/D (e.g. \"ac\" for lighter mode)\n"
+        "  use_canon_layers: true  # enables bidirectional Canon-ABCD (pure_torch only)\n"
+        "  canon_layers_mode: \"ac\"  # subset of Canon sites: A/B/C/D (e.g. \"ac\" for lighter mode)\n"
         "\n"
         "pretraining:\n"
         "  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)\n"
@@ -785,8 +785,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  #   global_batch_size: total tokens per optimizer step across all GPUs\n"
         "  #   gradient_accumulation_steps is inferred automatically:\n"
         "  #     grad_accum = ceil(global_batch_size / (micro_batch_size * max_seq_len * num_gpus))\n"
-        "  micro_batch_size: 32\n"
-        "  global_batch_size: 1048576  # 2^20 ≈ 1M tokens/step (based on PLM best practices)\n"
+        "  micro_batch_size: 64\n"
+        "  global_batch_size: 256000  # 2^20 ≈ 1M tokens/step (based on PLM best practices)\n"
         "  num_epochs: 10\n"
         "\n"
         "  optimizer: \"normuon\"  # adamw, stable_adamw, muon, normuon\n"
@@ -795,16 +795,16 @@ def get_yaml(output: Optional[str], force: bool):
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
         "  learning_rate: 1e-4  # AdamW LR (Muon uses muon_learning_rate)\n"
-        "  max_grad_norm: 1.0  # set to .inf (equivalent to float(\"inf\")) to disable clipping\n"
-        "  warmup_steps: 350\n"
+        "  max_grad_norm: .inf  # set to .inf (equivalent to float(\"inf\")) to disable clipping\n"
+        "  warmup_steps: 302\n"
         "  lr_decay_to_fraction: 0.1\n"
-        "  lr_schedule: \"Linear\" # Linear or Cosine \n" 
+        "  lr_schedule: \"cosine\" # Linear or Cosine \n" 
         "  weight_decay: 0.0\n"
         "  # Muon/NorMuon hyperparameters (used only when optimizer: muon or normuon)\n"
         "  muon_learning_rate: 1e-3\n"
         "  muon_weight_decay: 0.01\n"
         "  muon_cautious_weight_decay: true\n"
-        "  muon_use_polar_express: false\n"
+        "  muon_use_polar_express: true\n"
         "  muon_momentum: 0.95\n"
         "  muon_nesterov: true\n"
         "  muon_eps: 1e-7\n"
@@ -822,7 +822,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  # padding waste and increase GPU utilization. Requires flash attention and --pure-torch/--pure-te\n"
         "  use_packing: true\n"
         "  # Experimental throughput optimization: with packing, enables static input sizes which enables the use of torch.compile(dynamic=False) and cudagraphs\n"
-        "  use_static_inp_size: false \n"
+        "  use_static_inp_size: true \n"
         "\n"
         "  # Mixed precision training (recommended: keep enabled for 1.5-3x speedup)\n"
         "  # When bf16 is true, automatically selects the best precision for your hardware:\n"
@@ -833,10 +833,10 @@ def get_yaml(output: Optional[str], force: bool):
         "  bf16: true\n"
         "  tf32: true  # TF32 mode on Ampere+ CUDA GPUs only (automatically not used on MPS/CPU)\n"
         "             # Provides 3x faster fp32 matmuls with negligible precision loss\n"
-        "  fp8: true  # Enable FP8 Linear matmuls in pure_torch/pure_te paths (CUDA, best on H100+)\n"
+        "  fp8: false  # Enable FP8 Linear matmuls in pure_torch/pure_te paths (CUDA, best on H100+)\n"
         "\n"
-        "  multi_gpu: false\n"
-        "  world_size: 1  # Use \"auto\" if you want to use all available GPUs\n"
+        "  multi_gpu: true\n"
+        "  world_size: 'auto'  # Use \"auto\" if you want to use all available GPUs\n"
         "  project_name: \"nanoplm-pretraining\"\n"
         "\n"
         "resume:\n"

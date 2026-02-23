@@ -149,10 +149,10 @@ data_dirs:
 # This will generate the HDF5 shards and a .data_manifest file.
 
 model:
-  hidden_size: 1024
-  intermediate_size: 2048
-  num_hidden_layers: 16
-  num_attention_heads: 16
+  hidden_size: 768
+  intermediate_size: 1536
+  num_hidden_layers: 12
+  num_attention_heads: 8
   vocab_size: 32
   mlp_activation: "swiglu"
   mlp_dropout: 0.0
@@ -160,6 +160,12 @@ model:
   attention_bias: false
   attention_dropout: 0.0
   classifier_activation: "gelu"
+  # The options below only work on pure-torch and TE pipelines
+  use_resid_lambdas: true  # scales residual stream per layer
+  use_x0_lambdas: true  # blends initial embedding x0 per layer
+  use_qk_norm: false  # applies RMS norm to Q/K in attention
+  use_canon_layers: true  # enables bidirectional Canon-ABCD (pure_torch only)
+  canon_layers_mode: "ac"  # subset of Canon sites (A/B/C/D); "ac" is lighter/faster than full "abcd"
 
 pretraining:
   # Dataset directory (contains .data_manifest from nanoplm data from-yaml)
@@ -170,38 +176,44 @@ pretraining:
   ckp_dir: "output/pretraining_checkpoints"
 
   # Hyperparameters
-  max_length: 512
-  micro_batch_size: 32
+  micro_batch_size: 64
+  global_batch_size: 256000  # 2^20 ≈ 1M tokens/step (based on PLM best practices)
   num_epochs: 10
 
-
-  optimizer: "adamw" # adamw, stable_adamw, muon, normuon
-  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon)
+  optimizer: "normuon"  # adamw, stable_adamw, muon, normuon
+  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon or normuon)
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_epsilon: 1e-8
-  learning_rate: 1e-3  # AdamW LR (Muon uses muon_learning_rate)
-  warmup_ratio: 0.05
+  learning_rate: 1e-4  # AdamW LR (Muon uses muon_learning_rate)
+  max_grad_norm: .inf  # set to .inf (equivalent to float("inf")) to disable clipping
+  warmup_steps: 302
+  lr_decay_to_fraction: 0.1
+  lr_schedule: "cosine" # Linear or Cosine
   weight_decay: 0.0
-  # Muon hyperparameters (used only when optimizer: muon)
-  muon_learning_rate: 2e-2
-  muon_weight_decay: 0.1
+  # Muon/NorMuon hyperparameters (used only when optimizer: muon or normuon)
+  muon_learning_rate: 1e-3
+  muon_weight_decay: 0.01
   muon_cautious_weight_decay: true
-  muon_use_polar_express: false
+  muon_use_polar_express: true
   muon_momentum: 0.95
   muon_nesterov: true
   muon_eps: 1e-7
-  global_batch_size: 1048576 # target tokens/optimizer-step (2^20), grad_accum inferred automatically
   mlm_probability: 0.3
   mask_replace_prob: 0.8
   random_token_prob: 0.1
   keep_probability: 0.1
-  logging_steps: 10
-  eval_steps: 50
-  save_steps: 100
+  logging_steps: 1
+  eval_steps: 250
+  save_steps: 5000
   seed: 42
   num_workers: "auto"
   prefetch_factor: 2
+  # Sequence packing: concatenates shorter sequences into fewer rows to eliminate
+  # padding waste and increase GPU utilization. Requires flash attention and --pure-torch/--pure-te
+  use_packing: true
+  # Experimental throughput optimization: with packing, enables static input sizes which enables the use of torch.compile(dynamic=False) and cudagraphs
+  use_static_inp_size: true
 
   # Mixed precision training (recommended: keep enabled for 1.5-3x speedup)
   # When bf16 is true, automatically selects the best precision for your hardware:
@@ -212,9 +224,10 @@ pretraining:
   bf16: true
   tf32: true  # TF32 mode on Ampere+ CUDA GPUs only (automatically not used on MPS/CPU)
              # Provides 3x faster fp32 matmuls with negligible precision loss
+  fp8: false  # Enable FP8 Linear matmuls in pure_torch/pure_te paths (CUDA, best on H100+)
 
-  multi_gpu: false
-  world_size: 1  # Use "auto" if you want to use all available GPUs
+  multi_gpu: true
+  world_size: 'auto'  # Use "auto" if you want to use all available GPUs
   project_name: "nanoplm-pretraining"
 
 resume:
@@ -284,9 +297,9 @@ distillation:
 
   # Checkpointing
   project_name: "nanoplm-distillation"
-  logging_steps: 10
-  eval_steps: 50
-  save_steps: 100
+  logging_steps: 1
+  eval_steps: 250
+  save_steps: 5000
 
   # Mixed precision training (recommended: keep enabled for 1.5-3x speedup)
   # When bf16 is true, automatically selects the best precision for your hardware:

@@ -208,23 +208,23 @@ class PretrainingConfig:
     ckp_dir: str = "output/pretraining"
 
     # Training hyperparameters
-    micro_batch_size: int = 32
+    micro_batch_size: int = 64
     num_epochs: int = 10
-    warmup_steps: int = 350
-    lr_decay_to_fraction: float = 0.01
-    lr_schedule: str = "Linear"
-    optimizer: str = "adamw"
+    warmup_steps: int = 302
+    lr_decay_to_fraction: float = 0.1
+    lr_schedule: str = "cosine"
+    optimizer: str = "normuon"
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-8
-    learning_rate: float = 1e-3
+    learning_rate: float = 1e-4
     weight_decay: float = 0.0
     # Gradient clipping threshold (L2 norm). Set float("inf") to disable clipping.
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = float("inf")
     # Muon-specific hyperparameters (used only when optimizer == "muon" or "normuon").
     # Plain learning_rate/weight_decay/adam_* are used for the AdamW sub-optimizer.
-    muon_learning_rate: float = 2e-2
-    muon_weight_decay: float = 0.1
+    muon_learning_rate: float = 1e-3
+    muon_weight_decay: float = 0.01
     muon_cautious_weight_decay: bool = True
     muon_use_polar_express: bool = False
     muon_momentum: float = 0.95
@@ -232,7 +232,7 @@ class PretrainingConfig:
     muon_eps: float = 1e-7
     # Target effective batch size in tokens per optimizer step.
     # gradient_accumulation_steps is inferred from this value at runtime.
-    global_batch_size: int = 2 ** 20
+    global_batch_size: int = 256000
     inferred_grad_accum_steps: Optional[int] = None
     global_batch_size_samples: Optional[int] = None
     achieved_global_batch_tokens: Optional[int] = None
@@ -249,9 +249,9 @@ class PretrainingConfig:
     keep_probability: float = 0.1
 
     # Logging/checkpointing
-    logging_steps: int = 10
-    eval_steps: int = 50
-    save_steps: int = 100
+    logging_steps: int = 1
+    eval_steps: int = 250
+    save_steps: int = 5000
     seed: int = 42
 
     # Data loading
@@ -260,11 +260,11 @@ class PretrainingConfig:
 
     # Sequence packing (packs multiple sequences per row to eliminate padding waste).
     # Requires flash attention (varlen path).  Falls back to padding if disabled.
-    use_packing: bool = False
+    use_packing: bool = True
     # When packing is enabled, force fixed flat token count and bucketed attention metadata
     # (cu_seqlens/max_seqlen). This enables static-shape execution for torch.compile
     # (dynamic=False) and improves CUDA graph capture reuse.
-    use_static_inp_size: bool = False
+    use_static_inp_size: bool = True
 
     # Profiling (TE pipeline only). When enabled on rank 0:
     # - If running under nsys: uses CUDA Profiler API (start/stop at steps) for .nsys-rep traces.
@@ -274,8 +274,8 @@ class PretrainingConfig:
     profiler_end_step: int = 15
 
     # Distributed training
-    multi_gpu: bool = False
-    world_size: Union[int, str] = 1
+    multi_gpu: bool = True
+    world_size: Union[int, str] = "auto"
     project_name: str = "nanoplm-pretraining"
 
 
