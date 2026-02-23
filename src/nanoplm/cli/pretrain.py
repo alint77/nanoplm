@@ -418,6 +418,12 @@ def pretrain():
     help="Enable bidirectional Canon-ABCD local mixing layers (pure-torch path only)",
 )
 @click.option(
+    "--canon-layers-mode",
+    type=str,
+    default="abcd",
+    help="Subset of Canon insertion points to enable (A/B/C/D), e.g. 'abcd' or 'ac'",
+)
+@click.option(
     "--pure-torch",
     is_flag=True,
     default=False,
@@ -487,6 +493,7 @@ def run(
     use_x0_lambdas: bool,
     use_qk_norm: bool,
     use_canon_layers: bool,
+    canon_layers_mode: str,
     pure_torch: bool,
     pure_te: bool,
 ):
@@ -561,6 +568,7 @@ def run(
         use_x0_lambdas=use_x0_lambdas,
         use_qk_norm=use_qk_norm,
         use_canon_layers=use_canon_layers,
+        canon_layers_mode=canon_layers_mode,
     )
 
     _set_seed_for_init(seed)
@@ -755,6 +763,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  use_x0_lambdas: false  # blends initial embedding x0 per layer\n"
         "  use_qk_norm: false  # applies RMS norm to Q/K in attention\n"
         "  use_canon_layers: false  # enables bidirectional Canon-ABCD (pure_torch only)\n"
+        "  canon_layers_mode: \"abcd\"  # subset of Canon sites: A/B/C/D (e.g. \"ac\" for lighter mode)\n"
         "\n"
         "pretraining:\n"
         "  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)\n"

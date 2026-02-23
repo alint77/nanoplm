@@ -42,6 +42,7 @@ class ProtModernBertMLMConfig:
     use_x0_lambdas: bool = False
     use_qk_norm: bool = False
     use_canon_layers: bool = False
+    canon_layers_mode: str = "abcd"
     resid_lambda_init: float = 1.0
     x0_lambda_init: float = 0.1
 

@@ -47,6 +47,28 @@ if not _HAS_FLASH_VARLEN:
         pass
 
 
+def _parse_canon_layers_mode(mode: str) -> frozenset[str]:
+    if not isinstance(mode, str):
+        raise ValueError(f"canon_layers_mode must be a string, got {type(mode).__name__}")
+    normalized = mode.strip().lower()
+    if normalized in {"", "none", "off"}:
+        return frozenset()
+
+    allowed = {"a", "b", "c", "d"}
+    separators = {" ", "+", "-", "_", "/", "|", ","}
+    selected: set[str] = set()
+    for char in normalized:
+        if char in separators:
+            continue
+        if char not in allowed:
+            raise ValueError(
+                f"Invalid canon_layers_mode={mode!r}. "
+                "Use a subset of ABCD (e.g., 'abcd', 'ac', 'bcd')."
+            )
+        selected.add(char)
+    return frozenset(selected)
+
+
 @dataclass
 class ModernBertConfig:
     vocab_size: int = 50368
@@ -85,12 +107,14 @@ class ModernBertConfig:
     use_x0_lambdas: bool = False
     use_qk_norm: bool = False
     use_canon_layers: bool = False
+    canon_layers_mode: str = "abcd"
     resid_lambda_init: float = 1.0
     x0_lambda_init: float = 0.1
 
     head_dim: int = field(init=False)
     sliding_window: int = field(init=False)
     layer_types: list[str] = field(init=False)
+    canon_layer_set: frozenset[str] = field(init=False)
 
     def __post_init__(self) -> None:
         if self.hidden_size % self.num_attention_heads != 0:
@@ -106,6 +130,14 @@ class ModernBertConfig:
         if self.mlp_activation not in {"swiglu", "glu"}:
             raise ValueError(
                 f"Unsupported mlp_activation: {self.mlp_activation}. Supported: ['swiglu', 'glu']"
+            )
+        self.canon_layer_set = _parse_canon_layers_mode(self.canon_layers_mode)
+        if not self.use_canon_layers:
+            self.canon_layer_set = frozenset()
+        elif not self.canon_layer_set:
+            raise ValueError(
+                "use_canon_layers=True requires non-empty canon_layers_mode "
+                "(for example: 'abcd' or 'ac')."
             )
         self.layer_types = [
             "full_attention" if i % attn_stride == 0 else "sliding_attention"
@@ -229,7 +261,7 @@ class ModernBertCanonLayer(nn.Module):
     def __init__(self, channels, kernel_size=5):
         super().__init__()
         if kernel_size % 2 == 0:
-            raise ValueError(...)
+            raise ValueError(f"kernel_size must be odd, got {kernel_size}")
         self.kernel_size = kernel_size
         self.radius = kernel_size // 2
         self.conv = nn.Conv1d(
@@ -242,7 +274,7 @@ class ModernBertCanonLayer(nn.Module):
             bias=True,
         )
 
-    def _forward_varlen(self, x, cu_seqlens):
+    def _forward_varlen(self, x, cu_seqlens, position_ids=None):
         T, C = x.shape
         n_seqs = cu_seqlens.shape[0] - 1
 
@@ -250,27 +282,43 @@ class ModernBertCanonLayer(nn.Module):
             mixed = self.conv(x.T.unsqueeze(0)).squeeze(0).T
             return x + mixed
 
-        positions = torch.arange(T, device=x.device, dtype=cu_seqlens.dtype)
-        seq_id = torch.searchsorted(cu_seqlens[1:], positions, right=True)
+        if position_ids is not None and position_ids.shape[0] == T:
+            seq_start = (position_ids == 0).to(dtype=cu_seqlens.dtype)
+            seq_start = seq_start.clone()
+            seq_start[0] = 1
+            seq_id = torch.cumsum(seq_start, dim=0) - 1
+        else:
+            positions = torch.arange(T, device=x.device, dtype=cu_seqlens.dtype)
+            seq_id = torch.searchsorted(cu_seqlens[1:], positions, right=True)
         weight = self.conv.weight[:, 0, :]
         bias = self.conv.bias
 
-        mixed = _checkpoint(
-            _varlen_canon_inner, x, seq_id, weight, bias, self.radius,
-            use_reentrant=False,
-        )
+        if self.training and x.requires_grad:
+            mixed = _checkpoint(
+                _varlen_canon_inner, x, seq_id, weight, bias, self.radius,
+                use_reentrant=False,
+            )
+        else:
+            mixed = _varlen_canon_inner(x, seq_id, weight, bias, self.radius)
         return x + mixed
 
-    def _forward_padded(self, x):
+    def _forward_padded(self, x, attention_mask=None):
+        token_mask = None
+        if attention_mask is not None:
+            token_mask = attention_mask.unsqueeze(-1).to(dtype=x.dtype)
+            x = x * token_mask
         mixed = self.conv(x.transpose(1, 2)).transpose(1, 2)
-        return x + mixed
+        out = x + mixed
+        if token_mask is not None:
+            out = out * token_mask
+        return out
 
-    def forward(self, x, position_ids=None, cu_seqlens=None):
+    def forward(self, x, position_ids=None, cu_seqlens=None, attention_mask=None):
         if cu_seqlens is not None:
-            return self._forward_varlen(x, cu_seqlens=cu_seqlens)
+            return self._forward_varlen(x, cu_seqlens=cu_seqlens, position_ids=position_ids)
         if x.dim() == 3:
-            return self._forward_padded(x)
-        raise ValueError(...)
+            return self._forward_padded(x, attention_mask=attention_mask)
+        raise ValueError(f"Expected padded input [B, S, C], got shape={tuple(x.shape)}")
 
 
 def _varlen_canon_inner(x, seq_id, weight, bias, radius):
@@ -356,7 +404,7 @@ class ModernBertMLP(nn.Module):
         self.act = _get_activation(config.hidden_activation)
         self.canon_d = (
             ModernBertCanonLayer(2 * config.intermediate_size, kernel_size=5)
-            if config.use_canon_layers
+            if "d" in config.canon_layer_set
             else None
         )
 
@@ -365,10 +413,16 @@ class ModernBertMLP(nn.Module):
         x: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         wi = self.Wi(x)
         if self.canon_d is not None:
-            wi = self.canon_d(wi, position_ids=position_ids, cu_seqlens=cu_seqlens)
+            wi = self.canon_d(
+                wi,
+                position_ids=position_ids,
+                cu_seqlens=cu_seqlens,
+                attention_mask=attention_mask,
+            )
         x_proj, gate = wi.chunk(2, dim=-1)
         return self.Wo(self.drop(self.act(x_proj) * gate))
 
@@ -389,7 +443,7 @@ class ModernBertSwiGLUMLP(nn.Module):
         self.drop = nn.Dropout(config.mlp_dropout)
         self.canon_d = (
             ModernBertCanonLayer(2 * config.intermediate_size, kernel_size=5)
-            if config.use_canon_layers
+            if "d" in config.canon_layer_set
             else None
         )
 
@@ -398,10 +452,16 @@ class ModernBertSwiGLUMLP(nn.Module):
         x: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         wi = self.Wi(x)
         if self.canon_d is not None:
-            wi = self.canon_d(wi, position_ids=position_ids, cu_seqlens=cu_seqlens)
+            wi = self.canon_d(
+                wi,
+                position_ids=position_ids,
+                cu_seqlens=cu_seqlens,
+                attention_mask=attention_mask,
+            )
         x_proj, gate = wi.chunk(2, dim=-1)
         return self.Wo(self.drop(F.silu(gate) * x_proj))
 
@@ -432,7 +492,7 @@ class ModernBertAttention(nn.Module):
         )
         self.canon_b = (
             ModernBertCanonLayer(3 * config.hidden_size, kernel_size=5)
-            if config.use_canon_layers
+            if "b" in config.canon_layer_set
             else None
         )
 
@@ -493,6 +553,7 @@ class ModernBertAttention(nn.Module):
         max_seqlen: Optional[int] = None,
         window_size: Optional[tuple[int, int]] = None,
         position_ids: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if cu_seqlens is not None:
             return self._forward_varlen(
@@ -507,7 +568,7 @@ class ModernBertAttention(nn.Module):
         bsz, seq_len, _ = x.shape
         qkv = self.Wqkv(x)
         if self.canon_b is not None:
-            qkv = self.canon_b(qkv)
+            qkv = self.canon_b(qkv, attention_mask=token_mask)
         qkv = qkv.view(bsz, seq_len, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
         q = q.transpose(1, 2)
@@ -543,14 +604,14 @@ class ModernBertEncoderLayer(nn.Module):
         )
         self.canon_a = (
             ModernBertCanonLayer(config.hidden_size, kernel_size=5)
-            if config.use_canon_layers
+            if "a" in config.canon_layer_set
             else None
         )
         self.attn = ModernBertAttention(config)
         self.mlp_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
         self.canon_c = (
             ModernBertCanonLayer(config.hidden_size, kernel_size=5)
-            if config.use_canon_layers
+            if "c" in config.canon_layer_set
             else None
         )
         self.mlp = (
@@ -568,6 +629,7 @@ class ModernBertEncoderLayer(nn.Module):
         max_seqlen: Optional[int] = None,
         window_size: Optional[tuple[int, int]] = None,
         position_ids: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         attn_in = self.attn_norm(x)
         if self.canon_a is not None:
@@ -575,6 +637,7 @@ class ModernBertEncoderLayer(nn.Module):
                 attn_in,
                 position_ids=position_ids,
                 cu_seqlens=cu_seqlens,
+                attention_mask=token_mask,
             )
         x = x + self.attn(
             attn_in,
@@ -584,6 +647,7 @@ class ModernBertEncoderLayer(nn.Module):
             max_seqlen=max_seqlen,
             window_size=window_size,
             position_ids=position_ids,
+            token_mask=token_mask,
         )
         mlp_in = self.mlp_norm(x)
         if self.canon_c is not None:
@@ -591,11 +655,13 @@ class ModernBertEncoderLayer(nn.Module):
                 mlp_in,
                 position_ids=position_ids,
                 cu_seqlens=cu_seqlens,
+                attention_mask=token_mask,
             )
         x = x + self.mlp(
             mlp_in,
             position_ids=position_ids,
             cu_seqlens=cu_seqlens,
+            attention_mask=token_mask,
         )
         return x
 
@@ -629,14 +695,13 @@ class ModernBertModel(nn.Module):
     ) -> torch.Tensor:
         # ---- varlen (flash-attention) path --------------------------------
         if _cu_seqlens is not None:
-            if self.config.use_canon_layers and _position_ids is None:
-                raise ValueError(
-                    "Canon layers require position_ids in varlen mode to avoid "
-                    "cross-sequence leakage."
-                )
             device = input_ids.device
             x = self.embeddings(input_ids)  # (total_tokens, hidden)
             x0 = x if self.x0_lambdas is not None else None
+            if _position_ids is None:
+                _position_ids = _position_ids_from_cu_seqlens(
+                    _cu_seqlens, x.shape[0], x.device
+                )
 
             # Pre-compute RoPE tables up to max_position_embeddings (fixed size
             # avoids graph breaks / recompilation) and index by _position_ids.
@@ -729,6 +794,7 @@ class ModernBertModel(nn.Module):
                 attn_mask=attn_masks[layer_type],
                 cos_sin=rope[layer_type],
                 position_ids=None,
+                token_mask=attention_mask,
             )
 
         return self.final_norm(x)
