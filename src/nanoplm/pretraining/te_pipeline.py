@@ -3,6 +3,7 @@
 
 
 import gc
+import math
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
@@ -569,6 +570,11 @@ def run_te_pretraining(
         f"Precision config: bf16={use_bf16}, fp16={use_fp16}, "
         f"tf32={(pretrain_config.tf32 and device.type == 'cuda')}, fp8={pretrain_config.fp8}"
     )
+    max_grad_norm = float(pretrain_config.max_grad_norm)
+    logger.info(
+        "Gradient clipping: "
+        f"{'disabled (max_grad_norm=inf)' if math.isinf(max_grad_norm) else f'max_grad_norm={max_grad_norm}'}"
+    )
 
     fp8_enabled = bool(pretrain_config.fp8 and device.type == "cuda")
     if pretrain_config.fp8 and device.type != "cuda":
@@ -705,7 +711,7 @@ def run_te_pretraining(
 
                 if scaler is not None and scaler.is_enabled():
                     scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
 
                 optimizer_step_skipped = False
                 if scaler is not None and scaler.is_enabled():

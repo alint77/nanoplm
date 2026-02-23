@@ -141,6 +141,11 @@ def pretrain():
     help="Weight decay"
 )
 @click.option(
+    "--gradient-clipping/--no-gradient-clipping",
+    default=True,
+    help="Enable gradient clipping with max norm 1.0",
+)
+@click.option(
     "--warmup-steps",
     type=int,
     default=350,
@@ -413,6 +418,17 @@ def pretrain():
     help="Enable NanoChat-style RMS QK normalization in attention",
 )
 @click.option(
+    "--use-canon-layers/--no-use-canon-layers",
+    default=False,
+    help="Enable bidirectional Canon-ABCD local mixing layers (pure-torch path only)",
+)
+@click.option(
+    "--canon-layers-mode",
+    type=str,
+    default="abcd",
+    help="Subset of Canon insertion points to enable (A/B/C/D), e.g. 'abcd' or 'ac'",
+)
+@click.option(
     "--pure-torch",
     is_flag=True,
     default=False,
@@ -433,6 +449,7 @@ def run(
     num_epochs: int,
     learning_rate: float,
     weight_decay: float,
+    gradient_clipping: bool,
     warmup_steps: int,
     lr_decay_to_fraction: float,
     lr_schedule: str,
@@ -481,6 +498,8 @@ def run(
     use_resid_lambdas: bool,
     use_x0_lambdas: bool,
     use_qk_norm: bool,
+    use_canon_layers: bool,
+    canon_layers_mode: str,
     pure_torch: bool,
     pure_te: bool,
 ):
@@ -494,6 +513,7 @@ def run(
         num_epochs=num_epochs,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
+        max_grad_norm=1.0 if gradient_clipping else float("inf"),
         warmup_steps=warmup_steps,
         lr_decay_to_fraction=lr_decay_to_fraction,
         lr_schedule=lr_schedule,
@@ -529,8 +549,16 @@ def run(
         project_name=project_name,
     )
     
+    if pure_torch and pure_te:
+        raise click.ClickException("--pure-torch and --pure-te are mutually exclusive.")
+    if use_canon_layers and not pure_torch:
+        raise click.ClickException(
+            "use_canon_layers requires --pure-torch. "
+            "Canon layers are not implemented in HF/TE paths."
+        )
+
     _populate_batch_setup(cfg)
-    
+
     model_cfg = ProtModernBertMLMConfig(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -546,10 +574,9 @@ def run(
         use_resid_lambdas=use_resid_lambdas,
         use_x0_lambdas=use_x0_lambdas,
         use_qk_norm=use_qk_norm,
+        use_canon_layers=use_canon_layers,
+        canon_layers_mode=canon_layers_mode,
     )
-
-    if pure_torch and pure_te:
-        raise click.ClickException("--pure-torch and --pure-te are mutually exclusive.")
 
     _set_seed_for_init(seed)
     if pure_te:
@@ -634,9 +661,14 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
 
     # validate and load config
     pretrain_config = _load_pretrain_config(pretrain_dict)
-    _populate_batch_setup(pretrain_config)
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
+    if model_config.use_canon_layers and not pure_torch:
+        raise click.ClickException(
+            "model.use_canon_layers=true requires pure_torch: true (or --pure-torch). "
+            "Canon layers are not implemented in HF/TE paths."
+        )
+    _populate_batch_setup(pretrain_config)
 
     _set_seed_for_init(pretrain_config.seed)
     if pure_te:
@@ -737,6 +769,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  use_resid_lambdas: false  # scales residual stream per layer\n"
         "  use_x0_lambdas: false  # blends initial embedding x0 per layer\n"
         "  use_qk_norm: false  # applies RMS norm to Q/K in attention\n"
+        "  use_canon_layers: false  # enables bidirectional Canon-ABCD (pure_torch only)\n"
+        "  canon_layers_mode: \"abcd\"  # subset of Canon sites: A/B/C/D (e.g. \"ac\" for lighter mode)\n"
         "\n"
         "pretraining:\n"
         "  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)\n"
@@ -761,6 +795,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
         "  learning_rate: 1e-4  # AdamW LR (Muon uses muon_learning_rate)\n"
+        "  max_grad_norm: 1.0  # set to .inf (equivalent to float(\"inf\")) to disable clipping\n"
         "  warmup_steps: 350\n"
         "  lr_decay_to_fraction: 0.1\n"
         "  lr_schedule: \"Linear\" # Linear or Cosine \n" 
@@ -866,6 +901,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
     float_fields = [
         "learning_rate",
         "weight_decay",
+        "max_grad_norm",
         "adam_beta1",
         "adam_beta2",
         "adam_epsilon",
@@ -875,12 +911,38 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         "muon_eps",
         "min_lr",
     ]
+
+    def _parse_float_like(raw_value: Any, field_name: str) -> float:
+        if not isinstance(raw_value, str):
+            return float(raw_value)
+
+        stripped = raw_value.strip().lower()
+        if stripped in {
+            'float("inf")',
+            "float('inf')",
+            "inf",
+            "+inf",
+            "infinity",
+            "+infinity",
+            ".inf",
+        }:
+            return float("inf")
+        if stripped in {
+            'float("-inf")',
+            "float('-inf')",
+            "-inf",
+            "-infinity",
+            "-.inf",
+        }:
+            return float("-inf")
+        try:
+            return float(raw_value)
+        except ValueError as exc:
+            raise ValueError(f"Invalid {field_name} value: {raw_value}. Must be a number.") from exc
+
     for field in float_fields:
-        if isinstance(kwargs.get(field), str):
-            try:
-                kwargs[field] = float(kwargs[field])
-            except ValueError as exc:
-                raise ValueError(f"Invalid {field} value: {kwargs[field]}. Must be a number.") from exc
+        if field in kwargs and kwargs[field] is not None:
+            kwargs[field] = _parse_float_like(kwargs[field], field)
 
     # Ensure warmup_steps is int (YAML may load as int or float).
     if "warmup_steps" in kwargs and kwargs["warmup_steps"] is not None:
