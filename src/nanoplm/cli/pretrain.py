@@ -413,6 +413,11 @@ def pretrain():
     help="Enable NanoChat-style RMS QK normalization in attention",
 )
 @click.option(
+    "--use-canon-layers/--no-use-canon-layers",
+    default=False,
+    help="Enable bidirectional Canon-ABCD local mixing layers (pure-torch path only)",
+)
+@click.option(
     "--pure-torch",
     is_flag=True,
     default=False,
@@ -481,6 +486,7 @@ def run(
     use_resid_lambdas: bool,
     use_x0_lambdas: bool,
     use_qk_norm: bool,
+    use_canon_layers: bool,
     pure_torch: bool,
     pure_te: bool,
 ):
@@ -529,8 +535,16 @@ def run(
         project_name=project_name,
     )
     
+    if pure_torch and pure_te:
+        raise click.ClickException("--pure-torch and --pure-te are mutually exclusive.")
+    if use_canon_layers and not pure_torch:
+        raise click.ClickException(
+            "use_canon_layers requires --pure-torch. "
+            "Canon layers are not implemented in HF/TE paths."
+        )
+
     _populate_batch_setup(cfg)
-    
+
     model_cfg = ProtModernBertMLMConfig(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -546,10 +560,8 @@ def run(
         use_resid_lambdas=use_resid_lambdas,
         use_x0_lambdas=use_x0_lambdas,
         use_qk_norm=use_qk_norm,
+        use_canon_layers=use_canon_layers,
     )
-
-    if pure_torch and pure_te:
-        raise click.ClickException("--pure-torch and --pure-te are mutually exclusive.")
 
     _set_seed_for_init(seed)
     if pure_te:
@@ -634,9 +646,14 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
 
     # validate and load config
     pretrain_config = _load_pretrain_config(pretrain_dict)
-    _populate_batch_setup(pretrain_config)
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
+    if model_config.use_canon_layers and not pure_torch:
+        raise click.ClickException(
+            "model.use_canon_layers=true requires pure_torch: true (or --pure-torch). "
+            "Canon layers are not implemented in HF/TE paths."
+        )
+    _populate_batch_setup(pretrain_config)
 
     _set_seed_for_init(pretrain_config.seed)
     if pure_te:
@@ -737,6 +754,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  use_resid_lambdas: false  # scales residual stream per layer\n"
         "  use_x0_lambdas: false  # blends initial embedding x0 per layer\n"
         "  use_qk_norm: false  # applies RMS norm to Q/K in attention\n"
+        "  use_canon_layers: false  # enables bidirectional Canon-ABCD (pure_torch only)\n"
         "\n"
         "pretraining:\n"
         "  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)\n"

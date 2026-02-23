@@ -903,7 +903,12 @@ def run_pure_pretraining(
                 if "attention_mask" in batch:
                     fwd_kwargs["attention_mask"] = batch["attention_mask"]
                 if "cu_seqlens" in batch:
-                    fwd_kwargs["cu_seqlens"] = batch["cu_seqlens"]
+                    cu_seqlens = batch["cu_seqlens"]
+                    # cu_seqlens has shape (num_seqs+1,) which varies per packing
+                    # bucket.  Mark dim-0 dynamic so torch.compile(dynamic=False)
+                    # doesn't create a separate compiled graph per bucket count.
+                    torch._dynamo.mark_dynamic(cu_seqlens, 0)
+                    fwd_kwargs["cu_seqlens"] = cu_seqlens
                     fwd_kwargs["max_seqlen"] = batch["max_seqlen"]
                 if "position_ids" in batch:
                     fwd_kwargs["position_ids"] = batch["position_ids"]

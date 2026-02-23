@@ -41,6 +41,7 @@ class ProtModernBertMLMConfig:
     use_resid_lambdas: bool = False
     use_x0_lambdas: bool = False
     use_qk_norm: bool = False
+    use_canon_layers: bool = False
     resid_lambda_init: float = 1.0
     x0_lambda_init: float = 0.1
 
@@ -50,6 +51,12 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
         self,
         config: ProtModernBertMLMConfig
     ):
+        if config.use_canon_layers:
+            raise ValueError(
+                "Canon layers are currently implemented only in the pure-torch path. "
+                "Use --pure-torch with use_canon_layers=true."
+            )
+
         self.tokenizer = ProtModernBertTokenizer()
 
         self.config = ModernBertConfig(

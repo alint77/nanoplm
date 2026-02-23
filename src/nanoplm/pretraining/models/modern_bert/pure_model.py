@@ -60,6 +60,7 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             use_resid_lambdas=config.use_resid_lambdas,
             use_x0_lambdas=config.use_x0_lambdas,
             use_qk_norm=config.use_qk_norm,
+            use_canon_layers=config.use_canon_layers,
             resid_lambda_init=config.resid_lambda_init,
             x0_lambda_init=config.x0_lambda_init,
         )
@@ -71,6 +72,12 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
     """Transformer-Engine ``ProtModernBertMLM`` wrapper."""
 
     def __init__(self, config: ProtModernBertMLMConfig):
+        if config.use_canon_layers:
+            raise ValueError(
+                "Canon layers are currently implemented only in the pure-torch path. "
+                "Disable use_canon_layers or use --pure-torch."
+            )
+
         self.tokenizer = ProtModernBertTokenizer()
 
         mb_config = ModernBertConfig(
@@ -95,6 +102,7 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             use_resid_lambdas=config.use_resid_lambdas,
             use_x0_lambdas=config.use_x0_lambdas,
             use_qk_norm=config.use_qk_norm,
+            use_canon_layers=config.use_canon_layers,
             resid_lambda_init=config.resid_lambda_init,
             x0_lambda_init=config.x0_lambda_init,
         )

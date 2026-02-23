@@ -16,6 +16,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _checkpoint
+
 
 _HAS_FLASH_VARLEN = False
 _flash_varlen_fn = None
@@ -82,6 +84,7 @@ class ModernBertConfig:
     use_resid_lambdas: bool = False
     use_x0_lambdas: bool = False
     use_qk_norm: bool = False
+    use_canon_layers: bool = False
     resid_lambda_init: float = 1.0
     x0_lambda_init: float = 0.1
 
@@ -222,6 +225,67 @@ def _position_ids_from_cu_seqlens(
     return torch.arange(total, device=device, dtype=torch.int32) - offsets
 
 
+class ModernBertCanonLayer(nn.Module):
+    def __init__(self, channels, kernel_size=5):
+        super().__init__()
+        if kernel_size % 2 == 0:
+            raise ValueError(...)
+        self.kernel_size = kernel_size
+        self.radius = kernel_size // 2
+        self.conv = nn.Conv1d(
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=self.radius,
+            groups=channels,
+            bias=True,
+        )
+
+    def _forward_varlen(self, x, cu_seqlens):
+        T, C = x.shape
+        n_seqs = cu_seqlens.shape[0] - 1
+
+        if n_seqs <= 1:
+            mixed = self.conv(x.T.unsqueeze(0)).squeeze(0).T
+            return x + mixed
+
+        positions = torch.arange(T, device=x.device, dtype=cu_seqlens.dtype)
+        seq_id = torch.searchsorted(cu_seqlens[1:], positions, right=True)
+        weight = self.conv.weight[:, 0, :]
+        bias = self.conv.bias
+
+        mixed = _checkpoint(
+            _varlen_canon_inner, x, seq_id, weight, bias, self.radius,
+            use_reentrant=False,
+        )
+        return x + mixed
+
+    def _forward_padded(self, x):
+        mixed = self.conv(x.transpose(1, 2)).transpose(1, 2)
+        return x + mixed
+
+    def forward(self, x, position_ids=None, cu_seqlens=None):
+        if cu_seqlens is not None:
+            return self._forward_varlen(x, cu_seqlens=cu_seqlens)
+        if x.dim() == 3:
+            return self._forward_padded(x)
+        raise ValueError(...)
+
+
+def _varlen_canon_inner(x, seq_id, weight, bias, radius):
+    """Depthwise conv with boundary masking (checkpointed to save memory)."""
+    out = torch.zeros_like(x)
+    for k, offset in enumerate(range(-radius, radius + 1)):
+        rolled_x = torch.roll(x, shifts=-offset, dims=0)
+        rolled_id = torch.roll(seq_id, shifts=-offset, dims=0)
+        valid = (rolled_id == seq_id).unsqueeze(-1).to(x.dtype)
+        out = out + rolled_x * valid * weight[:, k]
+    if bias is not None:
+        out = out + bias
+    return out
+
+
 class ModernBertEmbeddings(nn.Module):
     def __init__(self, config: ModernBertConfig):
         super().__init__()
@@ -290,9 +354,22 @@ class ModernBertMLP(nn.Module):
         )
         self.drop = nn.Dropout(config.mlp_dropout)
         self.act = _get_activation(config.hidden_activation)
+        self.canon_d = (
+            ModernBertCanonLayer(2 * config.intermediate_size, kernel_size=5)
+            if config.use_canon_layers
+            else None
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_proj, gate = self.Wi(x).chunk(2, dim=-1)
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        wi = self.Wi(x)
+        if self.canon_d is not None:
+            wi = self.canon_d(wi, position_ids=position_ids, cu_seqlens=cu_seqlens)
+        x_proj, gate = wi.chunk(2, dim=-1)
         return self.Wo(self.drop(self.act(x_proj) * gate))
 
 
@@ -310,9 +387,22 @@ class ModernBertSwiGLUMLP(nn.Module):
             bias=config.mlp_bias,
         )
         self.drop = nn.Dropout(config.mlp_dropout)
+        self.canon_d = (
+            ModernBertCanonLayer(2 * config.intermediate_size, kernel_size=5)
+            if config.use_canon_layers
+            else None
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_proj, gate = self.Wi(x).chunk(2, dim=-1)
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        wi = self.Wi(x)
+        if self.canon_d is not None:
+            wi = self.canon_d(wi, position_ids=position_ids, cu_seqlens=cu_seqlens)
+        x_proj, gate = wi.chunk(2, dim=-1)
         return self.Wo(self.drop(F.silu(gate) * x_proj))
 
 
@@ -340,6 +430,11 @@ class ModernBertAttention(nn.Module):
             if config.attention_dropout > 0.0
             else nn.Identity()
         )
+        self.canon_b = (
+            ModernBertCanonLayer(3 * config.hidden_size, kernel_size=5)
+            if config.use_canon_layers
+            else None
+        )
 
     # -- varlen (flash-attention) path -----------------------------------------
 
@@ -350,9 +445,13 @@ class ModernBertAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int | torch.Tensor,
         window_size: tuple[int, int],
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         total = x.shape[0]  # (total_tokens, hidden)
-        qkv = self.Wqkv(x).view(total, 3, self.num_heads, self.head_dim)
+        qkv = self.Wqkv(x)
+        if self.canon_b is not None:
+            qkv = self.canon_b(qkv, position_ids=position_ids, cu_seqlens=cu_seqlens)
+        qkv = qkv.view(total, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=1)  # each: (total, H, D)
 
         cos, sin = cos_sin
@@ -393,12 +492,23 @@ class ModernBertAttention(nn.Module):
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
         window_size: Optional[tuple[int, int]] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if cu_seqlens is not None:
-            return self._forward_varlen(x, cos_sin, cu_seqlens, max_seqlen, window_size)
+            return self._forward_varlen(
+                x,
+                cos_sin,
+                cu_seqlens,
+                max_seqlen,
+                window_size,
+                position_ids=position_ids,
+            )
 
         bsz, seq_len, _ = x.shape
-        qkv = self.Wqkv(x).view(bsz, seq_len, 3, self.num_heads, self.head_dim)
+        qkv = self.Wqkv(x)
+        if self.canon_b is not None:
+            qkv = self.canon_b(qkv)
+        qkv = qkv.view(bsz, seq_len, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -431,8 +541,18 @@ class ModernBertEncoderLayer(nn.Module):
             if layer_idx == 0
             else nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
         )
+        self.canon_a = (
+            ModernBertCanonLayer(config.hidden_size, kernel_size=5)
+            if config.use_canon_layers
+            else None
+        )
         self.attn = ModernBertAttention(config)
         self.mlp_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+        self.canon_c = (
+            ModernBertCanonLayer(config.hidden_size, kernel_size=5)
+            if config.use_canon_layers
+            else None
+        )
         self.mlp = (
             ModernBertSwiGLUMLP(config)
             if config.mlp_activation == "swiglu"
@@ -447,16 +567,36 @@ class ModernBertEncoderLayer(nn.Module):
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
         window_size: Optional[tuple[int, int]] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        attn_in = self.attn_norm(x)
+        if self.canon_a is not None:
+            attn_in = self.canon_a(
+                attn_in,
+                position_ids=position_ids,
+                cu_seqlens=cu_seqlens,
+            )
         x = x + self.attn(
-            self.attn_norm(x),
+            attn_in,
             cos_sin=cos_sin,
             attn_mask=attn_mask,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             window_size=window_size,
+            position_ids=position_ids,
         )
-        x = x + self.mlp(self.mlp_norm(x))
+        mlp_in = self.mlp_norm(x)
+        if self.canon_c is not None:
+            mlp_in = self.canon_c(
+                mlp_in,
+                position_ids=position_ids,
+                cu_seqlens=cu_seqlens,
+            )
+        x = x + self.mlp(
+            mlp_in,
+            position_ids=position_ids,
+            cu_seqlens=cu_seqlens,
+        )
         return x
 
 
@@ -489,6 +629,11 @@ class ModernBertModel(nn.Module):
     ) -> torch.Tensor:
         # ---- varlen (flash-attention) path --------------------------------
         if _cu_seqlens is not None:
+            if self.config.use_canon_layers and _position_ids is None:
+                raise ValueError(
+                    "Canon layers require position_ids in varlen mode to avoid "
+                    "cross-sequence leakage."
+                )
             device = input_ids.device
             x = self.embeddings(input_ids)  # (total_tokens, hidden)
             x0 = x if self.x0_lambdas is not None else None
@@ -532,6 +677,7 @@ class ModernBertModel(nn.Module):
                     cu_seqlens=_cu_seqlens,
                     max_seqlen=_max_seqlen,
                     window_size=windows[lt],
+                    position_ids=_position_ids,
                 )
 
             return self.final_norm(x)
@@ -578,7 +724,12 @@ class ModernBertModel(nn.Module):
             if self.x0_lambdas is not None:
                 x = x + self.x0_lambdas[i] * x0
             layer_type = layer.attention_type
-            x = layer(x, attn_mask=attn_masks[layer_type], cos_sin=rope[layer_type])
+            x = layer(
+                x,
+                attn_mask=attn_masks[layer_type],
+                cos_sin=rope[layer_type],
+                position_ids=None,
+            )
 
         return self.final_norm(x)
 
