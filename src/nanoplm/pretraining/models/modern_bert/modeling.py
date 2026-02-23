@@ -36,7 +36,8 @@ if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
     except ImportError:
         pass
 
-USE_TRITON_SRELU = True
+if torch.cuda.is_available() and (torch.cuda.get_device_capability() == (9, 0) or torch.cuda.get_device_capability() == (12, 0)):
+    USE_TRITON_SRELU = True
 
 if not _HAS_FLASH_VARLEN:
     try:

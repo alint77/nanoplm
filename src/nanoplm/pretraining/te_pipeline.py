@@ -125,7 +125,8 @@ def _make_te_profiler(pretrain_config: PretrainingConfig, output_dir: str, is_ma
 
         prof = torch.profiler.profile(
             activities=activities,
-            schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=0),
+            # Single profiling window; avoid repeating the cycle throughout training.
+            schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=1),
             on_trace_ready=on_trace_ready,
             record_shapes=True,
         )
@@ -588,14 +589,13 @@ def run_te_pretraining(
 
     token_count = torch.tensor(0, dtype=torch.long, device=device)
     raw_token_count = torch.zeros((), dtype=torch.long, device=device)
-    token_t0: Optional[float] = None
-    have_tokens_since_log = False
+    step_t0: Optional[float] = None
     first_step_of_run = True
 
     # When packing, TokenPackingDataset holds the DistributedSampler; call set_epoch on it.
     _epoch_setter = train_ds if use_packing else train_sampler
-    # [0]=tok, [1]=raw_tok, [2]=elapsed (all-reduced), [3]=loss, [4]=grad_norm (local)
-    log_buf = torch.empty(5, device=device, dtype=torch.float32)
+    # [0]=loss, [1]=grad_norm (local)
+    log_buf = torch.empty(2, device=device, dtype=torch.float32)
 
     profiler_ctx, profiler_step_cb = _make_te_profiler(pretrain_config, output_dir, is_main)
 
@@ -632,9 +632,11 @@ def run_te_pretraining(
                     )
                     model.set_requires_gradient_sync(_is_sync_step)
 
-                if not have_tokens_since_log:
-                    token_t0 = time.perf_counter()
-                    have_tokens_since_log = True
+                # Start timing for this optimizer step (with CUDA sync for accuracy)
+                if step_t0 is None:
+                    if device.type == "cuda":
+                        torch.cuda.synchronize()
+                    step_t0 = time.perf_counter()
 
                 if "num_valid_tokens" in batch:
                     token_count += batch["num_valid_tokens"]
@@ -717,42 +719,34 @@ def run_te_pretraining(
                 window_steps += 1
                 accum_loss.zero_()
 
+                # ---- Timing: synchronize and measure dt per step (à la nanochat) ----
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                t1 = time.perf_counter()
+                dt = t1 - (step_t0 or t1)
+                step_t0 = None  # reset so next step re-syncs and re-measures
+
                 should_log = global_step % logging_steps == 0
                 vram_log = ""
-                tokens_per_sec = raw_tokens_per_sec = mfu = tok = raw_tok = 0.0
+                tokens_per_sec = mfu = tok = raw_tok = 0.0
                 if should_log:
-                    t1 = time.perf_counter()
-                    if token_t0 is None:
-                        token_t0 = t1
-                    elapsed = t1 - token_t0
-                    # Pack all values into one buffer: [tok, raw_tok, elapsed, loss, grad_norm]
-                    log_buf[0] = token_count.to(dtype=torch.float32)
-                    log_buf[1] = raw_token_count.to(dtype=torch.float32)
-                    log_buf[2] = max(elapsed, 1e-9)
-                    log_buf[3] = window_loss / max(1, window_steps)
-                    log_buf[4] = grad_norm.full_tensor() if isinstance(grad_norm, DTensor) else (grad_norm if isinstance(grad_norm, torch.Tensor) else float(grad_norm))
-                    # All-reduce only the throughput slots [0:3]
-                    if distributed and dist.is_initialized():
-                        dist.all_reduce(log_buf[:2], op=dist.ReduceOp.SUM)
-                        dist.all_reduce(log_buf[2:3], op=dist.ReduceOp.MAX)
-                    # Single device-to-host transfer (one cudaStreamSynchronize)
+                    # Use the known global batch size for throughput (like nanochat)
+                    tokens_per_sec = int(achieved_global_batch_tokens / max(dt, 1e-9))
+                    log_buf[0] = window_loss / max(1, window_steps)
+                    log_buf[1] = grad_norm.full_tensor() if isinstance(grad_norm, DTensor) else (grad_norm if isinstance(grad_norm, torch.Tensor) else float(grad_norm))
                     log_vals = log_buf.cpu()
-                    tok = float(log_vals[0])
-                    raw_tok = float(log_vals[1])
-                    elapsed = float(log_vals[2])
-                    loss_to_log = float(log_vals[3])
-                    grad_norm_val = float(log_vals[4])
-                    tokens_per_sec = tok / max(elapsed, 1e-9)
-                    raw_tokens_per_sec = raw_tok / max(elapsed, 1e-9)
-
-                    achieved_flops_per_sec = raw_tokens_per_sec * _flops_per_token
-                    per_gpu_flops = achieved_flops_per_sec / max(effective_world_size, 1)
-                    mfu = per_gpu_flops / _peak_flops_per_gpu
+                    loss_to_log = float(log_vals[0])
+                    grad_norm_val = float(log_vals[1])
+                    tok = float(token_count.item())
+                    raw_tok = float(raw_token_count.item())
+                    if distributed and dist.is_initialized():
+                        tok_buf = torch.tensor([tok, raw_tok], device=device)
+                        dist.all_reduce(tok_buf, op=dist.ReduceOp.SUM)
+                        tok, raw_tok = float(tok_buf[0].item()), float(tok_buf[1].item())
+                    mfu = (_flops_per_token * achieved_global_batch_tokens / max(dt, 1e-9)) / (_peak_flops_per_gpu * max(effective_world_size, 1))
 
                     token_count.zero_()
                     raw_token_count.zero_()
-                    token_t0 = None
-                    have_tokens_since_log = False
 
                     # VRAM logging only at eval steps (expensive: all_reduce + multiple .item())
                     if global_step % eval_steps == 0:
@@ -770,10 +764,10 @@ def run_te_pretraining(
                         "train/learning_rate": learning_rate,
                         "train/epoch": epoch + (micro_step + 1) / synced_train_loader_len,
                         "train/tokens_per_sec": tokens_per_sec,
-                        "train/raw_tokens_per_sec": raw_tokens_per_sec,
                         "train/step_real_tokens": int(tok),
                         "train/step_raw_tokens": int(raw_tok),
                         "train/packing_waste_pct": waste_pct,
+                        "train/dt": dt,
                     }
                     if muon_lr is not None:
                         payload["train/muon_lr"] = muon_lr
@@ -787,9 +781,8 @@ def run_te_pretraining(
                     logger.info(
                         f"[step {global_step}/{total_steps}] "
                         f"loss={loss_to_log:.4f} lr={learning_rate:.2e} {muon_lr_str}"
-                        f"grad_norm={grad_norm_val:.4f} tok/s={tokens_per_sec:,.0f} "
-                        f"raw_tok/s={raw_tokens_per_sec:,.0f} "
-                        f"step_tokens={int(tok):,} waste={waste_pct:.1f}% "
+                        f"grad_norm={grad_norm_val:.4f} tok/s={tokens_per_sec:,} "
+                        f"dt={dt*1000:.2f}ms waste={waste_pct:.1f}% "
                         f"h100_mfu={mfu:.2%} {vram_log}"
                     )
 
