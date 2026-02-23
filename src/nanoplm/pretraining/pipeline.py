@@ -266,7 +266,7 @@ class PretrainingConfig:
     # (dynamic=False) and improves CUDA graph capture reuse.
     use_static_inp_size: bool = True
 
-    # Profiling (TE pipeline only). When enabled on rank 0:
+    # Profiling (pure_torch / pure_te pipelines). When enabled on rank 0:
     # - If running under nsys: uses CUDA Profiler API (start/stop at steps) for .nsys-rep traces.
     # - Otherwise: uses PyTorch profiler and exports a Chrome trace (chrome://tracing) to ckp_dir.
     profiler_enabled: bool = False

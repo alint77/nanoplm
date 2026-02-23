@@ -67,7 +67,7 @@ torch.backends.cudnn.allow_tf32 = True
 H100_PEAK_TFLOPS = 989.4
 
 # https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html#forward-backward-with-prefetching
-N_PREFETCH_LAYERS_FSDP2 = 2
+N_PREFETCH_LAYERS_FSDP2 = 1
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +153,96 @@ def _dist_barrier(local_rank: int) -> None:
         dist.barrier(device_ids=[local_rank])
     else:
         dist.barrier()
+
+
+def _make_pure_profiler(
+    pretrain_config: PretrainingConfig,
+    output_dir: str,
+    is_main: bool,
+):
+    """Build profiler context and step callback for the pure-torch training loop.
+
+    When profiler_enabled and is_main:
+    - If running under nsys (NSYS_PROFILING_SESSION_ID): uses CUDA Profiler API so
+      nsys can capture; start/stop at profiler_start_step / profiler_end_step.
+    - Otherwise: uses PyTorch profiler with a schedule and exports a Chrome trace
+      to output_dir/profiler_traces/chrome_trace.json (view in chrome://tracing).
+
+    Returns:
+        (context_manager, step_callback): use as ``with context: ...; step_callback(global_step)``
+        after each optimizer step.
+    """
+    if not getattr(pretrain_config, "profiler_enabled", False) or not is_main:
+        return nullcontext(), lambda _: None
+
+    start_step = getattr(pretrain_config, "profiler_start_step", 10)
+    end_step = getattr(pretrain_config, "profiler_end_step", 15)
+    running_under_nsys = "NSYS_PROFILING_SESSION_ID" in os.environ
+
+    if running_under_nsys:
+        logger.info(
+            "Profiling enabled (Nsight): CUDA Profiler API will start at step %s, stop at %s. "
+            "Run with: nsys profile -o <trace> --trace=cuda,nvtx,osrt,cudnn,cublas "
+            "--capture-range=cudaProfilerApi --capture-range-end=stop ...",
+            start_step,
+            end_step,
+        )
+
+        class _NsightController:
+            def __init__(self):
+                self.started = False
+                self.finished = False
+
+            def step(self, gs: int) -> None:
+                if self.finished:
+                    return
+                if gs == start_step and not self.started:
+                    try:
+                        torch.cuda.cudart().cudaProfilerStart()  # type: ignore[attr-defined]
+                        self.started = True
+                        logger.info("Nsight profiling started at step %s", gs)
+                    except Exception as e:
+                        logger.error("Failed to start CUDA profiler: %s", e)
+                elif gs == end_step and self.started:
+                    try:
+                        torch.cuda.cudart().cudaProfilerStop()  # type: ignore[attr-defined]
+                        self.started = False
+                        self.finished = True
+                        logger.info("Nsight profiling stopped at step %s", gs)
+                    except Exception as e:
+                        logger.error("Failed to stop CUDA profiler: %s", e)
+
+        ctrl = _NsightController()
+        return nullcontext(), ctrl.step
+
+    trace_dir = Path(output_dir) / "profiler_traces"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    trace_path = trace_dir / "chrome_trace.json"
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    wait = max(0, start_step)
+    warmup = 1
+    active = max(1, end_step - start_step - 1)
+
+    def on_trace_ready(prof: torch.profiler.profile) -> None:
+        prof.export_chrome_trace(str(trace_path))
+        logger.info("Exported PyTorch profiler trace to %s", trace_path)
+
+    prof = torch.profiler.profile(
+        activities=activities,
+        schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=0),
+        on_trace_ready=on_trace_ready,
+        record_shapes=True,
+    )
+    logger.info(
+        "Profiling enabled (PyTorch): trace will be written to %s (steps %s..%s). "
+        "Open in chrome://tracing",
+        trace_path,
+        start_step,
+        end_step,
+    )
+    return prof, lambda _: prof.step()
 
 
 # ---------------------------------------------------------------------------
@@ -837,236 +927,240 @@ def run_pure_pretraining(
 
     epoch_setter = train_ds if use_packing else train_sampler
 
-    for epoch in range(start_epoch, num_epochs):
-        if epoch_setter is not None and hasattr(epoch_setter, "set_epoch"):
-            epoch_setter.set_epoch(epoch)
+    profiler_ctx, profiler_step_cb = _make_pure_profiler(pretrain_config, output_dir, is_main)
 
-        train_iter = iter(train_loader)
-        for micro_step in range(synced_len):
-            has_batch = True
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                has_batch = False
-                batch = None
+    with profiler_ctx:
+        for epoch in range(start_epoch, num_epochs):
+            if epoch_setter is not None and hasattr(epoch_setter, "set_epoch"):
+                epoch_setter.set_epoch(epoch)
 
-            # Token packing can still yield uneven batch counts per rank. If any rank
-            # runs out early, stop this epoch on all ranks to avoid collective deadlock.
-            if distributed and dist.is_initialized():
-                has_batch_t = torch.tensor(
-                    1 if has_batch else 0,
-                    device=device,
-                    dtype=torch.int32,
-                )
-                dist.all_reduce(has_batch_t, op=dist.ReduceOp.MIN)
-                if int(has_batch_t.item()) == 0:
-                    if is_main and micro_step + 1 < synced_len:
-                        logger.warning(
-                            "Ending epoch early at micro_step=%s due to uneven packed batches across ranks "
-                            "(configured=%s).",
-                            micro_step,
-                            synced_len,
-                        )
+            train_iter = iter(train_loader)
+            for micro_step in range(synced_len):
+                has_batch = True
+                try:
+                    batch = next(train_iter)
+                except StopIteration:
+                    has_batch = False
+                    batch = None
+
+                # Token packing can still yield uneven batch counts per rank. If any rank
+                # runs out early, stop this epoch on all ranks to avoid collective deadlock.
+                if distributed and dist.is_initialized():
+                    has_batch_t = torch.tensor(
+                        1 if has_batch else 0,
+                        device=device,
+                        dtype=torch.int32,
+                    )
+                    dist.all_reduce(has_batch_t, op=dist.ReduceOp.MIN)
+                    if int(has_batch_t.item()) == 0:
+                        if is_main and micro_step + 1 < synced_len:
+                            logger.warning(
+                                "Ending epoch early at micro_step=%s due to uneven packed batches across ranks "
+                                "(configured=%s).",
+                                micro_step,
+                                synced_len,
+                            )
+                        break
+                elif not has_batch:
                     break
-            elif not has_batch:
-                break
 
-            if not has_batch:
-                break
+                if not has_batch:
+                    break
 
-            if resume_micro_step > 0 and epoch == resume_epoch and micro_step < resume_micro_step:
-                continue
+                if resume_micro_step > 0 and epoch == resume_epoch and micro_step < resume_micro_step:
+                    continue
 
-            if distributed and N_PREFETCH_LAYERS_FSDP2 > 1:
-                model.unshard()
+                if distributed and N_PREFETCH_LAYERS_FSDP2 > 1:
+                    model.unshard()
 
-            batch = _move_batch_to_device(batch, device)
+                batch = _move_batch_to_device(batch, device)
 
-            # FSDP2: only reduce-scatter gradients at accumulation boundaries
-            if distributed:
-                sync = (micro_step + 1) % inferred_grad_accum_steps == 0 or micro_step + 1 == synced_len
-                model.set_requires_gradient_sync(sync)
+                # FSDP2: only reduce-scatter gradients at accumulation boundaries
+                if distributed:
+                    sync = (micro_step + 1) % inferred_grad_accum_steps == 0 or micro_step + 1 == synced_len
+                    model.set_requires_gradient_sync(sync)
 
-            if raw_token_count == 0:
-                token_t0 = time.perf_counter()
+                if raw_token_count == 0:
+                    token_t0 = time.perf_counter()
 
-            # Token counting
-            if "num_valid_tokens" in batch:
-                token_count += batch["num_valid_tokens"]
-                raw_token_count += batch["input_ids"].numel()
-            elif "attention_mask" in batch:
-                token_count += batch["attention_mask"].sum()
-                raw_token_count += batch["attention_mask"].numel()
-            else:
-                token_count += batch["input_ids"].numel()
-                raw_token_count += batch["input_ids"].numel()
+                # Token counting
+                if "num_valid_tokens" in batch:
+                    token_count += batch["num_valid_tokens"]
+                    raw_token_count += batch["input_ids"].numel()
+                elif "attention_mask" in batch:
+                    token_count += batch["attention_mask"].sum()
+                    raw_token_count += batch["attention_mask"].numel()
+                else:
+                    token_count += batch["input_ids"].numel()
+                    raw_token_count += batch["input_ids"].numel()
 
-            # Forward
-            amp_ctx = torch.autocast(device_type=device.type, dtype=amp_dtype) if amp_dtype else nullcontext()
-            with amp_ctx:
-                fwd_kwargs = dict(input_ids=batch["input_ids"], labels=batch["labels"])
-                if "attention_mask" in batch:
-                    fwd_kwargs["attention_mask"] = batch["attention_mask"]
-                if "cu_seqlens" in batch:
-                    cu_seqlens = batch["cu_seqlens"]
-                    # cu_seqlens has shape (num_seqs+1,) which varies per packing
-                    # bucket.  Mark dim-0 dynamic so torch.compile(dynamic=False)
-                    # doesn't create a separate compiled graph per bucket count.
-                    torch._dynamo.mark_dynamic(cu_seqlens, 0)
-                    fwd_kwargs["cu_seqlens"] = cu_seqlens
-                    fwd_kwargs["max_seqlen"] = batch["max_seqlen"]
-                if "position_ids" in batch:
-                    fwd_kwargs["position_ids"] = batch["position_ids"]
-                out = model(**fwd_kwargs)
+                # Forward
+                amp_ctx = torch.autocast(device_type=device.type, dtype=amp_dtype) if amp_dtype else nullcontext()
+                with amp_ctx:
+                    fwd_kwargs = dict(input_ids=batch["input_ids"], labels=batch["labels"])
+                    if "attention_mask" in batch:
+                        fwd_kwargs["attention_mask"] = batch["attention_mask"]
+                    if "cu_seqlens" in batch:
+                        cu_seqlens = batch["cu_seqlens"]
+                        # cu_seqlens has shape (num_seqs+1,) which varies per packing
+                        # bucket.  Mark dim-0 dynamic so torch.compile(dynamic=False)
+                        # doesn't create a separate compiled graph per bucket count.
+                        torch._dynamo.mark_dynamic(cu_seqlens, 0)
+                        fwd_kwargs["cu_seqlens"] = cu_seqlens
+                        fwd_kwargs["max_seqlen"] = batch["max_seqlen"]
+                    if "position_ids" in batch:
+                        fwd_kwargs["position_ids"] = batch["position_ids"]
+                    out = model(**fwd_kwargs)
 
-            loss = out["loss"] if isinstance(out, dict) else out.loss
-            loss = loss / inferred_grad_accum_steps
+                loss = out["loss"] if isinstance(out, dict) else out.loss
+                loss = loss / inferred_grad_accum_steps
 
-            # Backward
-            if scaler is not None and scaler.is_enabled():
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+                # Backward
+                if scaler is not None and scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
-            accum_loss = accum_loss + loss.detach()
+                accum_loss = accum_loss + loss.detach()
 
-            # Skip to next micro-step if not at accumulation boundary
-            is_boundary = (micro_step + 1) % inferred_grad_accum_steps == 0
-            is_last = micro_step + 1 == synced_len
-            if not (is_boundary or is_last):
-                continue
+                # Skip to next micro-step if not at accumulation boundary
+                is_boundary = (micro_step + 1) % inferred_grad_accum_steps == 0
+                is_last = micro_step + 1 == synced_len
+                if not (is_boundary or is_last):
+                    continue
 
-            # accum_loss = sum(Li/grad_accum). For partial last step of epoch, true mean = sum(Li)/n_micro.
-            # Scale so reported loss = true mean: accum_loss * grad_accum / n_micro
-            n_micro = (micro_step + 1) % inferred_grad_accum_steps or inferred_grad_accum_steps
-            accum_loss *= inferred_grad_accum_steps / n_micro
+                # accum_loss = sum(Li/grad_accum). For partial last step of epoch, true mean = sum(Li)/n_micro.
+                # Scale so reported loss = true mean: accum_loss * grad_accum / n_micro
+                n_micro = (micro_step + 1) % inferred_grad_accum_steps or inferred_grad_accum_steps
+                accum_loss *= inferred_grad_accum_steps / n_micro
 
-            # Optimizer step
-            if scaler is not None and scaler.is_enabled():
-                scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                # Optimizer step
+                if scaler is not None and scaler.is_enabled():
+                    scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
 
-            step_skipped = False
-            if scaler is not None and scaler.is_enabled():
-                old_scale = scaler.get_scale()
-                scaler.step(optimizer)
-                scaler.update()
-                step_skipped = scaler.get_scale() < old_scale
-            else:
-                optimizer.step()
+                step_skipped = False
+                if scaler is not None and scaler.is_enabled():
+                    old_scale = scaler.get_scale()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    step_skipped = scaler.get_scale() < old_scale
+                else:
+                    optimizer.step()
 
-            if isinstance(optimizer, (DionMuon, DionNorMuon)):
-                muon_lr = optimizer.param_groups[0]["lr"]
-                learning_rate = optimizer.param_groups[1]["lr"]
-            else:
-                learning_rate = optimizer.param_groups[0]["lr"]
-                muon_lr = None
+                if isinstance(optimizer, (DionMuon, DionNorMuon)):
+                    muon_lr = optimizer.param_groups[0]["lr"]
+                    learning_rate = optimizer.param_groups[1]["lr"]
+                else:
+                    learning_rate = optimizer.param_groups[0]["lr"]
+                    muon_lr = None
 
-            if not step_skipped:
-                scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
+                if not step_skipped:
+                    scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
 
-            global_step += 1
-            window_loss += accum_loss.item()
-            window_steps += 1
-            accum_loss = torch.tensor(0.0, device=device)
+                global_step += 1
+                profiler_step_cb(global_step)
+                window_loss += accum_loss.item()
+                window_steps += 1
+                accum_loss = torch.tensor(0.0, device=device)
 
-            # ---- Throughput / MFU ----
-            t1 = time.perf_counter()
-            elapsed = t1 - (token_t0 or t1)
-            tok, raw_tok = float(token_count.item()), float(raw_token_count)
+                # ---- Throughput / MFU ----
+                t1 = time.perf_counter()
+                elapsed = t1 - (token_t0 or t1)
+                tok, raw_tok = float(token_count.item()), float(raw_token_count)
 
-            if distributed and dist.is_initialized():
-                buf = torch.tensor([tok, raw_tok, elapsed], device=device)
-                dist.all_reduce(buf[:2], op=dist.ReduceOp.SUM)
-                dist.all_reduce(buf[2:], op=dist.ReduceOp.MAX)
-                tok, raw_tok, elapsed = buf[0].item(), buf[1].item(), buf[2].item()
+                if distributed and dist.is_initialized():
+                    buf = torch.tensor([tok, raw_tok, elapsed], device=device)
+                    dist.all_reduce(buf[:2], op=dist.ReduceOp.SUM)
+                    dist.all_reduce(buf[2:], op=dist.ReduceOp.MAX)
+                    tok, raw_tok, elapsed = buf[0].item(), buf[1].item(), buf[2].item()
 
-            tps = tok / max(elapsed, 1e-9)
-            raw_tps = raw_tok / max(elapsed, 1e-9)
-            mfu = (raw_tps * _flops_per_token / max(effective_world_size, 1)) / _peak_flops
+                tps = tok / max(elapsed, 1e-9)
+                raw_tps = raw_tok / max(elapsed, 1e-9)
+                mfu = (raw_tps * _flops_per_token / max(effective_world_size, 1)) / _peak_flops
 
-            token_count = torch.tensor(0, dtype=torch.long, device=device)
-            raw_token_count = 0
-            token_t0 = None
+                token_count = torch.tensor(0, dtype=torch.long, device=device)
+                raw_token_count = 0
+                token_t0 = None
 
-            # ---- Logging ----
-            should_log = global_step % logging_steps == 0
-            vram_log = ""
-            if should_log:
-                vram_log = _format_vram_for_log(
-                    device=device,
-                    distributed=distributed,
-                    reset_peak=True,
-                )
-            if should_log and is_main:
-                avg_loss = window_loss / max(1, window_steps)
-                waste = (1.0 - tok / max(raw_tok, 1)) * 100
-                grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
-                muon_str = f"muon_lr={muon_lr:.2e} " if muon_lr is not None else ""
-                logger.info(
-                    f"[step {global_step}/{total_steps}] "
-                    f"loss={avg_loss:.4f} lr={learning_rate:.2e} {muon_str}"
-                    f"grad_norm={grad_norm_val:.4f} tok/s={tps:,.0f} "
-                    f"raw_tok/s={raw_tps:,.0f} "
-                    f"step_tokens={int(tok):,} waste={waste:.1f}% "
-                    f"h100_mfu={mfu:.2%} {vram_log}"
-                )
-                payload = {
-                    "train/global_step": global_step,
-                    "train/loss": avg_loss,
-                    "train/grad_norm": grad_norm_val,
-                    "train/learning_rate": learning_rate,
-                    "train/epoch": epoch + (micro_step + 1) / synced_len,
-                    "train/tokens_per_sec": tps,
-                    "train/raw_tokens_per_sec": raw_tps,
-                    "train/step_real_tokens": int(tok),
-                    "train/step_raw_tokens": int(raw_tok),
-                    "train/packing_waste_pct": waste,
-                }
-                if muon_lr is not None:
-                    payload["train/muon_lr"] = muon_lr
-                if wandb_enabled and wandb.run is not None:
-                    try:
-                        wandb.log(payload)
-                    except Exception as exc:
-                        wandb_enabled = False
-                        logger.warning(f"W&B log failed; disabling. Error: {exc}")
-
-            # GC: after first step, freeze; then periodic collect
-            if first_step_of_run:
-                first_step_of_run = False
-                gc.collect(); gc.freeze(); gc.disable()
-            elif global_step % 5000 == 0:
-                gc.collect()
-
-            if should_log:
-                window_loss = 0.0
-                window_steps = 0
-
-            # ---- Eval ----
-            if global_step % eval_steps == 0:
-                eval_loss = _evaluate(orig_model, eval_loader, device, distributed, amp_dtype)
-                if is_main:
-                    logger.info(f"[step {global_step}] eval_loss={eval_loss:.4f}")
+                # ---- Logging ----
+                should_log = global_step % logging_steps == 0
+                vram_log = ""
+                if should_log:
+                    vram_log = _format_vram_for_log(
+                        device=device,
+                        distributed=distributed,
+                        reset_peak=True,
+                    )
+                if should_log and is_main:
+                    avg_loss = window_loss / max(1, window_steps)
+                    waste = (1.0 - tok / max(raw_tok, 1)) * 100
+                    grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+                    muon_str = f"muon_lr={muon_lr:.2e} " if muon_lr is not None else ""
+                    logger.info(
+                        f"[step {global_step}/{total_steps}] "
+                        f"loss={avg_loss:.4f} lr={learning_rate:.2e} {muon_str}"
+                        f"grad_norm={grad_norm_val:.4f} tok/s={tps:,.0f} "
+                        f"raw_tok/s={raw_tps:,.0f} "
+                        f"step_tokens={int(tok):,} waste={waste:.1f}% "
+                        f"h100_mfu={mfu:.2%} {vram_log}"
+                    )
+                    payload = {
+                        "train/global_step": global_step,
+                        "train/loss": avg_loss,
+                        "train/grad_norm": grad_norm_val,
+                        "train/learning_rate": learning_rate,
+                        "train/epoch": epoch + (micro_step + 1) / synced_len,
+                        "train/tokens_per_sec": tps,
+                        "train/raw_tokens_per_sec": raw_tps,
+                        "train/step_real_tokens": int(tok),
+                        "train/step_raw_tokens": int(raw_tok),
+                        "train/packing_waste_pct": waste,
+                    }
+                    if muon_lr is not None:
+                        payload["train/muon_lr"] = muon_lr
                     if wandb_enabled and wandb.run is not None:
                         try:
-                            wandb.log({"train/global_step": global_step, "eval/loss": eval_loss})
+                            wandb.log(payload)
                         except Exception as exc:
                             wandb_enabled = False
                             logger.warning(f"W&B log failed; disabling. Error: {exc}")
-                model.train()
 
-            # ---- Save ----
-            if global_step % save_steps == 0:
-                _save_checkpoint(
-                    model, optimizer, scheduler, global_step, epoch,
-                    output_dir, logging_steps, eval_steps, save_steps,
-                    distributed, is_main,
-                )
+                # GC: after first step, freeze; then periodic collect
+                if first_step_of_run:
+                    first_step_of_run = False
+                    gc.collect(); gc.freeze(); gc.disable()
+                elif global_step % 5000 == 0:
+                    gc.collect()
 
-        if resume_micro_step > 0 and epoch == resume_epoch:
-            resume_micro_step = 0
+                if should_log:
+                    window_loss = 0.0
+                    window_steps = 0
+
+                # ---- Eval ----
+                if global_step % eval_steps == 0:
+                    eval_loss = _evaluate(orig_model, eval_loader, device, distributed, amp_dtype)
+                    if is_main:
+                        logger.info(f"[step {global_step}] eval_loss={eval_loss:.4f}")
+                        if wandb_enabled and wandb.run is not None:
+                            try:
+                                wandb.log({"train/global_step": global_step, "eval/loss": eval_loss})
+                            except Exception as exc:
+                                wandb_enabled = False
+                                logger.warning(f"W&B log failed; disabling. Error: {exc}")
+                    model.train()
+
+                # ---- Save ----
+                if global_step % save_steps == 0:
+                    _save_checkpoint(
+                        model, optimizer, scheduler, global_step, epoch,
+                        output_dir, logging_steps, eval_steps, save_steps,
+                        distributed, is_main,
+                    )
+
+            if resume_micro_step > 0 and epoch == resume_epoch:
+                resume_micro_step = 0
 
     # ---- Finalize ----
     if distributed and dist.is_initialized():
