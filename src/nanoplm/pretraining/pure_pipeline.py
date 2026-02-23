@@ -827,10 +827,10 @@ def run_pure_pretraining(
     optimizer.zero_grad(set_to_none=True)
 
     global_step = start_step
-    accum_loss = 0.0
+    accum_loss = torch.tensor(0.0, device=device)
     window_loss = 0.0
     window_steps = 0
-    token_count = 0
+    token_count = torch.tensor(0, dtype=torch.long, device=device)
     raw_token_count = 0
     token_t0: Optional[float] = None
     first_step_of_run = True
@@ -892,14 +892,14 @@ def run_pure_pretraining(
 
             # Token counting
             if "num_valid_tokens" in batch:
-                token_count += int(batch["num_valid_tokens"])
-                raw_token_count += int(batch["input_ids"].numel())
+                token_count += batch["num_valid_tokens"]
+                raw_token_count += batch["input_ids"].numel()
             elif "attention_mask" in batch:
-                token_count += int(batch["attention_mask"].sum().item())
-                raw_token_count += int(batch["attention_mask"].numel())
+                token_count += batch["attention_mask"].sum()
+                raw_token_count += batch["attention_mask"].numel()
             else:
-                token_count += int(batch["input_ids"].numel())
-                raw_token_count += int(batch["input_ids"].numel())
+                token_count += batch["input_ids"].numel()
+                raw_token_count += batch["input_ids"].numel()
 
             # Forward
             amp_ctx = torch.autocast(device_type=device.type, dtype=amp_dtype) if amp_dtype else nullcontext()
@@ -928,7 +928,7 @@ def run_pure_pretraining(
             else:
                 loss.backward()
 
-            accum_loss += loss.item()
+            accum_loss = accum_loss + loss.detach()
 
             # Skip to next micro-step if not at accumulation boundary
             is_boundary = (micro_step + 1) % inferred_grad_accum_steps == 0
@@ -944,8 +944,7 @@ def run_pure_pretraining(
             # Optimizer step
             if scaler is not None and scaler.is_enabled():
                 scaler.unscale_(optimizer)
-            grad_norm_t = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-            grad_norm = grad_norm_t.item() if isinstance(grad_norm_t, torch.Tensor) else float(grad_norm_t)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
 
             step_skipped = False
             if scaler is not None and scaler.is_enabled():
@@ -968,14 +967,14 @@ def run_pure_pretraining(
             optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
-            window_loss += accum_loss
+            window_loss += accum_loss.item()
             window_steps += 1
-            accum_loss = 0.0
+            accum_loss = torch.tensor(0.0, device=device)
 
             # ---- Throughput / MFU ----
             t1 = time.perf_counter()
             elapsed = t1 - (token_t0 or t1)
-            tok, raw_tok = float(token_count), float(raw_token_count)
+            tok, raw_tok = float(token_count.item()), float(raw_token_count)
 
             if distributed and dist.is_initialized():
                 buf = torch.tensor([tok, raw_tok, elapsed], device=device)
@@ -987,7 +986,7 @@ def run_pure_pretraining(
             raw_tps = raw_tok / max(elapsed, 1e-9)
             mfu = (raw_tps * _flops_per_token / max(effective_world_size, 1)) / _peak_flops
 
-            token_count = 0
+            token_count = torch.tensor(0, dtype=torch.long, device=device)
             raw_token_count = 0
             token_t0 = None
 
@@ -1003,11 +1002,12 @@ def run_pure_pretraining(
             if should_log and is_main:
                 avg_loss = window_loss / max(1, window_steps)
                 waste = (1.0 - tok / max(raw_tok, 1)) * 100
+                grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
                 muon_str = f"muon_lr={muon_lr:.2e} " if muon_lr is not None else ""
                 logger.info(
                     f"[step {global_step}/{total_steps}] "
                     f"loss={avg_loss:.4f} lr={learning_rate:.2e} {muon_str}"
-                    f"grad_norm={grad_norm:.4f} tok/s={tps:,.0f} "
+                    f"grad_norm={grad_norm_val:.4f} tok/s={tps:,.0f} "
                     f"raw_tok/s={raw_tps:,.0f} "
                     f"step_tokens={int(tok):,} waste={waste:.1f}% "
                     f"h100_mfu={mfu:.2%} {vram_log}"
@@ -1015,7 +1015,7 @@ def run_pure_pretraining(
                 payload = {
                     "train/global_step": global_step,
                     "train/loss": avg_loss,
-                    "train/grad_norm": grad_norm,
+                    "train/grad_norm": grad_norm_val,
                     "train/learning_rate": learning_rate,
                     "train/epoch": epoch + (micro_step + 1) / synced_len,
                     "train/tokens_per_sec": tps,
