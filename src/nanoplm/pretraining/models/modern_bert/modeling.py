@@ -73,6 +73,36 @@ def _parse_canon_layers_mode(mode: str) -> frozenset[str]:
     return frozenset(selected)
 
 
+def _resolve_canon_kernel_size(
+    canon_layer_type: str,
+    canon_layers_kernel_size: Optional[int],
+) -> int:
+    allowed_by_type = {
+        "causal": frozenset({2, 3, 4}),
+        "symmetric": frozenset({3, 5, 7}),
+    }
+    default_by_type = {
+        "causal": 4,
+        "symmetric": 5,
+    }
+    allowed = allowed_by_type[canon_layer_type]
+    if canon_layers_kernel_size is None:
+        return default_by_type[canon_layer_type]
+    if isinstance(canon_layers_kernel_size, bool) or not isinstance(canon_layers_kernel_size, int):
+        raise ValueError(
+            "canon_layers_kernel_size must be an integer or null/None "
+            f"(auto default). Got {canon_layers_kernel_size!r}."
+        )
+    if canon_layers_kernel_size not in allowed:
+        allowed_str = ", ".join(str(v) for v in sorted(allowed))
+        raise ValueError(
+            "Invalid canon_layers_kernel_size="
+            f"{canon_layers_kernel_size} for canon_layer_type={canon_layer_type!r}. "
+            f"Allowed values: {allowed_str}."
+        )
+    return canon_layers_kernel_size
+
+
 @dataclass
 class ModernBertConfig:
     vocab_size: int = 50368
@@ -113,6 +143,7 @@ class ModernBertConfig:
     use_canon_layers: bool = False
     canon_layers_mode: str = "abcd"
     canon_layer_type: str = "causal"
+    canon_layers_kernel_size: Optional[int] = None
     resid_lambda_init: float = 1.0
     x0_lambda_init: float = 0.1
 
@@ -142,6 +173,10 @@ class ModernBertConfig:
                 f"Unsupported canon_layer_type: {self.canon_layer_type!r}. "
                 "Supported: ['causal', 'symmetric']"
             )
+        self.canon_layers_kernel_size = _resolve_canon_kernel_size(
+            self.canon_layer_type,
+            self.canon_layers_kernel_size,
+        )
         self.canon_layer_set = _parse_canon_layers_mode(self.canon_layers_mode)
         if not self.use_canon_layers:
             self.canon_layer_set = frozenset()
@@ -281,9 +316,16 @@ class CausalCanonLayer(nn.Module):
         super().__init__()
         self.channels = channels
         self.kernel_size = kernel_size
-        # Weight: (channels, kernel_size) — depthwise, no bias
-        self.weight = nn.Parameter(torch.empty(channels, kernel_size))
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        # Weight: (channels, kernel_size) — depthwise, no bias.
+        # Initialize via PyTorch Conv1d defaults instead of custom init.
+        default_w = nn.Conv1d(
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=kernel_size,
+            groups=channels,
+            bias=False,
+        ).weight[:, 0, :].detach()
+        self.weight = nn.Parameter(default_w)
 
     def _forward_varlen(self, x, cu_seqlens, position_ids=None):
         T, C = x.shape
@@ -326,9 +368,17 @@ def _make_canon_layer(
     channels: int, config: ModernBertConfig
 ) -> nn.Module:
     """Factory: returns the right canon layer based on config.canon_layer_type."""
+    if config.canon_layers_kernel_size is None:
+        raise ValueError("canon_layers_kernel_size was not resolved in ModernBertConfig.__post_init__")
     if config.canon_layer_type == "causal":
-        return CausalCanonLayer(channels, kernel_size=4)
-    return ModernBertCanonLayer(channels, kernel_size=5)
+        return CausalCanonLayer(channels, kernel_size=config.canon_layers_kernel_size)
+    return ModernBertCanonLayer(channels, kernel_size=config.canon_layers_kernel_size)
+
+
+def _canon_accum_dtype(x: torch.Tensor) -> torch.dtype:
+    if x.dtype in (torch.float16, torch.bfloat16):
+        return torch.float32
+    return x.dtype
 
 
 class ModernBertCanonLayer(nn.Module):
@@ -353,7 +403,20 @@ class ModernBertCanonLayer(nn.Module):
         n_seqs = cu_seqlens.shape[0] - 1
 
         if n_seqs <= 1:
-            mixed = self.conv(x.T.unsqueeze(0)).squeeze(0).T
+            acc_dtype = _canon_accum_dtype(x)
+            x_acc = x.to(dtype=acc_dtype)
+            mixed = F.conv1d(
+                x_acc.T.unsqueeze(0),
+                self.conv.weight.to(dtype=acc_dtype),
+                bias=(
+                    self.conv.bias.to(dtype=acc_dtype)
+                    if self.conv.bias is not None
+                    else None
+                ),
+                stride=1,
+                padding=self.radius,
+                groups=self.conv.groups,
+            ).squeeze(0).T.to(dtype=x.dtype)
             return x + mixed
 
         if position_ids is not None and position_ids.shape[0] == T:
@@ -377,15 +440,28 @@ class ModernBertCanonLayer(nn.Module):
         return x + mixed
 
     def _forward_padded(self, x, attention_mask=None):
+        acc_dtype = _canon_accum_dtype(x)
+        x_acc = x.to(dtype=acc_dtype)
         token_mask = None
         if attention_mask is not None:
-            token_mask = attention_mask.unsqueeze(-1).to(dtype=x.dtype)
-            x = x * token_mask
-        mixed = self.conv(x.transpose(1, 2)).transpose(1, 2)
-        out = x + mixed
+            token_mask = attention_mask.unsqueeze(-1).to(dtype=acc_dtype)
+            x_acc = x_acc * token_mask
+        mixed = F.conv1d(
+            x_acc.transpose(1, 2),
+            self.conv.weight.to(dtype=acc_dtype),
+            bias=(
+                self.conv.bias.to(dtype=acc_dtype)
+                if self.conv.bias is not None
+                else None
+            ),
+            stride=1,
+            padding=self.radius,
+            groups=self.conv.groups,
+        ).transpose(1, 2)
+        out = x_acc + mixed
         if token_mask is not None:
             out = out * token_mask
-        return out
+        return out.to(dtype=x.dtype)
 
     def forward(self, x, position_ids=None, cu_seqlens=None, attention_mask=None):
         if cu_seqlens is not None:
@@ -397,15 +473,19 @@ class ModernBertCanonLayer(nn.Module):
 
 def _varlen_canon_inner(x, seq_id, weight, bias, radius):
     """Depthwise conv with boundary masking (checkpointed to save memory)."""
-    out = torch.zeros_like(x)
+    acc_dtype = _canon_accum_dtype(x)
+    x_acc = x.to(dtype=acc_dtype)
+    weight_acc = weight.to(dtype=acc_dtype)
+    bias_acc = bias.to(dtype=acc_dtype) if bias is not None else None
+    out = torch.zeros_like(x_acc)
     for k, offset in enumerate(range(-radius, radius + 1)):
-        rolled_x = torch.roll(x, shifts=-offset, dims=0)
+        rolled_x = torch.roll(x_acc, shifts=-offset, dims=0)
         rolled_id = torch.roll(seq_id, shifts=-offset, dims=0)
-        valid = (rolled_id == seq_id).unsqueeze(-1).to(x.dtype)
-        out = out + rolled_x * valid * weight[:, k]
-    if bias is not None:
-        out = out + bias
-    return out
+        valid = (rolled_id == seq_id).unsqueeze(-1).to(dtype=acc_dtype)
+        out = out + rolled_x * valid * weight_acc[:, k]
+    if bias_acc is not None:
+        out = out + bias_acc
+    return out.to(dtype=x.dtype)
 
 
 def _varlen_causal_canon_inner(x, seq_id, weight, kernel_size):
@@ -414,14 +494,17 @@ def _varlen_causal_canon_inner(x, seq_id, weight, kernel_size):
     Only looks at current and past tokens: offsets 0, 1, ..., K-1.
     weight[:, 0] is applied to x[t], weight[:, 1] to x[t-1], etc.
     """
-    out = torch.zeros_like(x)
+    acc_dtype = _canon_accum_dtype(x)
+    x_acc = x.to(dtype=acc_dtype)
+    weight_acc = weight.to(dtype=acc_dtype)
+    out = torch.zeros_like(x_acc)
     for k in range(kernel_size):
         # k=0 → current token (offset=0), k=1 → one step back, etc.
-        rolled_x = torch.roll(x, shifts=k, dims=0)
+        rolled_x = torch.roll(x_acc, shifts=k, dims=0)
         rolled_id = torch.roll(seq_id, shifts=k, dims=0)
-        valid = (rolled_id == seq_id).unsqueeze(-1).to(x.dtype)
-        out = out + rolled_x * valid * weight[:, k]
-    return out
+        valid = (rolled_id == seq_id).unsqueeze(-1).to(dtype=acc_dtype)
+        out = out + rolled_x * valid * weight_acc[:, k]
+    return out.to(dtype=x.dtype)
 
 
 class ModernBertEmbeddings(nn.Module):

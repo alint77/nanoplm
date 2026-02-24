@@ -436,6 +436,13 @@ def pretrain():
          "'symmetric' uses bidirectional nn.Conv1d (slower, original implementation)",
 )
 @click.option(
+    "--canon-layers-kernel-size",
+    type=int,
+    default=None,
+    help="Canon kernel size. If omitted, defaults to 4 for 'causal' and 5 for 'symmetric'. "
+         "Allowed values: causal -> {2,3,4}, symmetric -> {3,5,7}.",
+)
+@click.option(
     "--pure-torch",
     is_flag=True,
     default=False,
@@ -508,6 +515,7 @@ def run(
     use_canon_layers: bool,
     canon_layers_mode: str,
     canon_layer_type: str,
+    canon_layers_kernel_size: Optional[int],
     pure_torch: bool,
     pure_te: bool,
 ):
@@ -590,6 +598,7 @@ def run(
         use_canon_layers=use_canon_layers,
         canon_layers_mode=canon_layers_mode,
         canon_layer_type=canon_layer_type,
+        canon_layers_kernel_size=canon_layers_kernel_size,
     )
 
     _set_seed_for_init(seed)
@@ -791,6 +800,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  use_canon_layers: true  # enables Canon-ABCD local mixing layers (pure_torch only)\n"
         "  canon_layers_mode: \"ac\"  # subset of Canon sites: A/B/C/D (e.g. \"ac\" for lighter mode)\n"
         "  canon_layer_type: \"causal\"  # 'causal' (fused CUDA kernel, fast) or 'symmetric' (nn.Conv1d, bidirectional)\n"
+        "  canon_layers_kernel_size: 4  # causal: 2/3/4, symmetric: 3/5/7 (defaults: causal=4, symmetric=5)\n"
         "\n"
         "pretraining:\n"
         "  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)\n"
