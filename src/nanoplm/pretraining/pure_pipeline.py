@@ -710,11 +710,22 @@ def run_pure_pretraining(
 
     if distributed:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
+
         if torch.cuda.is_available():
-            torch.cuda.set_device(local_rank)
-            device = torch.device(f"cuda:{local_rank}")
+            device = torch.device("cuda", local_rank)
+            torch.cuda.set_device(device)   
+        else:
+            device = torch.device("cpu")
+
         if not dist.is_initialized():
-            dist.init_process_group(backend=backend, **({"device_id": local_rank} if backend == "nccl" else {}))
+            kwargs = {}
+            if backend == "nccl":
+                kwargs["device_id"] = device  # <-- FIX: must be torch.device
+
+            dist.init_process_group(
+                backend=backend,
+                **kwargs
+            )
 
     is_main = (not distributed) or dist.get_rank() == 0
     eval_sampler = DistributedSampler(val_ds, shuffle=False) if distributed else SequentialSampler(val_ds)
