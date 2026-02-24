@@ -837,6 +837,14 @@ def run_te_pretraining(
                         is_main=is_main,
                     )
 
+            # Reset the logging window so epoch-transition overhead (dataloader
+            # teardown / recreation) doesn't pollute the next window's metrics.
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            log_window_t0 = time.perf_counter()
+            window_loss.zero_()
+            window_steps = 0
+
             if resume_micro_step > 0 and epoch == resume_epoch:
                 resume_micro_step = 0
 
