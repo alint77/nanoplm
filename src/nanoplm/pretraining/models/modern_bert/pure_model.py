@@ -62,6 +62,7 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             use_qk_norm=config.use_qk_norm,
             use_canon_layers=config.use_canon_layers,
             canon_layers_mode=config.canon_layers_mode,
+            canon_layer_type=config.canon_layer_type,
             resid_lambda_init=config.resid_lambda_init,
             x0_lambda_init=config.x0_lambda_init,
         )
@@ -105,6 +106,7 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             use_qk_norm=config.use_qk_norm,
             use_canon_layers=config.use_canon_layers,
             canon_layers_mode=config.canon_layers_mode,
+            canon_layer_type=config.canon_layer_type,
             resid_lambda_init=config.resid_lambda_init,
             x0_lambda_init=config.x0_lambda_init,
         )

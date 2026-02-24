@@ -429,6 +429,13 @@ def pretrain():
     help="Subset of Canon insertion points to enable (A/B/C/D), e.g. 'abcd' or 'ac'",
 )
 @click.option(
+    "--canon-layer-type",
+    type=click.Choice(["causal", "symmetric"], case_sensitive=False),
+    default="causal",
+    help="Canon layer conv type: 'causal' uses fused causal_conv1d CUDA kernel (fast, requires packing); "
+         "'symmetric' uses bidirectional nn.Conv1d (slower, original implementation)",
+)
+@click.option(
     "--pure-torch",
     is_flag=True,
     default=False,
@@ -500,6 +507,7 @@ def run(
     use_qk_norm: bool,
     use_canon_layers: bool,
     canon_layers_mode: str,
+    canon_layer_type: str,
     pure_torch: bool,
     pure_te: bool,
 ):
@@ -556,6 +564,11 @@ def run(
             "use_canon_layers requires --pure-torch. "
             "Canon layers are not implemented in HF/TE paths."
         )
+    if use_canon_layers and not use_packing:
+        raise click.ClickException(
+            "use_canon_layers requires --use-packing. "
+            "Canon layers are only supported with sequence packing enabled."
+        )
 
     _populate_batch_setup(cfg)
 
@@ -576,6 +589,7 @@ def run(
         use_qk_norm=use_qk_norm,
         use_canon_layers=use_canon_layers,
         canon_layers_mode=canon_layers_mode,
+        canon_layer_type=canon_layer_type,
     )
 
     _set_seed_for_init(seed)
@@ -667,6 +681,11 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
         raise click.ClickException(
             "model.use_canon_layers=true requires pure_torch: true (or --pure-torch). "
             "Canon layers are not implemented in HF/TE paths."
+        )
+    if model_config.use_canon_layers and not pretrain_config.use_packing:
+        raise click.ClickException(
+            "model.use_canon_layers=true requires use_packing: true. "
+            "Canon layers are only supported with sequence packing enabled."
         )
     _populate_batch_setup(pretrain_config)
 
@@ -769,8 +788,9 @@ def get_yaml(output: Optional[str], force: bool):
         "  use_resid_lambdas: true  # scales residual stream per layer\n"
         "  use_x0_lambdas: true  # blends initial embedding x0 per layer\n"
         "  use_qk_norm: false  # applies RMS norm to Q/K in attention\n"
-        "  use_canon_layers: true  # enables bidirectional Canon-ABCD (pure_torch only)\n"
+        "  use_canon_layers: true  # enables Canon-ABCD local mixing layers (pure_torch only)\n"
         "  canon_layers_mode: \"ac\"  # subset of Canon sites: A/B/C/D (e.g. \"ac\" for lighter mode)\n"
+        "  canon_layer_type: \"causal\"  # 'causal' (fused CUDA kernel, fast) or 'symmetric' (nn.Conv1d, bidirectional)\n"
         "\n"
         "pretraining:\n"
         "  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)\n"

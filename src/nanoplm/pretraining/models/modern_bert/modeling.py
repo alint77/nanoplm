@@ -22,6 +22,7 @@ from torch.utils.checkpoint import checkpoint as _checkpoint
 _HAS_FLASH_VARLEN = False
 _flash_varlen_fn = None
 _FLASH_HAS_DROPOUT = False
+USE_ACTIVATION_CHECKPOINTING_CANON=False
 
 if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
     try:
@@ -111,6 +112,7 @@ class ModernBertConfig:
     use_qk_norm: bool = False
     use_canon_layers: bool = False
     canon_layers_mode: str = "abcd"
+    canon_layer_type: str = "causal"
     resid_lambda_init: float = 1.0
     x0_lambda_init: float = 0.1
 
@@ -133,6 +135,12 @@ class ModernBertConfig:
         if self.mlp_activation not in {"swiglu", "glu", "srelu"}:
             raise ValueError(
                 f"Unsupported mlp_activation: {self.mlp_activation}. Supported: ['swiglu', 'glu', 'srelu']"
+            )
+        self.canon_layer_type = self.canon_layer_type.lower()
+        if self.canon_layer_type not in {"causal", "symmetric"}:
+            raise ValueError(
+                f"Unsupported canon_layer_type: {self.canon_layer_type!r}. "
+                "Supported: ['causal', 'symmetric']"
             )
         self.canon_layer_set = _parse_canon_layers_mode(self.canon_layers_mode)
         if not self.use_canon_layers:
@@ -260,6 +268,69 @@ def _position_ids_from_cu_seqlens(
     return torch.arange(total, device=device, dtype=torch.int32) - offsets
 
 
+class CausalCanonLayer(nn.Module):
+    """Canon layer using causal (left-only) depthwise convolution.
+
+    Uses the same roll-based approach as ``ModernBertCanonLayer`` but only
+    looks at current + past tokens (offsets 0..K-1), matching the causal
+    conv1d design from the PhysicsLM4 reference.  torch.compile fuses
+    the entire operation into Triton kernels with zero graph breaks.
+    """
+
+    def __init__(self, channels: int, kernel_size: int = 4):
+        super().__init__()
+        self.channels = channels
+        self.kernel_size = kernel_size
+        # Weight: (channels, kernel_size) — depthwise, no bias
+        self.weight = nn.Parameter(torch.empty(channels, kernel_size))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def _forward_varlen(self, x, cu_seqlens, position_ids=None):
+        T, C = x.shape
+        n_seqs = cu_seqlens.shape[0] - 1
+
+        if position_ids is not None and position_ids.shape[0] == T:
+            seq_start = (position_ids == 0).to(dtype=cu_seqlens.dtype)
+            seq_start = seq_start.clone()
+            seq_start[0] = 1
+            seq_id = torch.cumsum(seq_start, dim=0) - 1
+        else:
+            positions = torch.arange(T, device=x.device, dtype=cu_seqlens.dtype)
+            seq_id = torch.searchsorted(cu_seqlens[1:], positions, right=True)
+
+        if self.training and x.requires_grad and USE_ACTIVATION_CHECKPOINTING_CANON:
+            mixed = _checkpoint(
+                _varlen_causal_canon_inner, x, seq_id, self.weight, self.kernel_size,
+                use_reentrant=False,
+            )
+        else:
+            mixed = _varlen_causal_canon_inner(x, seq_id, self.weight, self.kernel_size)
+        return x + mixed
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if cu_seqlens is not None:
+            return self._forward_varlen(x, cu_seqlens=cu_seqlens, position_ids=position_ids)
+        raise ValueError(
+            "CausalCanonLayer requires cu_seqlens (packed path). "
+            "Use canon_layer_type='symmetric' for the SDPA/padded path."
+        )
+
+
+def _make_canon_layer(
+    channels: int, config: ModernBertConfig
+) -> nn.Module:
+    """Factory: returns the right canon layer based on config.canon_layer_type."""
+    if config.canon_layer_type == "causal":
+        return CausalCanonLayer(channels, kernel_size=4)
+    return ModernBertCanonLayer(channels, kernel_size=5)
+
+
 class ModernBertCanonLayer(nn.Module):
     def __init__(self, channels, kernel_size=5):
         super().__init__()
@@ -296,7 +367,7 @@ class ModernBertCanonLayer(nn.Module):
         weight = self.conv.weight[:, 0, :]
         bias = self.conv.bias
 
-        if self.training and x.requires_grad:
+        if self.training and x.requires_grad and USE_ACTIVATION_CHECKPOINTING_CANON:
             mixed = _checkpoint(
                 _varlen_canon_inner, x, seq_id, weight, bias, self.radius,
                 use_reentrant=False,
@@ -334,6 +405,22 @@ def _varlen_canon_inner(x, seq_id, weight, bias, radius):
         out = out + rolled_x * valid * weight[:, k]
     if bias is not None:
         out = out + bias
+    return out
+
+
+def _varlen_causal_canon_inner(x, seq_id, weight, kernel_size):
+    """Causal depthwise conv with boundary masking (checkpointed to save memory).
+
+    Only looks at current and past tokens: offsets 0, 1, ..., K-1.
+    weight[:, 0] is applied to x[t], weight[:, 1] to x[t-1], etc.
+    """
+    out = torch.zeros_like(x)
+    for k in range(kernel_size):
+        # k=0 → current token (offset=0), k=1 → one step back, etc.
+        rolled_x = torch.roll(x, shifts=k, dims=0)
+        rolled_id = torch.roll(seq_id, shifts=k, dims=0)
+        valid = (rolled_id == seq_id).unsqueeze(-1).to(x.dtype)
+        out = out + rolled_x * valid * weight[:, k]
     return out
 
 
@@ -406,7 +493,7 @@ class ModernBertMLP(nn.Module):
         self.drop = nn.Dropout(config.mlp_dropout)
         self.act = _get_activation(config.hidden_activation)
         self.canon_d = (
-            ModernBertCanonLayer(2 * config.intermediate_size, kernel_size=5)
+            _make_canon_layer(2 * config.intermediate_size, config)
             if "d" in config.canon_layer_set
             else None
         )
@@ -491,7 +578,7 @@ class ModernBertSwiGLUMLP(nn.Module):
         )
         self.drop = nn.Dropout(config.mlp_dropout)
         self.canon_d = (
-            ModernBertCanonLayer(2 * config.intermediate_size, kernel_size=5)
+            _make_canon_layer(2 * config.intermediate_size, config)
             if "d" in config.canon_layer_set
             else None
         )
@@ -540,7 +627,7 @@ class ModernBertAttention(nn.Module):
             else nn.Identity()
         )
         self.canon_b = (
-            ModernBertCanonLayer(3 * config.hidden_size, kernel_size=5)
+            _make_canon_layer(3 * config.hidden_size, config)
             if "b" in config.canon_layer_set
             else None
         )
@@ -652,14 +739,14 @@ class ModernBertEncoderLayer(nn.Module):
             else nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
         )
         self.canon_a = (
-            ModernBertCanonLayer(config.hidden_size, kernel_size=5)
+            _make_canon_layer(config.hidden_size, config)
             if "a" in config.canon_layer_set
             else None
         )
         self.attn = ModernBertAttention(config)
         self.mlp_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
         self.canon_c = (
-            ModernBertCanonLayer(config.hidden_size, kernel_size=5)
+            _make_canon_layer(config.hidden_size, config)
             if "c" in config.canon_layer_set
             else None
         )
