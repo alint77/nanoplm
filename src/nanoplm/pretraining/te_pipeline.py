@@ -457,19 +457,6 @@ def run_te_pretraining(
         distributed=distributed,
         device=device,
     )
-    # With TokenPackingDataset + DistributedSampler, greedy packing can yield different batch
-    # counts per rank, causing desync and deadlock. Cap iteration at a safe minimum so all
-    # ranks process the same number of batches.
-    if use_packing and distributed:
-        _total_tokens = train_ds.dataset.total_tokens
-        _tokens_per_rank = _total_tokens // effective_world_size
-        _min_safe_batches = max(1, _tokens_per_rank // train_ds.max_tokens_per_batch)
-        if _min_safe_batches < synced_train_loader_len:
-            logger.info(
-                f"Capping micro-batches per epoch to {_min_safe_batches} (from {synced_train_loader_len}) "
-                "to prevent distributed deadlock with variable packing"
-            )
-            synced_train_loader_len = _min_safe_batches
     steps_per_epoch = _num_update_steps_per_epoch(
         train_loader_len=synced_train_loader_len,
         grad_accum=inferred_grad_accum_steps,
@@ -616,7 +603,20 @@ def run_te_pretraining(
                     has_batch = False
                     batch = None
 
-                if not has_batch:
+                # When packing + num_workers > 0, greedy bin-packing can produce
+                # different batch counts per rank.  Coordinate so all ranks break
+                # together to avoid FSDP / NCCL deadlock.
+                if distributed and dist.is_initialized():
+                    has_batch_t = torch.tensor(1 if has_batch else 0, device=device, dtype=torch.int32)
+                    dist.all_reduce(has_batch_t, op=dist.ReduceOp.MIN)
+                    if int(has_batch_t.item()) == 0:
+                        if is_main and has_batch:
+                            logger.warning(
+                                "Rank 0 still has data but another rank exhausted its "
+                                "iterator at micro_step=%d — ending epoch early.", micro_step,
+                            )
+                        break
+                elif not has_batch:
                     break
 
                 if resume_micro_step > 0 and epoch == resume_epoch and micro_step < resume_micro_step:

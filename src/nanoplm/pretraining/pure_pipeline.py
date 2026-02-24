@@ -304,7 +304,24 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
     # -- Prediction head dense: h -> h --
     pred_head_flops = 2 * h * h
 
-    forward_flops = attn_proj_flops + attn_flops + mlp_flops + head_flops + pred_head_flops
+    # -- Canon layer FLOPs (depthwise conv1d) --
+    # Each canon layer is a depthwise conv with kernel_size K over C channels.
+    # Forward FLOPs per token = 2 * K * C  (K multiply-accumulates per channel).
+    canon_flops = 0
+    if getattr(config, "use_canon_layers", False) and config.canon_layer_set:
+        K = config.canon_layers_kernel_size
+        canon_set = config.canon_layer_set
+        if "a" in canon_set:                        # before attention, C = h
+            canon_flops += n_layers * 2 * K * h
+        if "b" in canon_set:                        # on QKV, C = 3h
+            canon_flops += n_layers * 2 * K * 3 * h
+        if "c" in canon_set:                        # before MLP, C = h
+            canon_flops += n_layers * 2 * K * h
+        if "d" in canon_set and config.mlp_activation != "srelu":
+            # after first MLP projection, C = 2*ff (gated MLPs only)
+            canon_flops += n_layers * 2 * K * 2 * ff
+
+    forward_flops = attn_proj_flops + attn_flops + mlp_flops + head_flops + pred_head_flops + canon_flops
     return 3 * forward_flops
 
 
@@ -862,18 +879,6 @@ def run_pure_pretraining(
     optimizer = _create_optimizer(model, pretrain_config, distributed_mesh=fsdp_mesh)
 
     synced_len = _sync_train_loader_len(len(train_loader), distributed, device)
-    # With TokenPackingDataset + DistributedSampler, greedy packing can yield different batch
-    # counts per rank, causing desync and deadlock. Cap iteration at a safe minimum.
-    if use_packing and distributed:
-        _total_tokens = train_ds.dataset.total_tokens
-        _tokens_per_rank = _total_tokens // effective_world_size
-        _min_safe_batches = max(1, _tokens_per_rank // train_ds.max_tokens_per_batch)
-        if _min_safe_batches < synced_len:
-            logger.info(
-                f"Capping micro-batches per epoch to {_min_safe_batches} (from {synced_len}) "
-                "to prevent distributed deadlock with variable packing"
-            )
-            synced_len = _min_safe_batches
     steps_per_epoch = max(1, math.ceil(synced_len / max(1, inferred_grad_accum_steps)))
     total_steps = num_epochs * steps_per_epoch
     warmup_steps = min(pretrain_config.warmup_steps, total_steps)
@@ -991,7 +996,20 @@ def run_pure_pretraining(
                     has_batch = False
                     batch = None
 
-                if not has_batch:
+                # When packing + num_workers > 0, greedy bin-packing can produce
+                # different batch counts per rank.  Coordinate so all ranks break
+                # together to avoid FSDP / NCCL deadlock.
+                if distributed and dist.is_initialized():
+                    has_batch_t = torch.tensor(1 if has_batch else 0, device=device, dtype=torch.int32)
+                    dist.all_reduce(has_batch_t, op=dist.ReduceOp.MIN)
+                    if int(has_batch_t.item()) == 0:
+                        if is_main and has_batch:
+                            logger.warning(
+                                "Rank 0 still has data but another rank exhausted its "
+                                "iterator at micro_step=%d — ending epoch early.", micro_step,
+                            )
+                        break
+                elif not has_batch:
                     break
 
                 if resume_micro_step > 0 and epoch == resume_epoch and micro_step < resume_micro_step:
