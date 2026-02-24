@@ -258,6 +258,14 @@ def run_te_pretraining(
     # can cause hangs near epoch boundaries (set_epoch doesn't reach workers).
     persistent_workers = num_workers > 0 and not use_packing
     prefetch_factor = pretrain_config.prefetch_factor if num_workers > 0 else None
+    if use_packing and num_workers > 0:
+        logger.warning(
+            "Sequence packing with DataLoader workers can stall on very large datasets "
+            "due to sampler fan-out; forcing num_workers=0 for stability."
+        )
+        num_workers = 0
+        persistent_workers = False
+        prefetch_factor = None
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     distributed = bool(pretrain_config.multi_gpu)

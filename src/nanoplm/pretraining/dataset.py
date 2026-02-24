@@ -2,6 +2,7 @@ import os
 import torch
 import bisect
 import numpy as np
+from itertools import islice
 from math import ceil
 from Bio import SeqIO
 from typing import List, Dict, Optional, Any
@@ -391,17 +392,13 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
              # Handle DataLoader worker sharding if using multiple workers
              worker_info = torch.utils.data.get_worker_info()
              if worker_info is not None and worker_info.num_workers > 1:
-                 # We need to split the sampler's indices across workers.
-                 # We iterate over the sampler and pick indices corresponding to this worker.
-                 # A simple round-robin or chunking approach works.
-                 # Slicing the list is simplest for now.
-                 all_indices = list(self.sampler)
-                 # Shard indices: each worker gets a contiguous chunk
-                 per_worker = int(ceil(len(all_indices) / worker_info.num_workers))
-                 start = worker_info.id * per_worker
-                 end = min(start + per_worker, len(all_indices))
-                 indices = all_indices[start:end]
-                 iterator = (self.dataset[i] for i in indices)
+                 # Avoid materializing sampler indices into an extra Python list.
+                 # This matters for very large datasets where list(self.sampler) can
+                 # consume multiple GB and stall startup.
+                 iterator = (
+                     self.dataset[i]
+                     for i in islice(self.sampler, worker_info.id, None, worker_info.num_workers)
+                 )
              else:
                  iterator = (self.dataset[i] for i in self.sampler)
 
