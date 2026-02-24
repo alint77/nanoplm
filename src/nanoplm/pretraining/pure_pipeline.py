@@ -708,24 +708,17 @@ def run_pure_pretraining(
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     distributed = bool(pretrain_config.multi_gpu)
 
+
     if distributed:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-
         if torch.cuda.is_available():
-            device = torch.device("cuda", local_rank)
-            torch.cuda.set_device(device)   
-        else:
-            device = torch.device("cpu")
-
+            torch.cuda.set_device(local_rank)
+            device = torch.device(f"cuda:{local_rank}")
         if not dist.is_initialized():
-            kwargs = {}
             if backend == "nccl":
-                kwargs["device_id"] = device  # <-- FIX: must be torch.device
-
-            dist.init_process_group(
-                backend=backend,
-                **kwargs
-            )
+                dist.init_process_group(backend=backend, device_id=device)
+            else:
+                dist.init_process_group(backend=backend)
 
     is_main = (not distributed) or dist.get_rank() == 0
     eval_sampler = DistributedSampler(val_ds, shuffle=False) if distributed else SequentialSampler(val_ds)
