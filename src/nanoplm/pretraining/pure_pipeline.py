@@ -988,6 +988,13 @@ def run_pure_pretraining(
                 epoch_setter.set_epoch(epoch)
 
             train_iter = iter(train_loader)
+            # Reset timing window AFTER dataloader workers are ready so the
+            # first logging window doesn't include iter(train_loader) overhead.
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            log_window_t0 = time.perf_counter()
+
+            epoch_ended_early = False
             for micro_step in range(synced_len):
                 has_batch = True
                 try:
@@ -1003,13 +1010,10 @@ def run_pure_pretraining(
                     has_batch_t = torch.tensor(1 if has_batch else 0, device=device, dtype=torch.int32)
                     dist.all_reduce(has_batch_t, op=dist.ReduceOp.MIN)
                     if int(has_batch_t.item()) == 0:
-                        if is_main and has_batch:
-                            logger.warning(
-                                "Rank 0 still has data but another rank exhausted its "
-                                "iterator at micro_step=%d — ending epoch early.", micro_step,
-                            )
+                        epoch_ended_early = True
                         break
                 elif not has_batch:
+                    epoch_ended_early = True
                     break
 
                 if resume_micro_step > 0 and epoch == resume_epoch and micro_step < resume_micro_step:
@@ -1020,9 +1024,12 @@ def run_pure_pretraining(
                 if distributed and N_PREFETCH_LAYERS_FSDP2 > 1:
                     model.unshard()
 
-                # FSDP2: only reduce-scatter gradients at accumulation boundaries
+                # FSDP2: only reduce-scatter gradients at regular accumulation
+                # boundaries.  (Do NOT use synced_len as a fallback — the loop may
+                # break early via all_reduce, making synced_len unreachable.
+                # Partial accumulation at epoch end is discarded, not stepped.)
                 if distributed:
-                    sync = (micro_step + 1) % inferred_grad_accum_steps == 0 or micro_step + 1 == synced_len
+                    sync = (micro_step + 1) % inferred_grad_accum_steps == 0
                     model.set_requires_gradient_sync(sync)
 
                 # Token counting
@@ -1065,16 +1072,14 @@ def run_pure_pretraining(
 
                 accum_loss = accum_loss + loss.detach()
 
-                # Skip to next micro-step if not at accumulation boundary
-                is_boundary = (micro_step + 1) % inferred_grad_accum_steps == 0
-                is_last = micro_step + 1 == synced_len
-                if not (is_boundary or is_last):
+                # Skip to next micro-step if not at a regular accumulation
+                # boundary.  We intentionally do NOT treat the last micro-step of
+                # the epoch as a boundary: the loop can break early (via the
+                # all_reduce exhaustion check above), making synced_len
+                # unreachable.  Any partial accumulation at epoch end is
+                # discarded in the epoch-boundary cleanup below.
+                if (micro_step + 1) % inferred_grad_accum_steps != 0:
                     continue
-
-                # accum_loss = sum(Li/grad_accum). For partial last step of epoch, true mean = sum(Li)/n_micro.
-                # Scale so reported loss = true mean: accum_loss * grad_accum / n_micro
-                n_micro = (micro_step + 1) % inferred_grad_accum_steps or inferred_grad_accum_steps
-                accum_loss *= inferred_grad_accum_steps / n_micro
 
                 # Optimizer step
                 if scaler is not None and scaler.is_enabled():
@@ -1212,11 +1217,30 @@ def run_pure_pretraining(
                         distributed, is_main,
                     )
 
-            # Reset the logging window so epoch-transition overhead (dataloader
-            # teardown / recreation) doesn't pollute the next window's metrics.
-            if device.type == "cuda":
-                torch.cuda.synchronize()
-            log_window_t0 = time.perf_counter()
+            # ---- Epoch boundary cleanup ----
+            # When the inner loop ends (either by exhausting synced_len or
+            # breaking early via the all_reduce exhaustion check), there may
+            # be partial gradient-accumulation state left over from micro-steps
+            # that ran forward+backward but never reached an optimizer step.
+            # Flush everything to prevent gradient leak (stale .grad tensors
+            # carrying into next epoch), loss contamination, FSDP gradient
+            # desync (partial micro-steps had sync=False), and token/loss
+            # counter bleed across the boundary.  Timing window is reset at
+            # the top of the next epoch iteration, after iter(train_loader).
+            epoch_fwd_count = micro_step if epoch_ended_early else synced_len
+            partial_discarded = epoch_fwd_count % inferred_grad_accum_steps
+            if is_main:
+                logger.info(
+                    "Epoch %d/%d complete: %d micro-steps, %d optimizer steps%s",
+                    epoch + 1, num_epochs, epoch_fwd_count,
+                    epoch_fwd_count // inferred_grad_accum_steps,
+                    f" ({partial_discarded} trailing micro-step(s) discarded)"
+                    if partial_discarded else "",
+                )
+            optimizer.zero_grad(set_to_none=True)
+            accum_loss.zero_()
+            token_count.zero_()
+            raw_token_count.zero_()
             window_loss.zero_()
             window_steps = 0
 
