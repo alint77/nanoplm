@@ -328,6 +328,7 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
         self.drop_last = drop_last
         self.split_samples = split_samples
         self.sampler = sampler
+        self._epoch = 0
 
     def __len__(self) -> int:
         """Return the estimated number of batches in the dataset."""
@@ -392,13 +393,25 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
              # Handle DataLoader worker sharding if using multiple workers
              worker_info = torch.utils.data.get_worker_info()
              if worker_info is not None and worker_info.num_workers > 1:
-                 # Avoid materializing sampler indices into an extra Python list.
-                 # This matters for very large datasets where list(self.sampler) can
-                 # consume multiple GB and stall startup.
-                 iterator = (
-                     self.dataset[i]
-                     for i in islice(self.sampler, worker_info.id, None, worker_info.num_workers)
-                 )
+                 if isinstance(self.sampler, torch.utils.data.DistributedSampler):
+                     # Build a per-worker DistributedSampler instead of sharing one sampler
+                     # and slicing in Python. This avoids O(dataset_size) index fan-out per worker.
+                     worker_sampler = torch.utils.data.DistributedSampler(
+                         self.dataset,
+                         num_replicas=self.sampler.num_replicas * worker_info.num_workers,
+                         rank=self.sampler.rank * worker_info.num_workers + worker_info.id,
+                         shuffle=self.sampler.shuffle,
+                         seed=self.sampler.seed,
+                         drop_last=self.sampler.drop_last,
+                     )
+                     worker_sampler.set_epoch(self._epoch)
+                     iterator = (self.dataset[i] for i in worker_sampler)
+                 else:
+                     # Generic fallback for non-distributed samplers.
+                     iterator = (
+                         self.dataset[i]
+                         for i in islice(self.sampler, worker_info.id, None, worker_info.num_workers)
+                     )
              else:
                  iterator = (self.dataset[i] for i in self.sampler)
 
@@ -458,10 +471,11 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
 
     def set_epoch(self, epoch: int):
         """Set the epoch for the dataset."""
+        self._epoch = int(epoch)
         if hasattr(self.dataset, "set_epoch"):
-            self.dataset.set_epoch(epoch)
+            self.dataset.set_epoch(self._epoch)
         if self.sampler is not None and hasattr(self.sampler, "set_epoch"):
-            self.sampler.set_epoch(epoch)
+            self.sampler.set_epoch(self._epoch)
 
 
 def _split_sample_by_num_tokens(sample: Dict[str, Any], num_tokens: int) -> tuple[Dict[str, Any], Dict[str, Any]]:

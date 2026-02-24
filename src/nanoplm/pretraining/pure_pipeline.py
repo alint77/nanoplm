@@ -703,14 +703,6 @@ def run_pure_pretraining(
     # queue non-determinism). Workers restart each epoch, fixing the stall.
     persistent_workers = num_workers > 0 and not use_packing
     prefetch_factor = pretrain_config.prefetch_factor if num_workers > 0 else None
-    if use_packing and num_workers > 0:
-        logger.warning(
-            "Sequence packing with DataLoader workers can stall on very large datasets "
-            "due to sampler fan-out; forcing num_workers=0 for stability."
-        )
-        num_workers = 0
-        persistent_workers = False
-        prefetch_factor = None
 
     # ---- Distributed init ----
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -976,7 +968,7 @@ def run_pure_pretraining(
     window_steps = 0
     token_count = torch.zeros((), dtype=torch.long, device=device)
     raw_token_count = torch.zeros((), dtype=torch.long, device=device)
-    step_t0: Optional[float] = None
+    log_window_t0 = time.perf_counter()
     first_step_of_run = True
 
     epoch_setter = train_ds if use_packing else train_sampler
@@ -1014,12 +1006,6 @@ def run_pure_pretraining(
                 if distributed:
                     sync = (micro_step + 1) % inferred_grad_accum_steps == 0 or micro_step + 1 == synced_len
                     model.set_requires_gradient_sync(sync)
-
-                # Start timing for this optimizer step (with CUDA sync for accuracy)
-                if step_t0 is None:
-                    if device.type == "cuda":
-                        torch.cuda.synchronize()
-                    step_t0 = time.perf_counter()
 
                 # Token counting
                 if "num_valid_tokens" in batch:
@@ -1103,20 +1089,20 @@ def run_pure_pretraining(
                 window_steps += 1
                 accum_loss.zero_()
 
-                # ---- Timing: synchronize and measure dt per step (à la nanochat) ----
-                if device.type == "cuda":
-                    torch.cuda.synchronize()
-                t1 = time.perf_counter()
-                dt = t1 - (step_t0 or t1)
-                step_t0 = None  # reset so next step re-syncs and re-measures
-
                 # ---- Logging ----
                 should_log = global_step % logging_steps == 0
                 vram_log = ""
-                tps = raw_tps = mfu = tok = raw_tok = 0.0
+                tps = mfu = tok = raw_tok = 0.0
+                avg_step_ms = 0.0
                 if should_log:
-                    # Use the known global batch size for throughput (like nanochat)
-                    tps = int(achieved_global_batch_tokens / max(dt, 1e-9))
+                    # Synchronize and measure only at logging boundaries to amortize sync cost.
+                    if device.type == "cuda":
+                        torch.cuda.synchronize()
+                    t1 = time.perf_counter()
+                    window_dt = max(1e-9, t1 - log_window_t0)
+                    log_window_t0 = t1
+                    avg_step_ms = (window_dt * 1000.0) / max(1, window_steps)
+                    tps = int((achieved_global_batch_tokens * window_steps) / window_dt)
                     # For real vs raw token tracking, still read the per-rank counters
                     log_buf[0] = window_loss / max(1, window_steps)
                     log_buf[1] = grad_norm.full_tensor() if isinstance(grad_norm, DTensor) else (grad_norm if isinstance(grad_norm, torch.Tensor) else float(grad_norm))
@@ -1129,8 +1115,9 @@ def run_pure_pretraining(
                         tok_buf = torch.tensor([tok, raw_tok], device=device)
                         dist.all_reduce(tok_buf, op=dist.ReduceOp.SUM)
                         tok, raw_tok = float(tok_buf[0].item()), float(tok_buf[1].item())
-                    raw_tps = int(achieved_global_batch_tokens / max(dt, 1e-9))
-                    mfu = (_flops_per_token * achieved_global_batch_tokens / max(dt, 1e-9)) / (_peak_flops * max(effective_world_size, 1))
+                    mfu = (
+                        _flops_per_token * achieved_global_batch_tokens * window_steps / window_dt
+                    ) / (_peak_flops * max(effective_world_size, 1))
 
                     token_count.zero_()
                     raw_token_count.zero_()
@@ -1150,7 +1137,7 @@ def run_pure_pretraining(
                         f"[step {global_step}/{total_steps}] "
                         f"loss={avg_loss:.4f} lr={learning_rate:.2e} {muon_str}"
                         f"grad_norm={grad_norm_val:.4f} tok/s={tps:,} "
-                        f"dt={dt*1000:.2f}ms wall={wall_elapsed:.1f}s waste={waste:.1f}% "
+                        f"dt={avg_step_ms:.2f}ms wall={wall_elapsed:.1f}s waste={waste:.1f}% "
                         f"h100_mfu={mfu:.2%} {vram_log}"
                     )
                     payload = {

@@ -258,14 +258,6 @@ def run_te_pretraining(
     # can cause hangs near epoch boundaries (set_epoch doesn't reach workers).
     persistent_workers = num_workers > 0 and not use_packing
     prefetch_factor = pretrain_config.prefetch_factor if num_workers > 0 else None
-    if use_packing and num_workers > 0:
-        logger.warning(
-            "Sequence packing with DataLoader workers can stall on very large datasets "
-            "due to sampler fan-out; forcing num_workers=0 for stability."
-        )
-        num_workers = 0
-        persistent_workers = False
-        prefetch_factor = None
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     distributed = bool(pretrain_config.multi_gpu)
@@ -600,7 +592,7 @@ def run_te_pretraining(
 
     token_count = torch.tensor(0, dtype=torch.long, device=device)
     raw_token_count = torch.zeros((), dtype=torch.long, device=device)
-    step_t0: Optional[float] = None
+    log_window_t0 = time.perf_counter()
     first_step_of_run = True
 
     # When packing, TokenPackingDataset holds the DistributedSampler; call set_epoch on it.
@@ -642,12 +634,6 @@ def run_te_pretraining(
                         or micro_step + 1 == synced_train_loader_len
                     )
                     model.set_requires_gradient_sync(_is_sync_step)
-
-                # Start timing for this optimizer step (with CUDA sync for accuracy)
-                if step_t0 is None:
-                    if device.type == "cuda":
-                        torch.cuda.synchronize()
-                    step_t0 = time.perf_counter()
 
                 if "num_valid_tokens" in batch:
                     token_count += batch["num_valid_tokens"]
@@ -730,19 +716,19 @@ def run_te_pretraining(
                 window_steps += 1
                 accum_loss.zero_()
 
-                # ---- Timing: synchronize and measure dt per step (à la nanochat) ----
-                if device.type == "cuda":
-                    torch.cuda.synchronize()
-                t1 = time.perf_counter()
-                dt = t1 - (step_t0 or t1)
-                step_t0 = None  # reset so next step re-syncs and re-measures
-
                 should_log = global_step % logging_steps == 0
                 vram_log = ""
                 tokens_per_sec = mfu = tok = raw_tok = 0.0
+                avg_step_ms = 0.0
                 if should_log:
-                    # Use the known global batch size for throughput (like nanochat)
-                    tokens_per_sec = int(achieved_global_batch_tokens / max(dt, 1e-9))
+                    # Synchronize and measure only at logging boundaries to amortize sync cost.
+                    if device.type == "cuda":
+                        torch.cuda.synchronize()
+                    t1 = time.perf_counter()
+                    window_dt = max(1e-9, t1 - log_window_t0)
+                    log_window_t0 = t1
+                    avg_step_ms = (window_dt * 1000.0) / max(1, window_steps)
+                    tokens_per_sec = int((achieved_global_batch_tokens * window_steps) / window_dt)
                     log_buf[0] = window_loss / max(1, window_steps)
                     log_buf[1] = grad_norm.full_tensor() if isinstance(grad_norm, DTensor) else (grad_norm if isinstance(grad_norm, torch.Tensor) else float(grad_norm))
                     log_vals = log_buf.cpu()
@@ -754,7 +740,9 @@ def run_te_pretraining(
                         tok_buf = torch.tensor([tok, raw_tok], device=device)
                         dist.all_reduce(tok_buf, op=dist.ReduceOp.SUM)
                         tok, raw_tok = float(tok_buf[0].item()), float(tok_buf[1].item())
-                    mfu = (_flops_per_token * achieved_global_batch_tokens / max(dt, 1e-9)) / (_peak_flops_per_gpu * max(effective_world_size, 1))
+                    mfu = (
+                        _flops_per_token * achieved_global_batch_tokens * window_steps / window_dt
+                    ) / (_peak_flops_per_gpu * max(effective_world_size, 1))
 
                     token_count.zero_()
                     raw_token_count.zero_()
@@ -795,7 +783,7 @@ def run_te_pretraining(
                         f"[step {global_step}/{total_steps}] "
                         f"loss={loss_to_log:.4f} lr={learning_rate:.2e} {muon_lr_str}"
                         f"grad_norm={grad_norm_val:.4f} tok/s={tokens_per_sec:,} "
-                        f"dt={dt*1000:.2f}ms waste={waste_pct:.1f}% "
+                        f"dt={avg_step_ms:.2f}ms waste={waste_pct:.1f}% "
                         f"h100_mfu={mfu:.2%} {vram_log}"
                     )
 
