@@ -32,9 +32,12 @@ def _get_hw_config():
         if cc == (9, 0):
             # (num_sms, num_warps, num_stages)
             _HW_CONFIG = (num_sms, 8, 4)
+        elif cc[0] >= 12 or cc == (8, 9):
+            # SM120 (Blackwell consumer/workstation: RTX 5090, RTX 6000 Blackwell) 
+            # and SM89 (Ada Lovelace) have strict ~99-100KB shared memory limits per block.
+            _HW_CONFIG = (num_sms, 4, 2)
         else:
-            # SM120 (Blackwell consumer, RTX 5090) and SM89 (Ada Lovelace, RTX 6000) 
-            # have strict ~99-100KB shared memory limits per block.
+            # Safe default for older/untested architectures
             _HW_CONFIG = (num_sms, 4, 2)
             
     return _HW_CONFIG
