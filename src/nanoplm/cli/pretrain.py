@@ -412,7 +412,7 @@ def pretrain():
 @click.option(
     "--use-resid-lambdas/--no-use-resid-lambdas",
     default=True,
-    help="Enable per-layer residual scaling (resid_lambdas)",
+    help="Enable per-layer residual scaling (resid_lambdas). Not compatible with --use-mhc-lite.",
 )
 @click.option(
     "--use-x0-lambdas/--no-use-x0-lambdas",
@@ -463,7 +463,8 @@ def pretrain():
 @click.option(
     "--use-mhc-lite/--no-use-mhc-lite",
     default=False,
-    help="Enable mHC-lite: multi-stream residual with doubly stochastic mixing (pure-torch only)",
+    help="Enable mHC-lite: multi-stream residual with doubly stochastic mixing (pure-torch only). "
+         "Not compatible with --use-resid-lambdas.",
 )
 @click.option(
     "--mhc-n-streams",
@@ -612,6 +613,12 @@ def run(
             "use_canon_layers requires --use-packing. "
             "Canon layers are only supported with sequence packing enabled."
         )
+    if use_mhc_lite and use_resid_lambdas:
+        raise click.ClickException(
+            "use_mhc_lite and use_resid_lambdas are mutually exclusive. "
+            "resid_lambdas scales the hidden state before each layer, which breaks "
+            "mHC-lite's doubly-stochastic stability guarantees."
+        )
 
     _populate_batch_setup(cfg)
 
@@ -735,6 +742,12 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
             "model.use_canon_layers=true requires use_packing: true. "
             "Canon layers are only supported with sequence packing enabled."
         )
+    if model_config.use_mhc_lite and model_config.use_resid_lambdas:
+        raise click.ClickException(
+            "model.use_mhc_lite=true is not compatible with model.use_resid_lambdas=true. "
+            "resid_lambdas scales the hidden state before each layer, which breaks "
+            "mHC-lite's doubly-stochastic stability guarantees."
+        )
     _populate_batch_setup(pretrain_config)
 
     _set_seed_for_init(pretrain_config.seed)
@@ -812,7 +825,7 @@ def get_yaml(output: Optional[str], force: bool):
             f"File already exists: {output_path}. Use --force to overwrite."
         )
 
-    template = (
+        template = (
         "# Pretraining configuration for nanoPLM\n"
         "#\n"
         "# IMPORTANT: Before running pretraining, ensure you have prepared your data with:\n"
@@ -833,7 +846,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  attention_dropout: 0.0\n"
         "  classifier_activation: \"gelu\"\n"
         "  # The options below only work on pure-torch and TE pipelines\n"
-        "  use_resid_lambdas: true  # scales residual stream per layer\n"
+        "  use_resid_lambdas: true  # scales residual stream per layer (not compatible with use_mhc_lite)\n"
         "  use_x0_lambdas: true  # blends initial embedding x0 per layer\n"
         "  use_qk_norm: false  # applies RMS norm to Q/K in attention\n"
         "  use_canon_layers: true  # enables Canon-ABCD local mixing layers (pure_torch only)\n"
@@ -1092,7 +1105,13 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
             f"Missing required model configuration keys: {', '.join(sorted(missing_required))}"
         )
 
-    return ProtModernBertMLMConfig(**normalized_kwargs)
+    try:
+        return ProtModernBertMLMConfig(**normalized_kwargs)
+    except TypeError:
+        raise
+    except ValueError as exc:
+        # Provide a clearer error for common config incompatibilities.
+        raise ValueError(f"Invalid model configuration: {exc}") from exc
 
 def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
     if config is None:

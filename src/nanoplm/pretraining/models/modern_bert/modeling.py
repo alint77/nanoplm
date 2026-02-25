@@ -166,6 +166,12 @@ class ModernBertConfig:
                 "hidden_size must be divisible by num_attention_heads: "
                 f"{self.hidden_size} vs {self.num_attention_heads}"
             )
+        if self.use_mhc_lite and self.use_resid_lambdas:
+            raise ValueError(
+                "use_mhc_lite=true is not compatible with use_resid_lambdas=true. "
+                "resid_lambdas scales the hidden state before each layer, which breaks "
+                "mHC-lite's stability guarantees (doubly-stochastic mixing)."
+            )
 
         attn_stride = max(1, int(self.global_attn_every_n_layers))
         self.head_dim = self.hidden_size // self.num_attention_heads
