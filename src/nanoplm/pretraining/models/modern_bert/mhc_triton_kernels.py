@@ -1,10 +1,14 @@
 """Fused Triton kernels for mHC-lite residual connections.
 
-Implements 3 fused kernels (K1, K3, K4) that replace separate PyTorch ops.
+Implements fused kernels (K3, K4) that replace separate PyTorch ops.
 K2 (coefficient computation) stays in PyTorch since it operates on only
 32 values per token — the overhead is in launch, not compute.
 
 Design follows the same persistent-scheduling pattern as triton_kernels.py.
+
+v2: Eliminated atomic_add in backward kernels by splitting into:
+  - Kernel A: grad_x/grad_lo (tiles over T×C, no reductions needed)
+  - Kernel B: grad_H/grad_hp (tiles over T only, reduces over ALL of C internally)
 """
 
 import math
@@ -29,8 +33,6 @@ def _get_num_sms():
 # Kernel 4: fused_post_res — THE CRITICAL KERNEL
 #
 # output[t, i, c] = Σ_j H_merged[t,i,j] * x[t,j,c]  +  h_post[t,i] * lo[t,c]
-#
-# Each tile processes BLOCK_T tokens × full C channels.
 # ═══════════════════════════════════════════════════════════════════════════
 
 @triton.jit
@@ -49,44 +51,41 @@ def _fused_post_res_fwd_kernel(
         pid_t = tile_id // num_c_tiles
         pid_c = tile_id % num_c_tiles
 
-        t_offs = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)  # (BLOCK_T,)
-        c_offs = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)  # (BLOCK_C,)
+        t_offs = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+        c_offs = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
         t_mask = t_offs < T
-        c_mask = c_offs < C
+        tc_mask = t_mask[:, None] & (c_offs[None, :] < C)
 
         # Load layer_output[t, c]: (BLOCK_T, BLOCK_C)
         lo_idx = t_offs[:, None] * C + c_offs[None, :]
-        lo_mask = t_mask[:, None] & c_mask[None, :]
-        lo = tl.load(lo_ptr + lo_idx, mask=lo_mask, other=0.0).to(tl.float32)
+        lo = tl.load(lo_ptr + lo_idx, mask=tc_mask, other=0.0).to(tl.float32)
 
         for i in tl.static_range(n):
-            # Load h_post[t, i]: (BLOCK_T,) scalar per token
             hp_i = tl.load(hp_ptr + t_offs * n + i, mask=t_mask, other=0.0)
-
-            # acc = h_post[t,i] * lo[t,c]: (BLOCK_T, BLOCK_C)
             acc = hp_i[:, None] * lo
 
             for j in tl.static_range(n):
-                # Load H_merged[t, i, j]: (BLOCK_T,) scalar per token
                 h_ij = tl.load(H_ptr + t_offs * (n * n) + i * n + j, mask=t_mask, other=0.0)
-                # Load x[t, j, c]: (BLOCK_T, BLOCK_C)
                 x_idx = t_offs[:, None] * (n * C) + j * C + c_offs[None, :]
-                x_j = tl.load(x_ptr + x_idx, mask=lo_mask, other=0.0).to(tl.float32)
+                x_j = tl.load(x_ptr + x_idx, mask=tc_mask, other=0.0).to(tl.float32)
                 acc += h_ij[:, None] * x_j
 
-            # Store output[t, i, c]
             out_idx = t_offs[:, None] * (n * C) + i * C + c_offs[None, :]
-            tl.store(out_ptr + out_idx, acc.to(tl.bfloat16), mask=lo_mask)
+            tl.store(out_ptr + out_idx, acc.to(tl.bfloat16), mask=tc_mask)
 
+
+# ---------- K4 Backward: Kernel A (grad_x, grad_lo) ----------
+# Tiles over (T, C). No reductions, no atomics.
 
 @triton.jit
-def _fused_post_res_bwd_kernel(
-    x_ptr, lo_ptr, H_ptr, hp_ptr, grad_out_ptr,
-    grad_x_ptr, grad_lo_ptr, grad_H_ptr, grad_hp_ptr,
+def _fused_post_res_bwd_xlo_kernel(
+    H_ptr, hp_ptr, grad_out_ptr, lo_ptr,
+    grad_x_ptr, grad_lo_ptr,
     T, C: tl.constexpr, n: tl.constexpr,
     BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr,
     NUM_SMS: tl.constexpr,
 ):
+    """Compute ∂L/∂x_streams and ∂L/∂layer_output (no reductions needed)."""
     pid = tl.program_id(0)
     num_t_tiles = tl.cdiv(T, BLOCK_T)
     num_c_tiles = tl.cdiv(C, BLOCK_C)
@@ -99,12 +98,7 @@ def _fused_post_res_bwd_kernel(
         t_offs = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
         c_offs = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
         t_mask = t_offs < T
-        c_mask = c_offs < C
-        tc_mask = t_mask[:, None] & c_mask[None, :]
-
-        # Load layer_output
-        lo_idx = t_offs[:, None] * C + c_offs[None, :]
-        lo = tl.load(lo_ptr + lo_idx, mask=tc_mask, other=0.0).to(tl.float32)
+        tc_mask = t_mask[:, None] & (c_offs[None, :] < C)
 
         # ∂L/∂layer_output[t,c] = Σ_i h_post[t,i] * grad_out[t,i,c]
         grad_lo_acc = tl.zeros((BLOCK_T, BLOCK_C), dtype=tl.float32)
@@ -113,20 +107,9 @@ def _fused_post_res_bwd_kernel(
             hp_i = tl.load(hp_ptr + t_offs * n + i, mask=t_mask, other=0.0)
             go_idx = t_offs[:, None] * (n * C) + i * C + c_offs[None, :]
             grad_i = tl.load(grad_out_ptr + go_idx, mask=tc_mask, other=0.0).to(tl.float32)
-
             grad_lo_acc += hp_i[:, None] * grad_i
 
-            # ∂L/∂h_post[t,i] += Σ_c grad_out[t,i,c] * lo[t,c]
-            dot_hp = tl.sum(grad_i * lo, axis=1)  # (BLOCK_T,)
-            tl.atomic_add(grad_hp_ptr + t_offs * n + i, dot_hp, mask=t_mask)
-
-            # ∂L/∂H_merged[t,i,j] += Σ_c grad_out[t,i,c] * x[t,j,c]
-            for j in tl.static_range(n):
-                x_idx = t_offs[:, None] * (n * C) + j * C + c_offs[None, :]
-                x_j = tl.load(x_ptr + x_idx, mask=tc_mask, other=0.0).to(tl.float32)
-                dot_H = tl.sum(grad_i * x_j, axis=1)
-                tl.atomic_add(grad_H_ptr + t_offs * (n * n) + i * n + j, dot_H, mask=t_mask)
-
+        lo_idx = t_offs[:, None] * C + c_offs[None, :]
         tl.store(grad_lo_ptr + lo_idx, grad_lo_acc.to(tl.bfloat16), mask=tc_mask)
 
         # ∂L/∂x[t,j,c] = Σ_i H_merged[t,i,j] * grad_out[t,i,c]
@@ -139,6 +122,130 @@ def _fused_post_res_bwd_kernel(
                 grad_x_j += h_ij[:, None] * grad_i
             x_out_idx = t_offs[:, None] * (n * C) + j * C + c_offs[None, :]
             tl.store(grad_x_ptr + x_out_idx, grad_x_j.to(tl.bfloat16), mask=tc_mask)
+
+
+# ---------- K4 Backward: Kernel B (grad_H, grad_hp) ----------
+# Tiles over T only. Each program reduces over ALL of C — NO atomics.
+
+@triton.jit
+def _fused_post_res_bwd_Hhp_kernel(
+    x_ptr, lo_ptr, grad_out_ptr,
+    grad_H_ptr, grad_hp_ptr,
+    T, C: tl.constexpr, n: tl.constexpr,
+    BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    """Compute ∂L/∂H_merged and ∂L/∂h_post by reducing over ALL of C internally."""
+    pid = tl.program_id(0)
+    num_t_tiles = tl.cdiv(T, BLOCK_T)
+
+    for tile_id in tl.range(pid, num_t_tiles, NUM_SMS, flatten=True):
+        t_offs = tile_id * BLOCK_T + tl.arange(0, BLOCK_T)
+        t_mask = t_offs < T
+
+        # Accumulators for the C-reduction (all scalars per token)
+        # grad_H[t, i, j] = Σ_c grad_out[t,i,c] * x[t,j,c]  → n*n accums
+        # grad_hp[t, i] = Σ_c grad_out[t,i,c] * lo[t,c]      → n accums
+        # Total: n*n + n = 20 accumulators per token, each is (BLOCK_T,)
+
+        # We accumulate inside BLOCK_C-chunked loop over C
+        # Initialize all accumulators to zero
+        # For n=4: 20 separate (BLOCK_T,) accumulators
+
+        # grad_hp accumulators: n of them
+        ghp_0 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        ghp_1 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        ghp_2 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        ghp_3 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+
+        # grad_H accumulators: n*n = 16 of them
+        gH_00 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_01 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_02 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_03 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_10 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_11 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_12 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_13 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_20 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_21 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_22 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_23 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_30 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_31 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_32 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_33 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+
+        # Iterate over C in chunks
+        for c_start in tl.range(0, C, BLOCK_C):
+            c_offs = c_start + tl.arange(0, BLOCK_C)
+            c_mask = c_offs < C
+            tc_mask = t_mask[:, None] & c_mask[None, :]
+
+            # Load lo[t, c]
+            lo_idx = t_offs[:, None] * C + c_offs[None, :]
+            lo = tl.load(lo_ptr + lo_idx, mask=tc_mask, other=0.0).to(tl.float32)
+
+            # Load x[t, j, c] for all j
+            x0 = tl.load(x_ptr + t_offs[:, None] * (n * C) + 0 * C + c_offs[None, :], mask=tc_mask, other=0.0).to(tl.float32)
+            x1 = tl.load(x_ptr + t_offs[:, None] * (n * C) + 1 * C + c_offs[None, :], mask=tc_mask, other=0.0).to(tl.float32)
+            x2 = tl.load(x_ptr + t_offs[:, None] * (n * C) + 2 * C + c_offs[None, :], mask=tc_mask, other=0.0).to(tl.float32)
+            x3 = tl.load(x_ptr + t_offs[:, None] * (n * C) + 3 * C + c_offs[None, :], mask=tc_mask, other=0.0).to(tl.float32)
+
+            # Load grad_out[t, i, c] for all i
+            go0 = tl.load(grad_out_ptr + t_offs[:, None] * (n * C) + 0 * C + c_offs[None, :], mask=tc_mask, other=0.0).to(tl.float32)
+            go1 = tl.load(grad_out_ptr + t_offs[:, None] * (n * C) + 1 * C + c_offs[None, :], mask=tc_mask, other=0.0).to(tl.float32)
+            go2 = tl.load(grad_out_ptr + t_offs[:, None] * (n * C) + 2 * C + c_offs[None, :], mask=tc_mask, other=0.0).to(tl.float32)
+            go3 = tl.load(grad_out_ptr + t_offs[:, None] * (n * C) + 3 * C + c_offs[None, :], mask=tc_mask, other=0.0).to(tl.float32)
+
+            # grad_hp[t,i] += Σ_c grad_out[t,i,c] * lo[t,c]
+            ghp_0 += tl.sum(go0 * lo, axis=1)
+            ghp_1 += tl.sum(go1 * lo, axis=1)
+            ghp_2 += tl.sum(go2 * lo, axis=1)
+            ghp_3 += tl.sum(go3 * lo, axis=1)
+
+            # grad_H[t,i,j] += Σ_c grad_out[t,i,c] * x[t,j,c]
+            gH_00 += tl.sum(go0 * x0, axis=1)
+            gH_01 += tl.sum(go0 * x1, axis=1)
+            gH_02 += tl.sum(go0 * x2, axis=1)
+            gH_03 += tl.sum(go0 * x3, axis=1)
+            gH_10 += tl.sum(go1 * x0, axis=1)
+            gH_11 += tl.sum(go1 * x1, axis=1)
+            gH_12 += tl.sum(go1 * x2, axis=1)
+            gH_13 += tl.sum(go1 * x3, axis=1)
+            gH_20 += tl.sum(go2 * x0, axis=1)
+            gH_21 += tl.sum(go2 * x1, axis=1)
+            gH_22 += tl.sum(go2 * x2, axis=1)
+            gH_23 += tl.sum(go2 * x3, axis=1)
+            gH_30 += tl.sum(go3 * x0, axis=1)
+            gH_31 += tl.sum(go3 * x1, axis=1)
+            gH_32 += tl.sum(go3 * x2, axis=1)
+            gH_33 += tl.sum(go3 * x3, axis=1)
+
+        # Store grad_hp[t, i]
+        tl.store(grad_hp_ptr + t_offs * n + 0, ghp_0, mask=t_mask)
+        tl.store(grad_hp_ptr + t_offs * n + 1, ghp_1, mask=t_mask)
+        tl.store(grad_hp_ptr + t_offs * n + 2, ghp_2, mask=t_mask)
+        tl.store(grad_hp_ptr + t_offs * n + 3, ghp_3, mask=t_mask)
+
+        # Store grad_H[t, i, j] — 16 stores
+        H_base = t_offs * (n * n)
+        tl.store(grad_H_ptr + H_base + 0,  gH_00, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 1,  gH_01, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 2,  gH_02, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 3,  gH_03, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 4,  gH_10, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 5,  gH_11, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 6,  gH_12, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 7,  gH_13, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 8,  gH_20, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 9,  gH_21, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 10, gH_22, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 11, gH_23, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 12, gH_30, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 13, gH_31, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 14, gH_32, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 15, gH_33, mask=t_mask)
 
 
 class FusedPostRes(torch.autograd.Function):
@@ -164,21 +271,32 @@ class FusedPostRes(torch.autograd.Function):
     def backward(ctx, grad_output):
         x_streams, layer_output, H_merged, h_post = ctx.saved_tensors
         T, n, C = x_streams.shape
-        grad_x = torch.empty_like(x_streams)
-        grad_lo = torch.empty((T, C), device=x_streams.device, dtype=x_streams.dtype)
-        grad_H = torch.zeros((T, n, n), device=x_streams.device, dtype=torch.float32)
-        grad_hp = torch.zeros((T, n), device=x_streams.device, dtype=torch.float32)
+        grad_out = grad_output.contiguous()
         NUM_SMS = _get_num_sms()
         BLOCK_T = 64
         BLOCK_C = min(256, triton.next_power_of_2(C))
         grid = (NUM_SMS,)
-        _fused_post_res_bwd_kernel[grid](
-            x_streams, layer_output, H_merged, h_post,
-            grad_output.contiguous(),
-            grad_x, grad_lo, grad_H, grad_hp,
+
+        # Kernel A: grad_x and grad_lo (tiles over T×C, no atomics)
+        grad_x = torch.empty_like(x_streams)
+        grad_lo = torch.empty((T, C), device=x_streams.device, dtype=x_streams.dtype)
+        _fused_post_res_bwd_xlo_kernel[grid](
+            H_merged, h_post, grad_out, layer_output,
+            grad_x, grad_lo,
             T, C, n,
             BLOCK_T=BLOCK_T, BLOCK_C=BLOCK_C, NUM_SMS=NUM_SMS,
         )
+
+        # Kernel B: grad_H and grad_hp (tiles over T, reduces over C, no atomics)
+        grad_H = torch.empty((T, n, n), device=x_streams.device, dtype=torch.float32)
+        grad_hp = torch.empty((T, n), device=x_streams.device, dtype=torch.float32)
+        _fused_post_res_bwd_Hhp_kernel[grid](
+            x_streams, layer_output, grad_out,
+            grad_H, grad_hp,
+            T, C, n,
+            BLOCK_T=BLOCK_T, BLOCK_C=BLOCK_C, NUM_SMS=NUM_SMS,
+        )
+
         return grad_x, grad_lo, grad_H, grad_hp
 
 
@@ -277,14 +395,17 @@ class FusedPreMap(torch.autograd.Function):
     def backward(ctx, grad_output):
         x_streams, h_pre = ctx.saved_tensors
         T, n, C = x_streams.shape
+        grad_out = grad_output.contiguous()
+        
         grad_x = torch.empty_like(x_streams)
         grad_hp = torch.zeros((T, n), device=x_streams.device, dtype=torch.float32)
         NUM_SMS = _get_num_sms()
         BLOCK_T = 64
         BLOCK_C = min(256, triton.next_power_of_2(C))
         grid = (NUM_SMS,)
+
         _fused_pre_map_bwd_kernel[grid](
-            x_streams, h_pre, grad_output.contiguous(),
+            x_streams, h_pre, grad_out,
             grad_x, grad_hp,
             T, C, n,
             BLOCK_T=BLOCK_T, BLOCK_C=BLOCK_C, NUM_SMS=NUM_SMS,
