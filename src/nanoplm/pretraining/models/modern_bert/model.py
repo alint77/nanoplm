@@ -50,6 +50,9 @@ class ProtModernBertMLMConfig:
     x0_lambda_init: float = 0.1
     use_repo: bool = False
     repo_after_n_layers: int = 3
+    use_mhc_lite: bool = False
+    mhc_n_streams: int = 4
+    mhc_triton_fused: bool = False
 
 
 class ProtModernBertMLM(ModernBertForMaskedLM):

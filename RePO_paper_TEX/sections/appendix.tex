@@ -1,0 +1,145 @@
+\appendix
+\onecolumn
+
+\section{What’s the Real Difference between Conventional PEs, NoPE, and RePo?\label{app:comp}}
+
+In the background section (\S\ref{sec:bg}), we use \textsc{RoPE} as a representative example to illustrate how conventional positional encoding methods rely on a strict linear pattern to assign positional information to tokens in the context.
+
+
+Recently, researchers have found that the causal mask in the attention mechanism enables LLMs to implicitly learn positional information, and that removing explicit positional encoding can even achieve superior performance on structured data and long-context tasks. This approach is referred to as the NoPE method \cite{kazemnejad2023impact, yang2025rope, wang-etal-2024-length, barbero2025round}. We argue that the attention score of NoPE can be reformulated within the RoPE framework by assigning a constant positional value $a$:
+\begin{align}
+\mathbf{A}_{i,j}^{\text{NoPE}} &= \boldsymbol{q}_i^\top \boldsymbol{k}_j \nonumber \\
+&= \boldsymbol{q}i^\top g\theta(0)\boldsymbol{k}_j \nonumber \\
+&= \boldsymbol{q}i^\top g\theta(a - a)\boldsymbol{k}_j,
+\end{align}
+where $a$ denotes a uniform position value for all tokens, yielding a constant rotation matrix $g_\theta(0)$. Thus, under this reformulation, the key difference between RoPE and NoPE lies solely in how positions are assigned.
+
+\begin{wraptable}{R}{0.4\columnwidth}
+    \centering
+    % \tiny
+    \caption{Comparison between different methods. In RoPE-like methods, $g_\theta$ generates a rotation matrix based on a distance. The $j-i$ is the distance between $x_j$ and $x_i$, $g_\theta(0)$ is a constant rotation, and $z_j$ and $z_i$ are predicted positions by $f_\phi$ (Eq. \ref{eq:repo}).}
+    \label{tab:method_comp}
+        \begin{tabular}{lc}\toprule
+        Method & Attention Score \\\midrule
+        Linear (e.g., \textsc{RoPE}) & $\boldsymbol{q}_i^\top g_\theta(j-i)\boldsymbol{k}_j$ \\[0.5em]
+        Constant (e.g.,\textsc{NoPE}) & $\boldsymbol{q}_i^\top g_\theta(0)\boldsymbol{k}_j$ \\[0.5em]
+        \implname & $\boldsymbol{q}_i^\top g_\theta (z_j - z_i) \boldsymbol{k}_j$ \\\bottomrule
+        \end{tabular}
+\end{wraptable}
+
+
+In addition, LLMs with interpolated  NoPE and RoPE layers \cite{yang2025rope, meta2025llama, barbero2025round} have been widely used architectures, which can be explained as hybrid position assignment strategies. In contrast to previous works that empirically configure the hybrid system with hyper-parameters, our
+\implname shows higher expressiveness, as it can dynamically determine whether to adopt the conventional linear, NoPE-like constant, or hybrid position assignment for tokens in a given context. A comparison among the three approaches is summarized in Table~\ref{tab:method_comp}.
+As explained in \S\ref{sec:bg},  when $z_j = z_i$, \implname effectively reduces to the NoPE pattern with the constant $z_j = z_i = a$. In contrast, if $z_j > z_i$ for $j > i$, it indicates that \implname adopts positional relationship similar to the conventional linear style, e.g., the strategt used in RoPE.
+In our experiments and analyses, we will demonstrate that an LLM may dynamically select between constant and linear position assignments, or hybridize them with \implname module. Notably, although we use RoPE for the comparison, linear position assignment is widely adopted in conventional positional encoding methods \cite{vaswani2017attention, gehring2017convolutional, press2021train, li2025seqpe}, and our findings can be readily extended to these approaches.
+
+
+
+\section{Details of Experiments\label{app:exp}}
+
+\subsection{Extrapolation}
+We use the following hyper-parameters to extend the context:
+\begin{enumerate}
+    \item 8K Tokens: \texttt{\{"rope\_type": "yarn", "factor": 2.0, "original\_max\_position\_embeddings": 4096\}}
+    \item 16K Tokens: \texttt{\{"rope\_type": "yarn", "factor": 4.0, "original\_max\_position\_embeddings": 4096\}}
+\end{enumerate}
+We use the setting for ``16K Tokens'' for all the experiments on LongBench (Table \ref{tab:lc_longbench}).
+
+\subsection{General Tasks}
+We use the following task ids in \texttt{olmes} for the evaluation in Table \ref{tab:general}: \texttt{arc\_challenge:rc::large}, \texttt{arc\_easy:rc::olmes}, \texttt{boolq:rc::large}, \texttt{coqa::large}, \texttt{drop::large}, \texttt{hellaswag:rc::large}, \texttt{mmlu\_pro:cot::none}, \texttt{triviaqa::olmes}
+
+
+
+
+\begin{wrapfigure}{R}{0.4\columnwidth}
+    \centering
+    % \includegraphics[width=\linewidth]{figs/ablation.pdf}
+    \includegraphics[width=\linewidth]{figs/ablation.png}
+    \caption{Sensitivity to the starting layer of \implname (i.e. $l=3,5,7$). We validate on the NIAH subtask of RULER benchmark and MMLUPro of general benchmarks.}
+    \label{fig:ablation}
+\end{wrapfigure}
+
+
+
+
+\subsection{Ablation Study \label{app:ablation}}
+
+As shown in Figure \ref{fig:ablation}, we evaluate the sensitivity of model performance to the starting layer of \implname, where $l=5$ indicates that \implname is applied beginning from the 5th layer of the LLM, while the vanilla \textsc{RoPE} is used for the lower layers. We conduct experiments on two subtasks, NIAH and MMLUPro. The results show that overall performance is robust to this hyperparameter. However, increasing $l$ slightly improves performance on general benchmarks while negatively affecting performance on NIAH. The results are consistent on other evaluation benchmarks.
+
+
+
+\section{Preliminary Experiments \label{app:pre}}
+
+
+
+
+\begin{figure*}[]
+    \begin{center}
+        \includegraphics[width=0.95\textwidth]{figs/layer_visual.png}
+    \end{center}
+    \caption{Visualization of predicted positions from a 4-layer GPT-2 model in the reversal task. The \textcolor{Cerulean}{area with blue background color} indicates input context, while the \textcolor{Apricot}{orange region} is the generated sequence. We use A-K to replace the real tokens to save space for illustration. The x and y-axis represent the input order and predicted position $z$ of a token, respectively.
+    \label{fig:visual}}
+\vspace{-1em}
+\end{figure*}
+
+In this experiment, we train a small-scale language model on a purposefully selected synthetic task, namely text reversal, to determine whether \implname can re-position tokens in the context.
+
+
+In the text reversal task, a model is prompted to generate a given sequence of tokens $\boldsymbol{x} = \{x_1, x_2, \dots, x_L\}$ in a reversed order $\boldsymbol{x}^\prime = \{x_L, x_{L-1}, \dots, x_1\}$. \textit{Locality bias} does not apply here because the distance between a generated token and its corresponding dependent input token grows linearly as the generation proceeds. It is interesting to investigate whether the \implname method can learn beneficial re-positioning patterns from the task.
+
+\subsection{Setup} We use the data and train/dev/test splits provided in \citet{kazemnejad2023impact} for the text reversal task. The sequence lengths $L$ in training are between $[2, 20]$, while we use the sequence lengths between $[2, 30]$ for evaluation.  The input sequence $\boldsymbol{x}$ is constructed from a fixed set of subwords that are shared across the three datasets, without regard to grammatical or semantic structure \cite{kazemnejad2023impact}.
+
+
+We train a GPT-2 model with 4 layers for this task. We use NoPE, RoPE, and \implname\footnote{Notably, \implname functions solely as a position prediction module. For brevity, however, mentioning \implname implies the use of RoPE encoding together in this work.} methods to train the model. For the \implname method, we shared the parameters of $f_\phi$ for all the attention heads in each layer. All training hyper-parameters are set as in \citet{kazemnejad2023impact}. 
+
+
+\begin{wrapfigure}{R}{0.5\columnwidth}
+    \centering
+    \includegraphics[width=\linewidth]{figs/synthetic_task.png}
+    \caption{Performance on the text reversal task. We report the accuracy on all lengths of input sequences.}
+    \label{fig:synthetic_task}
+\end{wrapfigure}
+
+\subsection{Findings}
+As shown in Figure \ref{fig:synthetic_task}, due to the simplicity of the text reversal task, all the models achieve nearly perfect performance on short in-domain sequences ($L \leq 20$). However, when testing on examples with longer-range dependencies, i.e. $L > 20$, our \implname method demonstrates superior performance compared to both NoPE and RoPE. 
+
+We further investigate the re-positioning patterns  learned by \implname that contribute to this performance gain. As illustrated in Figure \ref{fig:visual}, we visualize the predicted positions across different layers of the trained model and observe several intriguing patterns. The overall distribution of predicted positions is remarkably distinct from the pre-defined positional indices (e.g., 1 to 27). Specifically, we observe a mirror effect in layers 0, 2, and 3, where pairs of reversal tokens are assigned the same position indices. Additionally, we identify hybrid positional patterns across different parts of the context. For example, from layers 1 to 3, the model adopts a NoPE-like pattern for the opening tokens, assigining nearly identical position indices to tokens in the phrase “Reverse the following words:”, while exhibiting patterns with mirror symmetry for the input and output sequences. Notably, we did not introduce any inductive bias for this task; all patterns emerged in a purely data-driven manner. These intriguing patterns motivate us to further investigate \implname on more general datasets. 
+
+
+
+
+\section{Case Study\label{app:case_study}}
+As shown in Figure \ref{fig:case_study}, we visualize the positions assigned by \implname when testing on the MMLUPro benchmark \cite{wang2024mmlu} with few-shot examples. We observe that \implname learns distinct patterns across different layers and attention heads. Interestingly, as shown in Figure \ref{fig:case2}, the patterns of assigned positions roughly align with the semantic segmentation of the few-shot examples, demonstrating that \implname is capable of capturing the structure of the input context. Additionally, we find that some positions assigned by \implname are negative values, as shown in Figure \ref{fig:case3}. Those negative positions can be interpreted as rotations in a reversed direction under the RoPE framework. There also exist some outlier positions in the figures. Upon inspection, we find that they correspond to non-informative punctuation marks and function words, such as ``.'' and ``such.''
+
+\begin{figure}[htbp]
+    \centering
+    % --- First Subfigure ---
+    \begin{subfigure}{\linewidth}
+        \centering
+        \includegraphics[width=0.9\linewidth]{figs/l5h1.png}
+        \caption{Layer 5 \& Attention Head 1}
+        \label{fig:case1}
+    \end{subfigure}
+    
+    \vspace{1em} % Add vertical space between the images
+    
+    % --- Second Subfigure ---
+    \begin{subfigure}{\linewidth}
+    \centering
+        \includegraphics[width=0.9\linewidth]{figs/l8h0.png}
+        \caption{Layer 8 \& Attention Head 0}
+        \label{fig:case2}
+    \end{subfigure}
+
+
+    \begin{subfigure}{\linewidth}
+    \centering
+        \includegraphics[width=0.9\linewidth]{figs/l13h3.png}
+        \caption{Layer 13 \& Attention Head 3}
+        \label{fig:case3}
+    \end{subfigure}
+
+
+    \caption{Visualization of positions assigned by \implname. The \implname is continuously trained on general data. The visualization data is from MMLUPro with few-shot examples. Symbols in \textcolor{orange}{orange} belong to the prompt, while symbols in \textcolor{blue}{blue} and \textcolor{red}{red} represent questions and answers in few-shot examples.}
+    \label{fig:case_study}
+\end{figure}

@@ -1,0 +1,205 @@
+
+
+
+\section{Experiments\label{sec:exp}}
+This section presents our main experiments on general language modeling. We continually pre-train an LLM with \implname on general datasets and evaluate its performance on three types of tasks that require restructuring context. In Appendix~\ref{app:pre}, we present preliminary studies on synthetic data along with visualizations to show how \implname works.
+
+
+
+\begin{table}[]
+\centering
+\caption{Performance for structured data. We evaluate on NLGraph and HybridQA datasets for graph and table data, respectively. We use exact match (EM) as metric. \textbf{Bold} and \underline{underline} denote the best and the second best results, respectively. \label{tab:struct}}
+\tiny
+\resizebox{0.85\columnwidth}{!}{
+\begin{tabular}{lccc}\toprule
+     & Graph & Table & AVG.   \\\midrule
+\textsc{RoPE} & 27.43                  & 24.43              & 25.93 \\\hdashline
+NoPE & \textbf{29.90}                  & 23.52              & \underline{26.71} \\
+\textsc{R2N1} & 27.11                  & \underline{25.11}              & 26.11 \\
+\textsc{N2R1} & 25.42                  & 23.86              & 24.64 \\\hdashline
+\implname & \underline{29.03}                  & \textbf{26.70}              & \textbf{27.87} \\\bottomrule
+\end{tabular}
+}
+\end{table}
+
+
+\begin{figure*}[]
+    \begin{center}
+        \includegraphics[width=0.85\textwidth]{figs/repo_long_context.png}
+    \end{center}
+    \caption{Long-context Evaluation on RULER. YaRN \cite{peng2024yarn} is used for all RoPE layers to extend the context.  We observe consistent results on the more realistic benchmark LongBench in Table \ref{tab:lc_longbench}.\label{fig:lc_ruler}}
+\end{figure*}
+
+
+
+\subsection{Setup} We use OLMo-2 \cite{walsh2} developed by Allen Institute for AI as the backbone model, whose performance is comparable to Qwen-2.5 \cite{qwen2025qwen25technicalreport}. Its data, model weights, and code are fully open-sourced. Notably, OLMo-2 is trained with the RoPE method \cite{su2024roformer}. For all methods in our experiments, we start from the checkpoint of the OLMo-2 1B model that has completed stage-1 pre-training, and we continually pre-train it on the $50$B-token stage-2 data\footnote{\url{https://github.com/allenai/OLMo}}. The training context length is 4096 tokens. We keep the training configuration and codebase identical to those released by \citet{walsh2}.
+
+For our \implname method, we apply it starting from the 5th layer of the OLMo-2 1B model. In each layer that uses \implname, we share the parameters for position representation transformation in Eq.~\ref{eq:pos_repr}, while learning the position assignment for each attention head independently as in Eq.~\ref{eq:pos_head}. The hidden size for the learned position representation is 256, i.e., $1/8$ of the model’s hidden size. 
+As shown in \S\ref{app:efficiency}, \implname is lightweight and introduces negligible overhead to the original LLM. 
+We compare \implname with baselines:
+\begin{itemize}%[leftmargin=*, nosep]
+    \item \textsc{RoPE}: Uses RoPE \cite{su2024roformer} for positional encoding, identical to pre-training.
+    \item \textsc{NoPE}: Removes explicit positional encoding methods \cite{kazemnejad2023impact, wang-etal-2024-length}, i.e., RoPE is omitted during the continual pre-training.
+    \item \textsc{R2N1}: A hybrid positional encoding method that interleaves RoPE and NoPE \cite{yang2025rope, meta2025llama}. For every three layers, the first two use RoPE while the last one uses NoPE.
+    \item \textsc{N2R1}: The opposite of R2N1, i.e., every three layers, the first two use NoPE and the last one uses RoPE.
+\end{itemize}
+
+
+
+We train those models on 4 H100 GPUs for 50B tokens. We use the \texttt{allenai/olmes}\footnote{\url{https://github.com/allenai/olmes}} codebase for evaluation, which provides extensive test suites. We categorize our main evaluation tasks into three dimensions as follows:
+
+\begin{itemize}%[leftmargin=*, nosep]
+\item \textbf{Noisy Context} evaluates the model’s robustness to contexts containing large amounts of irrelevant information. Such ``noise’’ increases \textit{extraneous cognitive load} \cite{paas2003cognitive}, which can negatively affect problem-solving performance. We use the RULER benchmark \cite{hsiehruler}, which purposefully constructs contexts with irrelevant content for evaluation.
+
+
+\item \textbf{Structured Data} evaluates performance on structured data such as tables and graphs. This setting highlights the importance of contextual organization, as linearizing such data into natural language often leads to significant structural information loss. We use NLGraph \cite{wang2023can} and HybridQA \cite{chen-etal-2020-hybridqa} to evaluate model performance on graph and table reasoning, respectively.
+
+
+\item \textbf{Longer Context} evaluates model performance on sequences longer than those seen during training (i.e., 4K tokens), as positional encoding has been shown to strongly affect long-context generalization \cite{press2021train}. We use subsets of RULER and LongBench \cite{bai-etal-2024-longbench}, which contain examples with 4K to 16K tokens for this evaluation.
+
+\end{itemize}
+Notably, both the evaluations for noisy context and structured data are conducted within the training context length (i.e., 4K tokens). In contrast, the longer-context evaluation requires extended context lengths. To enable this, we apply the YaRN method to RoPE layers across all methods using the extrapolation hyperparameters in \citet{peng2024yarn}. More details are in Appendix~\ref{app:exp}.
+
+
+
+\begin{table*}[]
+\caption{Performance on LongBench. This uses F1 score for QA and fewshot tasks, while Rouge-L \cite{lin-2004-rouge} for the summarization tasks. We only evaluate on data that contains less than 16K tokens. Since the model is trained with a max of 4096 tokens, the YaRN method \cite{peng2024yarn} is used for all RoPE layers for context extrapolation. We use \textbf{bold} and \underline{underline} for best and second best results, respectively.\label{tab:lc_longbench}}
+\resizebox{1.0\textwidth}{!}{
+\begin{tabular}{lrrrrrrrrr}\toprule
+\multirow{2}{*}{Method} & \multicolumn{2}{c}{Multidoc QA} & \multicolumn{2}{c}{Singledoc QA} & \multicolumn{2}{c}{Summarization} & \multicolumn{2}{c}{Fewshot} & \multirow{2}{*}{AVG.}\\
+                        & 2WikiMultihopQA        & MuSiQue       & MultiFieldQA-en  & NarrativeQA  & GovReport        & QMSum        & TREC        & TriviaQA      \\\midrule
+RoPE                    & 23.32           & 7.24          & 27.37             & 12.94        & 6.23               & 7.96         & 22.00       & 61.47  & 21.07        \\\hdashline
+NoPE                    & 9.11            & 0.33          & 13.64             & 1.80         & 5.15               & 0.68         & 9.50        & 18.12 & 7.29\\
+R2N1                    & \underline{25.88}           & \underline{7.31}          & \underline{31.28}             & \textbf{16.24}        & 4.53               & \underline{8.74}         & \underline{22.00}       & \underline{66.67}   & \underline{22.83}      \\
+N2R1                    & 16.24           & 0.40          & 21.88             & 1.26         & \underline{8.74}               & 5.31         & 21.50       & 25.18    & 12.56     \\\hdashline
+\implname                    & \textbf{30.86}           & \textbf{13.45}        & \textbf{33.12}             & \underline{15.24}        & \textbf{16.80}              & \textbf{12.53}        & \textbf{31.50}       & \textbf{73.02} & \textbf{28.31}\\ \bottomrule        
+\end{tabular}
+}
+\end{table*}
+
+
+
+\subsection{Results}
+
+Experimental results show that \implname yields significant performance gains across all three evaluation dimensions. 
+
+\paragraph{Noisy Context} For all evaluation subtasks, the input contexts are injected with irrelevant information. As shown in Table~\ref{tab:anti_noise}, even when all test contexts are within the training context length (i.e., 4K tokens), \implname outperforms RoPE by 11.04 points. This suggests that the re-positioning mechanism in \implname effectively reduces \textit{extraneous cognitive load} and improves robustness against noisy or distracting information in model inputs. 
+ 
+
+
+
+\paragraph{Longer Context} The advantage of \implname becomes even more pronounced on long-context tasks. As shown in Figure~\ref{fig:lc_ruler}, \implname already surpasses all baselines at a context length of 4K. The performance gap further widens at 8K and 16K, which are lengths unseen during training. To rule out potential confounding effects from {\implname}’s noise robustness, we additionally evaluate on LongBench~\cite{bai-etal-2024-longbench}, which consists of more realistic long-context tasks. As shown in Table~\ref{tab:lc_longbench}, \implname consistently outperforms other baselines on LongBench by at least 5.48 points. In addition, the hybrid \textsc{R2N1} method, with interleaved RoPE and NoPE layers, achieves the second-best performance, consistent with the findings of \citet{yang2025rope}.
+
+
+
+
+\paragraph{Structured Data} Since linearizing structured data (e.g., tables and graphs) into natural language can result in substantial loss of structural information, it is of interest to examine whether contextual re-positioning benefits such data types. As shown in Table~\ref{tab:struct}, \implname improves over the vanilla RoPE method by an average of 1.94 EM points. Interestingly, the NoPE method achieves the best performance on the graph dataset, suggesting that emphasizing local positional relationships may not be a valid assumption for graph-structured inputs.
+
+
+\section{Analyses\label{sec:analyses}}
+This section is to provide insights into the inner workings of \implname. To this end, we conducted detailed analyses to understand: 1) where the performance gains stem from; and 2) what patterns the positions assigned by \implname exhibit.
+
+\begin{table}[!]
+\centering
+\small
+\caption{Attention mass per token ($10^{-2}$) on different parts of context. We evaluate on NIAH task within the training context length (i.e., 4K tokens).\label{tab:attn_mass}} 
+\resizebox{1.0\columnwidth}{!}{
+\begin{tabular}{lccc}\toprule
+Pos. Assignment     & Needle  & Query & Rest \\\midrule
+Linear (e.g., RoPE) & 1.754  & 1.123 & 0.014   \\
+Constant (e.g., NoPE) & 1.572  & 1.135 & 0.014 \\
+\implname & 2.013  & 1.046 & 0.015  \\\bottomrule
+\end{tabular}
+}
+\vspace{-1em}
+\end{table}
+
+\subsection{Attention Mass on Relevant Tokens\label{ssec:niah}} 
+Since our \implname method re-organizes the context based on its intrinsic structure, we hypothesize that it can better capture long-distance dependencies by bringing distant but relevant tokens with closer positions.
+To evaluate this effect, we analyze the attention patterns of methods with different types of position assignment strategies on the needle-in-a-haystack (NIAH) task \cite{kamradt2023needle, hsiehruler} and  quantitatively measure the attention mass, i.e., attention scores averaged across attention heads and layers, from generated tokens to three non-overlapping parts of the context, following \citet{yang2025rope}: 
+\begin{itemize}%[leftmargin=*, nosep] 
+\item \textbf{Needle}: tokens that correspond to the golden answer in the context. The ``needle'' tokens are generally distant from the generated tokens in the NIAH task.
+\item \textbf{Query}: tokens that correspond to the user question and the continuation prefix in the context. Thus, they are closest to the generated tokens.
+\item \textbf{Rest}: other tokens in the context. \end{itemize} 
+
+We conduct our analysis on the NIAH dataset provided by RULER \cite{hsiehruler}, where the context follows the format: 
+
+\begin{displayquote}
+\texttt{Rest $\dots$ Needle $\dots$ Rest $\dots$ Query}
+\end{displayquote}
+
+As shown in Table~\ref{tab:attn_mass}, for needle tokens that are distant yet critical for generation, our \implname method allocates substantially more attention mass than both the linear (i.e., RoPE) and constant (i.e., NoPE) position assignment strategies. Compared with \implname, the linear position assignment also exhibits a stronger locality bias, encouraging attention allocation to nearby query tokens. In addition, the constant position assignment, which treats all positions uniformly, produces an attention pattern with much lower variance across the three parts. These findings explain how our \implname method achieves performance gains on tasks involving noisy context, and also support our motivation based on Cognitive Load Theory (CLT), where the germane load (e.g., the attention mechanism) can better process the context information with context re-positioning.
+
+\subsection{Position Patterns Learned by \implname \label{ssec:pos_pattern}}
+To better understand the patterns learned by \implname, we analyze the characteristics of the assigned positions, first focusing on their ranges and then on their local patterns.
+
+We first collect statistics on the distances between the maximum and minimum assigned positions for each attention head:
+$$
+d^{k, h} = \mathrm{max}(\boldsymbol{z}^{k,h}) - \mathrm{min}(\boldsymbol{z}^{k,h}),
+$$
+where $\boldsymbol{z}^{k,h} = \{z_1^{k,h}, z_2^{k,h}, \dots, z_L^{k,h}\}$, $L$ is the number of tokens in input $\boldsymbol{x}$, and $k$ and $h$ represent the indices of the attention head and layer, respectively. 
+
+We compare these statistics on a general benchmark (2K-token context) and the RULER benchmark (4K-token context). As shown in Figure \ref{fig:stats_pos_dist}, we find that \implname assigns larger positional distances $d$ on longer context lengths, but the largest distance  is still much smaller than the raw context length (i.e., 2K or 4K). This observation suggests that increasing the positional range to match the full input context length may not be necessary from the model’s perspective. Furthermore, the distribution of distances is non-uniform, unlike the linear positional assignment in RoPE. We hypothesize that assigning positions in a denser and non-linear continuous space contributes to improved performance on longer contexts in \S\ref{sec:exp}.
+
+
+
+\begin{figure}[]
+    \begin{center}
+        \includegraphics[width=1.0\columnwidth]{figs/stats_pos_dist.png}
+    \end{center}
+    \caption{Statistics for the distances between maximum and minimum positions in each attention head of the LLM. The averaged and maximum number of tokens in the MMLUPro-Math benchmark are 1971 and 2512, while those for RULER-QA are 2995 and 3555, respectively. \label{fig:stats_pos_dist}}
+\end{figure}
+
+
+
+\begin{table*}[]
+\centering
+\caption{We use the default evaluation suites, including few-shot examples, prompts, and metrics, provided in \texttt{allenai/olmes} for evaluation. All evaluations are conducted within the training context length, i.e., 4096 tokens. We use \textbf{bold} and \underline{underline} to indicate the best and second-best results, respectively.\label{tab:general}}
+\resizebox{1.0\textwidth}{!}{
+\begin{tabular}{lcccccccccc}\toprule
+Model  & ARC-C & ARC-E & BoolQ & CoQA & Drop & Hellaswag & MMLU-Pro & TriviaQA  & AVG.   \\\midrule
+\textsc{RoPE}      & \textbf{47.99}                                   & \underline{75.25}                         & 72.12                 & 56.87            & 37.90            & \textbf{70.68}                         & \textbf{13.77}                                   & \textbf{54.98} & 53.70  \\\hdashline
+\textsc{NoPE}      & 44.05                                   & 73.64                         & 66.70                 & 44.52            & 33.22            & 65.68                         & 10.70                                   & 43.43 & 47.74   \\
+\textsc{R2N1} & 47.30                                   & \textbf{75.68}                         & \underline{73.04}                 & \textbf{59.31}            & \textbf{38.48}            & 69.26                         & 13.41                                   & 54.61 & \textbf{53.88}  \\
+\textsc{N2R1} & 43.78                                   & 72.72                         & 69.38                 & 50.74            & 36.66            & 67.58                         & 11.99                                   & 47.31 & 50.02 \\\hdashline
+\implname  & \underline{47.61}                                   & 74.87                         & \textbf{73.58}                 & \underline{57.44}            & \underline{38.17}            & \underline{70.08}                         & \underline{13.52}                                   & \underline{54.56}  & \underline{53.73} \\\bottomrule
+\end{tabular}
+}
+\end{table*}
+
+
+We then analyze the patterns of the positions assigned by \implname. We split the positions $\boldsymbol{z}^{l,h}$ into non-overlapping chunks with $\Delta$ tokens  $\{\boldsymbol{z}^{k,h}_{1:\Delta}, \boldsymbol{z}^{k,h}_{\Delta+1:2\Delta}, \dots, \boldsymbol{z}^{k,h}_{L-\Delta:L}\}$ and define three pattern types:
+\begin{itemize}%[leftmargin=*, nosep]
+    \item \textbf{Constant}: We calculate the average position value $a$ in the chunk. If all positions lie between $[a-\epsilon, a+\epsilon]$, we conjecture that the positions are close to a constant, indicating the pattern of NoPE that assigns all positions to a constant position. 
+    \item \textbf{Mono}: If the positions in a chunk are monotonically increasing (i.e., $z_{i-1} < z_i < z_{i+1}$) or monotonically decreasing (i.e., $z_{i+1} < z_i < z_{i-1}$) for all $z_i$ in a chunk, we classify the pattern as \emph{monotonic}, similar to the position assignment strategy used by conventional position encoding methods.
+    \item \textbf{Hybrid}: All other patterns, e.g., a mixture of constant and monotonic patterns.
+\end{itemize}
+We empirically set $\Delta=16$ and $\epsilon=0.2$ to provide insights for the learned patterns\footnote{Setting different values for $\Delta$ and $\epsilon$ results in different plots, but the overall conclusion still holds.}. As shown in Figure \ref{fig:stats_pos_pi}, we find that the \textbf{Mono} pattern is very rare (4\% of all chunks), and the model prefer the constant patterns (22\% of all chunks) than mono pattern.   The dominating pattern of positions assigned by \implname is \textbf{Hybrid}, indicating that the position patterns beneficial for LLMs are different from those pre-defined in previous work \cite{vaswani2017attention, su2024roformer}. This analysis is conducted on the RULER benchmark, but we find consistent observations on other benchmarks.
+
+\begin{figure}[] \begin{center} \includegraphics[width=0.6\columnwidth]{figs/stats_pos_pi.png} \end{center} \caption{Statistics for the patterns of assigned positions. We split the context into non-overlapping chunks of 16 tokens. "Constant" means assigned positions are all close to a constant position, "Mono" means the positions are monotonically increasing or decreasing in the chunk, and "Hybrid" means all other patterns. \label{fig:stats_pos_pi}} \end{figure}
+
+
+Besides the statistics of positions assigned by \implname, as shown in Appendix \ref{app:case_study}, we also conduct a case study to visualize the positions across different layers and attention heads of the LLM. We find that the assigned positions can capture the intrinsic structure of the input context, such as the segmentation of few-shot examples, which aligns with our CLT-based motivation.
+
+
+
+
+
+
+\subsection{Performance on General Tasks}
+As shown in Table \ref{tab:general}, along with the noticeable performance gain in previous experiments, our \implname method still achieves performance comparable to the \textsc{RoPE} method on extensive general benchmarks. This occurs even though changing from linear position assignment to \implname causes an inconsistency between pre-training and continued training. This observation indicates that our \implname, learned from general data, generalizes well to diverse types of data, even when questions in general benchmarks are typically short and precise, requiring almost no context reorganization.
+
+\begin{table}
+    \centering
+    \caption{Efficiency comparison. FLOPs are reported for training on 50B tokens. Inference time (second) per token is evaluated using vLLM.\label{tab:efficency}}
+    \begin{tabular}{lcc}\toprule
+        Method & FLOPs & Dec. Time / Token \\\midrule
+        \textsc{RoPE} & $3.84 \times 10^{20}$ & 0.0176 \\
+        \implname & $3.87 \times 10^{20}$ & 0.0182   \\\bottomrule
+    \end{tabular}
+\end{table}
+
+
+
+\subsection{Efficiency\label{app:efficiency}}
+As shown in Table \ref{tab:efficency}, we compare the FLOPs and inference time between the vanilla model with \textsc{RoPE} method and \implname. We observe that \implname method is very lightweight, introducing only a $0.9\%$ increase in parameters while providing performance gains across many evaluation dimensions. When running inference for RULER benchmark \cite{hsiehruler} within training context length, the time cost of \implname is comparable to that of the vanilla model.

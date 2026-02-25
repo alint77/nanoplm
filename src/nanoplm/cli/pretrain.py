@@ -461,6 +461,17 @@ def pretrain():
     help="First N layers keep standard RoPE; layers after use RePO (only when --use-repo)",
 )
 @click.option(
+    "--use-mhc-lite/--no-use-mhc-lite",
+    default=False,
+    help="Enable mHC-lite: multi-stream residual with doubly stochastic mixing (pure-torch only)",
+)
+@click.option(
+    "--mhc-n-streams",
+    type=int,
+    default=4,
+    help="Number of residual streams for mHC-lite (uses n! permutation matrices)",
+)
+@click.option(
     "--pure-torch",
     is_flag=True,
     default=False,
@@ -537,6 +548,8 @@ def run(
     canon_layers_kernel_size: Optional[int],
     use_repo: bool,
     repo_after_n_layers: int,
+    use_mhc_lite: bool,
+    mhc_n_streams: int,
     pure_torch: bool,
     pure_te: bool,
 ):
@@ -623,6 +636,8 @@ def run(
         canon_layers_kernel_size=canon_layers_kernel_size,
         use_repo=use_repo,
         repo_after_n_layers=repo_after_n_layers,
+        use_mhc_lite=use_mhc_lite,
+        mhc_n_streams=mhc_n_streams,
     )
 
     _set_seed_for_init(seed)

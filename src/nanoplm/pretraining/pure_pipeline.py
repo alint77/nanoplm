@@ -329,10 +329,6 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
 # torch.compile
 # ---------------------------------------------------------------------------
 
-def _compile_inner_layers_for_fsdp(model: torch.nn.Module, *, dynamic: bool) -> None:
-    """Compile transformer layers individually (before FSDP wrapping)."""
-    for i, layer in enumerate(model.model.layers):
-        model.model.layers[i] = torch.compile(layer, dynamic=dynamic)
 
 
 # ---------------------------------------------------------------------------
@@ -817,14 +813,7 @@ def run_pure_pretraining(
     # ---- Model to device + compile + FSDP ----
     model.to(device)
 
-    compile_dynamic_inner = bool(use_packing and not use_static_inp_size)
-    compile_dynamic_root = not bool(use_packing and use_static_inp_size)
-    if distributed:
-        _compile_inner_layers_for_fsdp(model, dynamic=compile_dynamic_inner)
-        logger.info(
-            "Compiled inner transformer layers with "
-            f"torch.compile(dynamic={compile_dynamic_inner}) before FSDP2 wrapping"
-        )
+    compile_dynamic = not bool(use_packing and use_static_inp_size)
 
     # Precision detection (needed before FSDP MixedPrecisionPolicy)
     use_bf16 = pretrain_config.bf16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
@@ -853,11 +842,8 @@ def run_pure_pretraining(
 
     # Keep orig_model reference for checkpointing/eval (eval changes shapes → recompilation)
     orig_model = model
-    if distributed:
-        logger.info("Skipping root model torch.compile under FSDP2 (using pre-wrapped compiled inner layers)")
-    else:
-        model = torch.compile(model, dynamic=compile_dynamic_root)
-        logger.info(f"Model compiled with torch.compile(dynamic={compile_dynamic_root})")
+    model = torch.compile(model, dynamic=compile_dynamic)
+    logger.info(f"Model compiled with torch.compile(dynamic={compile_dynamic})")
 
     # ---- DataLoaders ----
     eval_collator = ProtDataCollatorForLM(

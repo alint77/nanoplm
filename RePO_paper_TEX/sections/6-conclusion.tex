@@ -1,0 +1,14 @@
+\section{Conclusion}
+
+In this paper, we addressed high \textit{extraneous cognitive load} by substituting the rigid linear position encoding in LLMs with context Re-Positioning (\implname). The proposed \implname is a novel, lightweight differentiable module ($f_{\phi}$) that empowers models to learn positions that capture the structure and dependencies in a context. Through continual pre-training of an OLMo-2 1B model, our extensive experiments demonstrated that \implname significantly outperforms strong baselines on tasks requiring specific contextual dependencies, showing substantial gains on noisy-context, structured data, and long-context extrapolation benchmarks, while maintaining performance on general short-context tasks. Our analysis revealed that \implname also brings notable technical advantages, as it mitigates  locality bias of traditional position assignment strategies by allocating more attention to distant but relevant ``needle'' tokens, and learns adaptive position patterns in a more non-linear and denser continues space. By enabling models to actively re-position their input context, \implname opens a new direction for flexible context management driven by innovations in LLM architecture.
+
+
+\section{Impact Statement}
+
+This work improves how large language models (LLMs) organize and attend to contextual information, particularly in long or noisy inputs. By enabling more effective use of relevant context, the proposed method can improve reliability and efficiency in downstream applications such as long-document understanding, retrieval-augmented generation, and agentic systems.
+
+
+The method does not introduce new data sources or supervision and operates within existing model architectures. While improved contextual reasoning may amplify both beneficial and harmful uses of language models, this work does not inherently introduce new ethical risks beyond those already associated with LLMs, and highlights context organization as an important direction for improving robustness and interpretability.
+
+\section{Acknowledgment}
+This work was conducted during Huayang's internship at Sakana AI. Huayang wishes to thank his mentors, Richard and Tianyu, for their kind support during this journey. The authors also thank Yoav Gelberg and Yingtao Tian for insightful discussions regarding the experiments, as well as Yujin Tang, Qi Sun, Makoto Shing, Lemao Liu, Deng Cai, Leyang Cui, Yahui Liu, and Tian Lan for their feedback on the manuscript.

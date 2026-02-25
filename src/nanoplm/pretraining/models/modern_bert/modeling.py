@@ -151,6 +151,9 @@ class ModernBertConfig:
     x0_lambda_init: float = 0.1
     use_repo: bool = False
     repo_after_n_layers: int = 3
+    use_mhc_lite: bool = False
+    mhc_n_streams: int = 4
+    mhc_triton_fused: bool = False
 
     head_dim: int = field(init=False)
     sliding_window: int = field(init=False)
@@ -991,14 +994,160 @@ class ModernBertEncoderLayer(nn.Module):
         return x
 
 
+def _build_permutation_matrices(n: int) -> tuple[torch.Tensor, int]:
+    """Pre-compute all n! permutation matrices (flattened) and identity index."""
+    from itertools import permutations
+
+    perms = list(permutations(range(n)))
+    identity_idx = 0  # (0,1,...,n-1) is first in lexicographic order
+    P = torch.zeros(len(perms), n * n)
+    for i, perm in enumerate(perms):
+        for row, col in enumerate(perm):
+            P[i, row * n + col] = 1.0
+    return P, identity_idx
+
+
+class MHCLiteBlock(nn.Module):
+    """mHC-lite: wraps a transformer layer with n residual streams
+    and doubly stochastic mixing via convex combination of permutation matrices.
+
+    Forward: x_streams (..., n, C) -> (..., n, C)
+    x_{l+1} = H^res_l @ x_l + H^post_l * f(H^pre_l @ x_l)
+    where f is the wrapped transformer layer (without residual).
+
+    Optimized I/O: fused projection, merged H_res-h_post application.
+    Optional Triton kernels for further fusion (set triton_fused=True).
+    """
+
+    def __init__(self, n_streams: int, hidden_size: int, layer: nn.Module,
+                 triton_fused: bool = False):
+        super().__init__()
+        self.n = n_streams
+        self.C = hidden_size
+        self.nC = n_streams * hidden_size
+        self.layer = layer
+        n_fact = math.factorial(n_streams)
+        self.n_fact = n_fact
+        self.triton_fused = triton_fused
+
+        self.alpha_pre = nn.Parameter(torch.tensor([0.01]))
+        self.alpha_post = nn.Parameter(torch.tensor([0.01]))
+        self.alpha_res = nn.Parameter(torch.tensor([0.01]))
+
+        # Fused single projection: pre(n) + post(n) + res(n!) outputs
+        total_out = n_streams + n_streams + n_fact
+        self.W_all = nn.Linear(self.nC, total_out, bias=True)
+
+        perm_flat, self._identity_idx = _build_permutation_matrices(n_streams)
+        self.register_buffer("perm_mat", perm_flat)  # (n!, n*n)
+
+    @property
+    def attention_type(self):
+        return self.layer.attention_type
+
+    def _forward_pytorch(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
+        """Pure PyTorch forward path (always correct, works everywhere)."""
+        n = self.n
+        dt = x_streams.dtype
+
+        x_flat = x_streams.reshape(*x_streams.shape[:-2], self.nC)
+        x_norm = F.rms_norm(x_flat, (self.nC,))
+
+        all_proj = F.linear(x_norm, self.W_all.weight.to(dt), None)
+        pre_proj, post_proj, res_proj = all_proj.split(
+            [n, n, self.n_fact], dim=-1
+        )
+
+        bias = self.W_all.bias.to(dt)
+        pre_bias = bias[:n]
+        post_bias = bias[n:2 * n]
+        res_bias = bias[2 * n:]
+
+        h_pre = torch.sigmoid(self.alpha_pre.to(dt) * pre_proj + pre_bias)
+        h_post = 2.0 * torch.sigmoid(self.alpha_post.to(dt) * post_proj + post_bias)
+        a_res = F.softmax(self.alpha_res.to(dt) * res_proj + res_bias, dim=-1)
+
+        H_res = torch.matmul(a_res, self.perm_mat.to(dt)).unflatten(-1, (n, n))
+        H_merged = H_res - h_post.unsqueeze(-1) * h_pre.unsqueeze(-2)
+
+        layer_input = torch.matmul(h_pre.unsqueeze(-2), x_streams).squeeze(-2)
+        layer_output = self.layer(layer_input, **kwargs)
+
+        return (
+            torch.matmul(H_merged, x_streams)
+            + h_post.unsqueeze(-1) * layer_output.unsqueeze(-2)
+        )
+
+    def _forward_triton(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
+        """Triton-fused forward path. Requires (T, n, C) bf16 on CUDA.
+
+        Uses Triton for the memory-heavy stream operations (K3: pre-map,
+        K4: post-res) and PyTorch for the coefficient computation (tiny ops).
+        """
+        from .mhc_triton_kernels import FusedPreMap, FusedPostRes
+
+        n = self.n
+        T = x_streams.shape[0]
+        dt = x_streams.dtype
+
+        # Coefficient computation in PyTorch (operates on only 32 values per token)
+        x_flat = x_streams.reshape(T, self.nC)
+        x_norm = F.rms_norm(x_flat, (self.nC,))
+        all_proj = F.linear(x_norm, self.W_all.weight.to(dt), None)
+        pre_proj, post_proj, res_proj = all_proj.split(
+            [n, n, self.n_fact], dim=-1
+        )
+
+        bias = self.W_all.bias.to(dt)
+        h_pre = torch.sigmoid(self.alpha_pre.to(dt) * pre_proj + bias[:n])
+        h_post = 2.0 * torch.sigmoid(self.alpha_post.to(dt) * post_proj + bias[n:2*n])
+        a_res = F.softmax(self.alpha_res.to(dt) * res_proj + bias[2*n:], dim=-1)
+
+        H_res = torch.matmul(a_res, self.perm_mat.to(dt)).unflatten(-1, (n, n))
+        H_merged = H_res - h_post.unsqueeze(-1) * h_pre.unsqueeze(-2)
+
+        # K3: Triton fused pre-map (weighted stream aggregation)
+        layer_input = FusedPreMap.apply(x_streams, h_pre.float())
+
+        # Transformer layer
+        layer_output = self.layer(layer_input, **kwargs)
+
+        # K4: Triton fused post-res (H_merged @ x + h_post * layer_output)
+        return FusedPostRes.apply(
+            x_streams, layer_output, H_merged.float(), h_post.float()
+        )
+
+    def forward(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
+        """x_streams: (..., n, C).  Returns (..., n, C)."""
+        # Use Triton path when: triton_fused=True, CUDA, bf16, 2D token dim
+        use_triton = (
+            self.triton_fused
+            and x_streams.is_cuda
+            and x_streams.dtype == torch.bfloat16
+            and x_streams.dim() == 3  # (T, n, C) — no batch dim
+        )
+
+        if use_triton:
+            return self._forward_triton(x_streams, **kwargs)
+        return self._forward_pytorch(x_streams, **kwargs)
+
+
 class ModernBertModel(nn.Module):
     def __init__(self, config: ModernBertConfig):
         super().__init__()
         self.config = config
         self.embeddings = ModernBertEmbeddings(config)
-        self.layers = nn.ModuleList(
-            [ModernBertEncoderLayer(config, i) for i in range(config.num_hidden_layers)]
-        )
+        if config.use_mhc_lite:
+            self.layers = nn.ModuleList([
+                MHCLiteBlock(config.mhc_n_streams, config.hidden_size,
+                             ModernBertEncoderLayer(config, i),
+                             triton_fused=config.mhc_triton_fused)
+                for i in range(config.num_hidden_layers)
+            ])
+        else:
+            self.layers = nn.ModuleList(
+                [ModernBertEncoderLayer(config, i) for i in range(config.num_hidden_layers)]
+            )
         if config.use_resid_lambdas:
             self.resid_lambdas = nn.Parameter(torch.ones(config.num_hidden_layers))
         else:
@@ -1025,6 +1174,9 @@ class ModernBertModel(nn.Module):
         if _cu_seqlens is not None:
             device = input_ids.device
             x = self.embeddings(input_ids)  # (total_tokens, hidden)
+            if self.config.use_mhc_lite:
+                n = self.config.mhc_n_streams
+                x = F.pad(x.unsqueeze(-2), (0, 0, 0, n - 1))  # (T, n, C)
             x0 = x if self.x0_lambdas is not None else None
             if _position_ids is None:
                 _position_ids = _position_ids_from_cu_seqlens(
@@ -1076,6 +1228,8 @@ class ModernBertModel(nn.Module):
                     repo_active=repo_active,
                 )
 
+            if self.config.use_mhc_lite:
+                x = x[..., 0, :]  # compress: take stream 0
             return self.final_norm(x)
 
         # ---- SDPA (fallback) path -----------------------------------------
@@ -1087,6 +1241,9 @@ class ModernBertModel(nn.Module):
         device = input_ids.device
 
         x = self.embeddings(input_ids)
+        if self.config.use_mhc_lite:
+            n = self.config.mhc_n_streams
+            x = F.pad(x.unsqueeze(-2), (0, 0, 0, n - 1))  # (B, S, n, C)
         x0 = x if self.x0_lambdas is not None else None
 
         attn_masks = {
@@ -1131,6 +1288,8 @@ class ModernBertModel(nn.Module):
                 repo_active=repo_active,
             )
 
+        if self.config.use_mhc_lite:
+            x = x[..., 0, :]  # compress: take stream 0
         return self.final_norm(x)
 
 
@@ -1189,30 +1348,50 @@ class ModernBertForMaskedLM(nn.Module):
                     nn.init.zeros_(module.bias)
 
         for layer in self.model.layers:
-            nn.init.uniform_(layer.attn.Wqkv.weight, -bound, bound)
-            nn.init.zeros_(layer.attn.Wo.weight)
-            nn.init.uniform_(layer.mlp.Wi.weight, -bound, bound)
-            if hasattr(layer.mlp, "Wo"):
-                nn.init.zeros_(layer.mlp.Wo.weight)
+            enc = layer.layer if isinstance(layer, MHCLiteBlock) else layer
+            nn.init.uniform_(enc.attn.Wqkv.weight, -bound, bound)
+            nn.init.zeros_(enc.attn.Wo.weight)
+            nn.init.uniform_(enc.mlp.Wi.weight, -bound, bound)
+            if hasattr(enc.mlp, "Wo"):
+                nn.init.zeros_(enc.mlp.Wo.weight)
             else:
-                nn.init.zeros_(layer.mlp.Wo_weight)
+                nn.init.zeros_(enc.mlp.Wo_weight)
 
-            if layer.attn.Wqkv.bias is not None:
-                nn.init.zeros_(layer.attn.Wqkv.bias)
-            if layer.attn.Wo.bias is not None:
-                nn.init.zeros_(layer.attn.Wo.bias)
-            if layer.mlp.Wi.bias is not None:
-                nn.init.zeros_(layer.mlp.Wi.bias)
-            if hasattr(layer.mlp, "Wo"):
-                if layer.mlp.Wo.bias is not None:
-                    nn.init.zeros_(layer.mlp.Wo.bias)
-            elif layer.mlp.Wo_bias is not None:
-                nn.init.zeros_(layer.mlp.Wo_bias)
+            if enc.attn.Wqkv.bias is not None:
+                nn.init.zeros_(enc.attn.Wqkv.bias)
+            if enc.attn.Wo.bias is not None:
+                nn.init.zeros_(enc.attn.Wo.bias)
+            if enc.mlp.Wi.bias is not None:
+                nn.init.zeros_(enc.mlp.Wi.bias)
+            if hasattr(enc.mlp, "Wo"):
+                if enc.mlp.Wo.bias is not None:
+                    nn.init.zeros_(enc.mlp.Wo.bias)
+            elif enc.mlp.Wo_bias is not None:
+                nn.init.zeros_(enc.mlp.Wo_bias)
 
             # RePO: zero-init W_z so positions start at zero (NoPE-like).
             # W_g and W_c keep default Kaiming uniform init.
-            if layer.attn.repo is not None:
-                nn.init.zeros_(layer.attn.repo.W_z.weight)
+            if enc.attn.repo is not None:
+                nn.init.zeros_(enc.attn.repo.W_z.weight)
+
+            # mHC-lite: zero-init fused projection, set biases for identity behavior
+            if isinstance(layer, MHCLiteBlock):
+                nn.init.zeros_(layer.W_all.weight)
+                n_s = layer.n
+                n_f = layer.n_fact
+                bias = layer.W_all.bias.data
+                # pre bias: first n values
+                bias[:n_s].fill_(-1.0)
+                bias[0] = 1.0
+                # post bias: next n values
+                bias[n_s:2 * n_s].fill_(-1.0)
+                bias[n_s] = 1.0
+                # res bias: last n! values
+                bias[2 * n_s:].fill_(-8.0)
+                bias[2 * n_s + layer._identity_idx] = 0.0
+                layer.alpha_pre.fill_(0.01)
+                layer.alpha_post.fill_(0.01)
+                layer.alpha_res.fill_(0.01)
 
         nn.init.uniform_(self.head.dense.weight, -bound, bound)
         if self.head.dense.bias is not None:

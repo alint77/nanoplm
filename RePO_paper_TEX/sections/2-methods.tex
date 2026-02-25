@@ -1,0 +1,91 @@
+\section{Background\label{sec:bg}}
+The position information of tokens in a context is critical for the attention mechanism of LLMs. The position of a given token is generally mapped into embeddings \cite{su2024roformer, vaswani2017attention, li2025seqpe} or biases \citep{press2021train, raffel2020exploring} through a position encoding module before the attention function. In this section, we will introduce the notations for attention mechanism and position encoding functions.
+
+
+Given an input sequence $\boldsymbol{x} = (x_1, x_2, \dots, x_L)$, where each token $x_i$ is drawn from a vocabulary $\mathcal{V}$, most large language models (LLMs) process the information in $\boldsymbol{x}$ through multiple layers of self-attention-based neural networks.
+In each layer, the attention score\footnote{For simplicity, we omit the design of multi-head in the attention calculation.} between tokens $x_i$ and $x_j$ is computed as follows:
+\begin{align}
+\mathbf{Q}, \mathbf{K}, \mathbf{V} &= \mathbf{H}\mathbf{W}^{{q, k, v}}, \label{eq:qkv}\\
+\mathbf{A}_{i,j} &= \boldsymbol{q}_i^\top \boldsymbol{k}_j,
+\end{align}
+where $\mathbf{W}^{{q,k,v}} \in \mathbb{R}^{d \times 3d}$ projects the hidden state $\boldsymbol{h}_i \in \mathbf{H}$ of token $x_i$ into its corresponding query, key, and value representations, and $\textbf{A} \in \mathbb{R}^{L\times L}$ represents the attention scores for all token pairs.  
+
+
+We use the \emph{rotary position encoding} (\textsc{RoPE}) \cite{su2024roformer} as a specific example to illustrate the position assignment and encoding procedure commonly employed in LLMs \cite{walsh2, yang2025qwen3, qwen2025qwen25technicalreport}. First, each token \(x_i\) is assigned an integer position index \(i\). This positional information is then incorporated into the model through an encoding function \(g_\theta: \mathbb{R} \rightarrow \mathbb{R}^{d \times d}\), which is a differentiable function that generates a rotation matrix. The parameter \(\theta\) represents a pre-defined frequency vector, generally frozen during training. In \textsc{RoPE}, the function \(g_\theta\) is directly applied to the query \(\boldsymbol{q}_i\) and key \(\boldsymbol{k}_j\) as follows:
+\begin{align}
+\mathbf{A}_{i,j}^\text{RoPE} = \boldsymbol{q}_i^\top g_\theta(j-i)\boldsymbol{k}_j \label{eq:rope},
+\end{align}
+where \(i\) and \(j\) are the integer position indices for tokens \(x_i\) and \(x_j\), respectively, and \(g_\theta(j-i)\) captures the relative positional relationship between any tokens with a distance of \(j-i\). 
+
+In many related works, strict linear position assignment (i.e., 0 to $L-1$) similar to \textsc{RoPE} has become the standard approach, with various encoding functions being explored \cite{vaswani2017attention, press2021train, yang2025rope, li2025seqpe}. One notable exception is the \textsc{NoPE} method \cite{kazemnejad2023impact, yang2025rope}, which omits both position assignment and position encoding. However, we demonstrate that this approach is equivalent to applying position encoding at a constant position \(a\) for all tokens. Further discussion about the inter-connection between constant (e.g., \textsc{NoPE}) and linear position assignment (e.g., \textsc{RoPE}) strategies are provided in Appendix \ref{app:comp}.
+
+
+
+
+\section{Methods}
+
+\subsection{Overview}
+The current linear context organization, which assigns consecutive integer indices to tokens, overlooks the internal structure of tokens based on their relevance. For instance, this limitation leads to noticeable performance degradation in tasks involving long-distance dependencies \cite{hsiehruler}, a problem analogous to the high extraneous load issue in Cognitive Load Theory (CLT).
+
+The main goal of this work is to reduce the unnecessary cognitive cost raised by the oversimplified organization of the context, i.e., \textit{extraneous cognitive load}, thereby conserving the finite working memory capacity for beneficial \textit{germane load}, such as the attention mechanism. To this end, we propose a context re-positioning (\implname) module $f_\phi: \mathbb{R}^{d} \rightarrow \mathbb{R}$, which is a light-weight neural network that assigns more appropriate positions of tokens, taking into account their relevance within a given context. The assigned positions by $f_\phi$ are defined in a continuous, non-linear space, and can thus be optimized jointly with LLMs when equipped with differentiable position encoding methods \cite{vaswani2017attention, su2024roformer, press2021train}. Notably, our \implname module $f_\phi$ is prior to position encoding, where the latter aims to map assigned positions into embeddings or biases.  
+
+
+
+\subsection{Context Re-positioning}
+The context re-positioning module $f_\phi$ has two components: 1) representing the position information based on hidden states of tokens; 2) assigning real-valued positions based on the extracted position representations.
+
+
+
+
+
+\paragraph{Position Representation}
+\citet{kazemnejad2023impact} shows that position information may be entangled in original hidden states, so the first component is designed to extract the position representation from hidden states of tokens explicitly. In our implementation, we use a light-weight SwiGLU \cite{shazeer2020glu} sub-layer to achieve this goal:
+\begin{equation}
+\boldsymbol{r}_i = \mathrm{Swish}(\boldsymbol{h}_i\mathbf{W}^{g})\odot(\boldsymbol{h}_i\mathbf{W}^{c}),\label{eq:pos_repr}
+\end{equation}
+where $\boldsymbol{r}_i \in \mathbb{R}^{d_p}$ and $\boldsymbol{h}_i \in \mathbb{R}^d$ are position representation\footnote{Notably, the hidden state $\boldsymbol{h}_i$ of token $x_i$ does not explicitly encode the linear position information $i$. In our preliminary experiments, when using the raw position $i$ as an additional dimension during continue-training, the LLM pre-trained on \textsc{RoPE} quickly biases to this feature, resulting in trivial position assignment.} and hidden state of token $x_i$ respectively, $\mathbf{W}^{g},\mathbf{W}^{c} \in \mathbb{R}^{d\times d_p}$ are linear transformations for gate and content mapping, and $\mathrm{Swish}(\cdot)$ is the activation function.  Since we assume that position information can be represented with a lower dimension, we set $d_p < d$ in practice. 
+
+
+\paragraph{Position Assignment} The subsequent component assigns a new position value $z_i$ for token $x_i$ in each attention head. There are a variety of modeling strategies for processing $\boldsymbol{r}_i$ with full \cite{vaswani2017attention} or limited \cite{lecun1998convolutional} access to $\boldsymbol{r}_{<i}$, but we find that a linear transformation achieves comparable performance with lower latency:
+\begin{equation}
+    z_i = \boldsymbol{r}_i\mathbf{W}^z,\label{eq:pos_head}
+\end{equation}
+where $\mathbf{W}^z \in \mathbb{R}^{d_p\times1}$. 
+
+\paragraph{\implname Module} By combining Eq. \ref{eq:pos_repr} and \ref{eq:pos_head}, the formal definition of $f_\theta$ becomes:
+\begin{align}
+f_\phi(\boldsymbol{h}_i) &= \big(\mathrm{Swish}(\boldsymbol{h}_i\mathbf{W}^{g})\odot(\boldsymbol{h}_i\mathbf{W}^{c})\big)\mathbf{W}^z,
+\end{align}
+where $\boldsymbol{h}_i$ is the hidden state of token $x_i$, as defined in Eq. \ref{eq:qkv}.
+When equipped with modern position encoding methods, e.g., RoPE, the computation of attention score becomes:
+\begin{align}
+    \textbf{A}^{\text{RePo}}_{i,j} &= \boldsymbol{q}_i^\top g_\theta \big(f_\phi(\boldsymbol{h}_j) - f_\phi(\boldsymbol{h}_i)\big) \boldsymbol{k}_j \nonumber\\
+    &= \boldsymbol{q}_i^\top g_\theta (z_j - z_i) \boldsymbol{k}_j,
+    \label{eq:repo}
+\end{align}
+where the position encoding function $g_\theta$ is the same as that used in \textsc{RoPE} in Eq. \ref{eq:rope}. It is worth noting that our \implname is not restricted to \textsc{RoPE} and can be easily extended to all the differentiable position encoding methods \cite{vaswani2017attention, press2021train, li2025seqpe}. In practice, we apply the position representation module (Eq. \ref{eq:pos_repr}) for each layer independently, and position assignment module (Eq. \ref{eq:pos_head}) for each attention head independently. 
+% The pseudo code for the full implementation of $f_\phi$ is shown in Alg 1. 
+
+
+\begin{table}
+\centering
+\caption{Performance on noisy context. We evaluate on subsets of RULER with noisy context, i.e., Needle-in-the-haystack (NIAH), Question Answering (QA), Aggregation (AGG), and variable tracking (VT), within the training context length (i.e., 4K tokens). 
+This uses recall for NAIH, AGG, and VT tasks, and EM for the QA task as the metrics. 
+We use \textbf{bold} and \underline{underline} for best and second best results.\label{tab:anti_noise}}
+\resizebox{1.0\columnwidth}{!}{
+\begin{tabular}{lrrrrr}\toprule
+Model & NIAH  & QA   & AGG & VT & AVG.  \\\midrule
+\textsc{RoPE}    & 82.56 & 57.00  & \textbf{37.98}       & 1.00              & 44.64 \\\hdashline
+\textsc{NoPE}    & 74.59 & 49.00  & 22.45       & 12.20             & 39.56 \\
+\textsc{R2N1}   & \underline{85.00} & \underline{59.50}   & 31.10       & 0.00              & 43.90 \\
+N2R1   & 80.00 & 58.00   & 32.75       & \underline{27.00}             & \underline{49.44} \\\hdashline
+\implname    & \textbf{88.25} & \textbf{61.00}   & \underline{35.05}       & \textbf{38.40}            & \textbf{55.68} \\\bottomrule
+\end{tabular}
+}
+% \vspace{-1.2em}
+\end{table}
+
+
+\paragraph{Training \& Efficiency} Since many position encoding methods are differentiable \cite{su2024roformer,press2021train,li2025seqpe}, we can train an LLM with \implname-based attention (Eq.~\ref{eq:repo}) using backpropagation when equipped with such encodings. To balance efficiency and effectiveness, we apply the \implname method starting from the $l$-th layer (e.g., $l=5$) while keeping standard position encoding for the lower layers. This design choice is motivated by previous findings that the lower layers of LLMs primarily capture surface-level features that depend more on local information \cite{tenney-etal-2019-bert}, such as part-of-speech tagging and syntax, and thus benefit less from reorganization. An ablation study for the hyper-parameter is in Appendix \ref{app:ablation}.
+
+In order not to impair the efficiency of LLMs significantly, we only use the assigned position $z_i$ and $z_j$ to affect the position encoding in attention calculation in Eq. \ref{eq:repo}, leaving the auto-regressive order of $\boldsymbol{q}_i$ (or $\boldsymbol{k}_i$) and $\boldsymbol{q}_j$ (or $\boldsymbol{k}_j$) in the context unchanged. The \implname module can be applied to each attention head independently. In principle, we can sort queries and keys in each attention head according to the assigned positions $\boldsymbol{z} = \{z_1, \dots, z_n\}$. However, under the auto-regressive language modeling paradigm, this approach requires re-computation for the KV cache at each time step, resulting in tremendous overhead for auto-regressive LLMs. Therefore, the assigned positions are only used in Eq. \ref{eq:repo}. 

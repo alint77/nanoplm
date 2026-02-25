@@ -68,6 +68,9 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             x0_lambda_init=config.x0_lambda_init,
             use_repo=config.use_repo,
             repo_after_n_layers=config.repo_after_n_layers,
+            use_mhc_lite=config.use_mhc_lite,
+            mhc_n_streams=config.mhc_n_streams,
+            mhc_triton_fused=config.mhc_triton_fused,
         )
 
         super().__init__(mb_config)
@@ -115,6 +118,9 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             x0_lambda_init=config.x0_lambda_init,
             use_repo=config.use_repo,
             repo_after_n_layers=config.repo_after_n_layers,
+            use_mhc_lite=config.use_mhc_lite,
+            mhc_n_streams=config.mhc_n_streams,
+            mhc_triton_fused=config.mhc_triton_fused,
         )
 
         super().__init__(mb_config)
