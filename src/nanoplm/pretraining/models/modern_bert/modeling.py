@@ -18,6 +18,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _checkpoint
 
+# Registers torch.ops.nanoplm_mhc::* used by MHCLiteBlock's Triton path.
+from . import mhc_triton_ops as _mhc_triton_ops  # noqa: F401
+
 
 _HAS_FLASH_VARLEN = False
 _flash_varlen_fn = None
@@ -1090,8 +1093,6 @@ class MHCLiteBlock(nn.Module):
         Uses Triton for the memory-heavy stream operations (K3: pre-map,
         K4: post-res) and PyTorch for the coefficient computation (tiny ops).
         """
-        from .mhc_triton_kernels import FusedRMSNormProject, FusedPreMap, FusedPostRes
-
         n = self.n
         T = x_streams.shape[0]
         dt = x_streams.dtype
@@ -1099,7 +1100,9 @@ class MHCLiteBlock(nn.Module):
         # K1: Fused RMSNorm + projection
         # This replaces: x_norm = F.rms_norm(x_flat); all_proj = F.linear(x_norm, W_all)
         x_flat = x_streams.reshape(T, self.nC)
-        all_proj = FusedRMSNormProject.apply(x_flat, self.W_all.weight.to(dt))
+        all_proj, _inv_rms = torch.ops.nanoplm_mhc.fused_rmsnorm_project(
+            x_flat, self.W_all.weight.to(dt)
+        )
 
         pre_proj, post_proj, res_proj = all_proj.split(
             [n, n, self.n_fact], dim=-1
@@ -1114,13 +1117,13 @@ class MHCLiteBlock(nn.Module):
         H_merged = H_res - h_post.unsqueeze(-1) * h_pre.unsqueeze(-2)
 
         # K3: Triton fused pre-map (weighted stream aggregation)
-        layer_input = FusedPreMap.apply(x_streams, h_pre.float())
+        layer_input = torch.ops.nanoplm_mhc.fused_pre_map(x_streams, h_pre.float())
 
         # Transformer layer
         layer_output = self.layer(layer_input, **kwargs)
 
         # K4: Triton fused post-res (H_merged @ x + h_post * layer_output)
-        return FusedPostRes.apply(
+        return torch.ops.nanoplm_mhc.fused_post_res(
             x_streams, layer_output, H_merged.float(), h_post.float()
         )
 
