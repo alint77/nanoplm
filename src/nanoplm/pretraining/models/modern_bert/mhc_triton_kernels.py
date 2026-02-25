@@ -217,20 +217,27 @@ class FusedRMSNormProject(torch.autograd.Function):
         x_flat, W, proj_out, inv_rms = ctx.saved_tensors
         T, nC = x_flat.shape
         D_out = W.shape[0]
-        BLOCK_T = getattr(ctx, 'BLOCK_T', 128)
         BLOCK_K = getattr(ctx, 'BLOCK_K', 128)
         grad_out = grad_output.contiguous()
-        
+
         grad_x = torch.empty_like(x_flat)
-        grid = (triton.cdiv(T, BLOCK_T),)
         _, nw, ns = _get_hw_config()
-        # SMEM constraints based on HW Config
+        cc_major, _ = torch.cuda.get_device_capability()
+        # SM120: BLOCK_T=64, BLOCK_K=128 → 24KB/stage, 3 stages = 72KB (fits 99KB).
+        # SM90+: keep BLOCK_T=128, BLOCK_K=128 with default stages.
+        if cc_major >= 12:
+            BLOCK_T_BWD = 64
+            ns_bwd = 3
+        else:
+            BLOCK_T_BWD = getattr(ctx, 'BLOCK_T', 128)
+            ns_bwd = ns
+        grid = (triton.cdiv(T, BLOCK_T_BWD),)
         _fused_rmsnorm_project_bwd_dx_kernel[grid](
             x_flat, W, grad_out, proj_out, inv_rms,
             grad_x,
             T, nC, D_out,
-            BLOCK_T=BLOCK_T, BLOCK_K=BLOCK_K,
-            num_warps=nw, num_stages=ns
+            BLOCK_T=BLOCK_T_BWD, BLOCK_K=BLOCK_K,
+            num_warps=nw, num_stages=ns_bwd
         )
         
         # dW natively with cuBLAS without instantiating x_norm!
@@ -522,7 +529,7 @@ def _fused_post_res_bwd_Hhp_kernel(
             x1_ptr = tl.make_block_ptr(base=x_ptr + 1 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
             x2_ptr = tl.make_block_ptr(base=x_ptr + 2 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
             x3_ptr = tl.make_block_ptr(base=x_ptr + 3 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
-            
+
             x0 = tl.load(x0_ptr, boundary_check=(0, 1)).to(tl.float32)
             x1 = tl.load(x1_ptr, boundary_check=(0, 1)).to(tl.float32)
             x2 = tl.load(x2_ptr, boundary_check=(0, 1)).to(tl.float32)
@@ -644,7 +651,8 @@ class FusedPostRes(torch.autograd.Function):
         )
 
         BLOCK_T_B = 64
-        BLOCK_C_B = min(256, triton.next_power_of_2(C))
+        # SM120: BLOCK_C=128 reduces register pressure (9 live tiles fit in regs).
+        BLOCK_C_B = 128 if cc_major >= 12 else min(256, triton.next_power_of_2(C))
         _fused_post_res_bwd_Hhp_kernel[grid](
             x_streams, layer_output, grad_out,
             grad_H, grad_hp,
