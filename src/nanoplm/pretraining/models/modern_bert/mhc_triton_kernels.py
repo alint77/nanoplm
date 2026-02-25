@@ -19,14 +19,206 @@ import triton.language as tl
 # ═══════════════════════════════════════════════════════════════════════════
 # Hardware detection (shared with triton_kernels.py)
 # ═══════════════════════════════════════════════════════════════════════════
-_NUM_SMS = None
+_HW_CONFIG = None
+
+def _get_hw_config():
+    global _HW_CONFIG
+    if _HW_CONFIG is None:
+        props = torch.cuda.get_device_properties("cuda")
+        num_sms = props.multi_processor_count
+        cc = (props.major, props.minor)
+        
+        # SM90 (Hopper) has 227KB shared memory per block
+        if cc == (9, 0):
+            # (num_sms, num_warps, num_stages)
+            _HW_CONFIG = (num_sms, 8, 4)
+        else:
+            # SM120 (Blackwell consumer, RTX 5090) and SM89 (Ada Lovelace, RTX 6000) 
+            # have strict ~99-100KB shared memory limits per block.
+            _HW_CONFIG = (num_sms, 4, 2)
+            
+    return _HW_CONFIG
 
 
-def _get_num_sms():
-    global _NUM_SMS
-    if _NUM_SMS is None:
-        _NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-    return _NUM_SMS
+# ═══════════════════════════════════════════════════════════════════════════
+# Kernel 1: fused_rmsnorm_project
+#
+# proj_out[t, d] = (x_flat[t] / rms[t]) @ W[d]
+# Dimensions: x_flat is (T, nC), W is (D_out, nC), proj_out is (T, D_out)
+# D_out is tiny (e.g. 32), nC is large (e.g. 8192). 
+# This is a vectorized dot-product kernel, not a standard GEMM.
+# ═══════════════════════════════════════════════════════════════════════════
+
+@triton.jit
+def _fused_rmsnorm_project_fwd_kernel(
+    x_ptr, W_ptr,
+    out_ptr, rms_ptr,
+    T, nC: tl.constexpr, D_out: tl.constexpr,
+    BLOCK_T: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    t_start = pid * BLOCK_T
+    t_offs = t_start + tl.arange(0, BLOCK_T)
+    t_mask = t_offs < T
+    
+    d_offs = tl.arange(0, D_out)
+    
+    sum_sq = tl.zeros((BLOCK_T,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_T, D_out), dtype=tl.float32)
+    
+    for k_start in tl.range(0, nC, BLOCK_K):
+        # Load x_tile: (BLOCK_T, BLOCK_K) via TMA
+        x_block_ptr = tl.make_block_ptr(
+            base=x_ptr,
+            shape=(T, nC),
+            strides=(nC, 1),
+            offsets=(t_start, k_start),
+            block_shape=(BLOCK_T, BLOCK_K),
+            order=(1, 0)
+        )
+        x_tile = tl.load(x_block_ptr, boundary_check=(0, 1))
+        x_tile_f32 = x_tile.to(tl.float32)
+        sum_sq += tl.sum(x_tile_f32 * x_tile_f32, axis=1)
+        
+        # Load W_tile transposed: need (BLOCK_K, D_out) via TMA
+        # W in memory is (D_out, nC) 
+        w_block_ptr = tl.make_block_ptr(
+            base=W_ptr,
+            shape=(nC, D_out), # Reversed for transposition
+            strides=(1, nC),   # Strides of transposed view
+            offsets=(k_start, 0),
+            block_shape=(BLOCK_K, D_out),
+            order=(0, 1)
+        )
+        w_tile = tl.load(w_block_ptr, boundary_check=(0, 1))
+        
+        # Tensor Core matmul: (BLOCK_T, BLOCK_K) @ (BLOCK_K, D_out)
+        acc += tl.dot(x_tile, w_tile)
+
+    rms = tl.sqrt(sum_sq / nC + 1e-6)
+    tl.store(rms_ptr + t_offs, rms, mask=t_mask)
+
+    # proj_out = (x @ W_T) / rms
+    out_vals = acc / rms[:, None]
+
+    out_ptrs = out_ptr + t_offs[:, None] * D_out + d_offs[None, :]
+    tl.store(out_ptrs, out_vals.to(tl.bfloat16), mask=t_mask[:, None])
+
+
+@triton.jit
+def _fused_rmsnorm_project_bwd_dx_kernel(
+    x_ptr, W_ptr, grad_out_ptr, proj_out_ptr, rms_ptr,
+    grad_x_ptr,
+    T, nC: tl.constexpr, D_out: tl.constexpr,
+    BLOCK_T: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Compute ∂L/∂x_flat in a single pass!
+    dx = c1 * dx_norm - scale * x
+    where dx_norm = grad_proj @ W
+    c1 = 1/rms.
+    dot_term = sum_d(grad_proj_d * proj_out_d) * rms
+    scale = dot_term / (rms^3 * nC) = sum_d(grad_proj_d * proj_out_d) / (rms^2 * nC)
+    """
+    pid = tl.program_id(0)
+    t_start = pid * BLOCK_T
+    t_offs = t_start + tl.arange(0, BLOCK_T)
+    t_mask = t_offs < T
+
+    rms = tl.load(rms_ptr + t_offs, mask=t_mask, other=1.0)
+    
+    d_offs = tl.arange(0, D_out)
+    go_ptrs = grad_out_ptr + t_offs[:, None] * D_out + d_offs[None, :]
+    proj_ptrs = proj_out_ptr + t_offs[:, None] * D_out + d_offs[None, :]
+    
+    go = tl.load(go_ptrs, mask=t_mask[:, None], other=0.0)
+    proj_out = tl.load(proj_ptrs, mask=t_mask[:, None], other=0.0)
+
+    c1 = 1.0 / rms
+    
+    # Compute scale directly from outputs without iterating x again
+    dot_term_fast = tl.sum(go.to(tl.float32) * proj_out.to(tl.float32), axis=1) # (BLOCK_T,)
+    scale = dot_term_fast / (rms * rms * nC)
+
+    # Single pass to compute dx
+    for k_start in tl.range(0, nC, BLOCK_K):
+        k_offs = k_start + tl.arange(0, BLOCK_K)
+        k_mask = k_offs < nC
+        
+        x_ptrs = x_ptr + t_offs[:, None] * nC + k_offs[None, :]
+        x_tile = tl.load(x_ptrs, mask=t_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
+        
+        # Load W_tile: need (D_out, BLOCK_K)
+        w_ptrs = W_ptr + d_offs[:, None] * nC + k_offs[None, :]
+        w_tile = tl.load(w_ptrs, mask=k_mask[None, :], other=0.0)
+        
+        # Tensor Core matmul: (BLOCK_T, D_out) @ (D_out, BLOCK_K)
+        dx_norm_tile = tl.dot(go, w_tile) # (BLOCK_T, BLOCK_K)
+        
+        dx_tile = c1[:, None] * dx_norm_tile - scale[:, None] * x_tile
+        
+        gx_ptrs = grad_x_ptr + t_offs[:, None] * nC + k_offs[None, :]
+        tl.store(gx_ptrs, dx_tile.to(tl.bfloat16), mask=t_mask[:, None] & k_mask[None, :])
+
+class FusedRMSNormProject(torch.autograd.Function):
+    """RMSNorm(x_flat) @ W.T -> proj_out (T, D_out).
+    Expects x_flat (T, nC) and W (D_out, nC).
+    No biases — they are added later in the Python coefficients func.
+    """
+
+    @staticmethod
+    def forward(ctx, x_flat, W):
+        T, nC = x_flat.shape
+        D_out = W.shape[0]
+        out = torch.empty((T, D_out), device=x_flat.device, dtype=x_flat.dtype)
+        rms = torch.empty((T,), device=x_flat.device, dtype=torch.float32)
+        
+        BLOCK_K = min(128, triton.next_power_of_2(nC))
+        BLOCK_T = 128
+        _, nw, ns = _get_hw_config()
+        
+        grid = (triton.cdiv(T, BLOCK_T),)
+        # SM120 limit: 99KB shared memory. BLOCK_T=128, BLOCK_K=128 needs ~32KB per stage for x.
+        # num_stages=2 ensures we stay well under 99KB. SM90 can use 4 stages.
+        _fused_rmsnorm_project_fwd_kernel[grid](
+            x_flat, W,
+            out, rms,
+            T, nC, D_out,
+            BLOCK_T=BLOCK_T, BLOCK_K=BLOCK_K,
+            num_warps=nw, num_stages=ns
+        )
+        ctx.save_for_backward(x_flat, W, out, rms)
+        ctx.BLOCK_T = BLOCK_T
+        ctx.BLOCK_K = BLOCK_K
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x_flat, W, proj_out, rms = ctx.saved_tensors
+        T, nC = x_flat.shape
+        D_out = W.shape[0]
+        BLOCK_T = getattr(ctx, 'BLOCK_T', 128)
+        BLOCK_K = getattr(ctx, 'BLOCK_K', 128)
+        grad_out = grad_output.contiguous()
+        
+        grad_x = torch.empty_like(x_flat)
+        grid = (triton.cdiv(T, BLOCK_T),)
+        _, nw, ns = _get_hw_config()
+        # SMEM constraints based on HW Config
+        _fused_rmsnorm_project_bwd_dx_kernel[grid](
+            x_flat, W, grad_out, proj_out, rms,
+            grad_x,
+            T, nC, D_out,
+            BLOCK_T=BLOCK_T, BLOCK_K=BLOCK_K,
+            num_warps=nw, num_stages=ns
+        )
+        
+        # dW natively with cuBLAS without instantiating x_norm!
+        # dW = grad_out^T @ (x_flat / rms) = (grad_out / rms)^T @ x_flat
+        grad_out_scaled = (grad_out / rms[:, None]).to(x_flat.dtype)
+        grad_W = torch.matmul(grad_out_scaled.transpose(0, 1), x_flat)
+        
+        return grad_x, grad_W
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -52,13 +244,17 @@ def _fused_post_res_fwd_kernel(
         pid_c = tile_id % num_c_tiles
 
         t_offs = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
-        c_offs = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
         t_mask = t_offs < T
-        tc_mask = t_mask[:, None] & (c_offs[None, :] < C)
 
-        # Load layer_output[t, c]: (BLOCK_T, BLOCK_C)
-        lo_idx = t_offs[:, None] * C + c_offs[None, :]
-        lo = tl.load(lo_ptr + lo_idx, mask=tc_mask, other=0.0).to(tl.float32)
+        lo_block_ptr = tl.make_block_ptr(
+            base=lo_ptr,
+            shape=(T, C),
+            strides=(C, 1),
+            offsets=(pid_t * BLOCK_T, pid_c * BLOCK_C),
+            block_shape=(BLOCK_T, BLOCK_C),
+            order=(1, 0)
+        )
+        lo = tl.load(lo_block_ptr, boundary_check=(0, 1)).to(tl.float32)
 
         for i in tl.static_range(n):
             hp_i = tl.load(hp_ptr + t_offs * n + i, mask=t_mask, other=0.0)
@@ -66,12 +262,30 @@ def _fused_post_res_fwd_kernel(
 
             for j in tl.static_range(n):
                 h_ij = tl.load(H_ptr + t_offs * (n * n) + i * n + j, mask=t_mask, other=0.0)
-                x_idx = t_offs[:, None] * (n * C) + j * C + c_offs[None, :]
-                x_j = tl.load(x_ptr + x_idx, mask=tc_mask, other=0.0).to(tl.float32)
+                
+                # x_streams is (T * n, C) in memory layout
+                x_base_offset = j * C
+                x_block_ptr = tl.make_block_ptr(
+                    base=x_ptr + x_base_offset,
+                    shape=(T, C),
+                    strides=(n * C, 1),
+                    offsets=(pid_t * BLOCK_T, pid_c * BLOCK_C),
+                    block_shape=(BLOCK_T, BLOCK_C),
+                    order=(1, 0)
+                )
+                x_j = tl.load(x_block_ptr, boundary_check=(0, 1)).to(tl.float32)
                 acc += h_ij[:, None] * x_j
 
-            out_idx = t_offs[:, None] * (n * C) + i * C + c_offs[None, :]
-            tl.store(out_ptr + out_idx, acc.to(tl.bfloat16), mask=tc_mask)
+            out_base_offset = i * C
+            out_block_ptr = tl.make_block_ptr(
+                base=out_ptr + out_base_offset,
+                shape=(T, C),
+                strides=(n * C, 1),
+                offsets=(pid_t * BLOCK_T, pid_c * BLOCK_C),
+                block_shape=(BLOCK_T, BLOCK_C),
+                order=(1, 0)
+            )
+            tl.store(out_block_ptr, acc.to(tl.bfloat16), boundary_check=(0, 1))
 
 
 # ---------- K4 Backward: Kernel A (grad_x, grad_lo) ----------
@@ -255,14 +469,16 @@ class FusedPostRes(torch.autograd.Function):
     def forward(ctx, x_streams, layer_output, H_merged, h_post):
         T, n, C = x_streams.shape
         out = torch.empty_like(x_streams)
-        NUM_SMS = _get_num_sms()
+        NUM_SMS, nw, ns = _get_hw_config()
         BLOCK_T = 64
         BLOCK_C = min(256, triton.next_power_of_2(C))
         grid = (NUM_SMS,)
+        # SM120 99KB SMEM limit: BLOCK_C=256, BLOCK_T=64 requires 32KB per stage.
         _fused_post_res_fwd_kernel[grid](
             x_streams, layer_output, H_merged, h_post, out,
             T, C, n,
             BLOCK_T=BLOCK_T, BLOCK_C=BLOCK_C, NUM_SMS=NUM_SMS,
+            num_warps=nw, num_stages=ns
         )
         ctx.save_for_backward(x_streams, layer_output, H_merged, h_post)
         return out
@@ -272,7 +488,7 @@ class FusedPostRes(torch.autograd.Function):
         x_streams, layer_output, H_merged, h_post = ctx.saved_tensors
         T, n, C = x_streams.shape
         grad_out = grad_output.contiguous()
-        NUM_SMS = _get_num_sms()
+        NUM_SMS, nw, ns = _get_hw_config()
         BLOCK_T = 64
         BLOCK_C = min(256, triton.next_power_of_2(C))
         grid = (NUM_SMS,)
@@ -280,11 +496,13 @@ class FusedPostRes(torch.autograd.Function):
         # Kernel A: grad_x and grad_lo (tiles over T×C, no atomics)
         grad_x = torch.empty_like(x_streams)
         grad_lo = torch.empty((T, C), device=x_streams.device, dtype=x_streams.dtype)
+        # SM120 99KB SMEM limit
         _fused_post_res_bwd_xlo_kernel[grid](
             H_merged, h_post, grad_out, layer_output,
             grad_x, grad_lo,
             T, C, n,
             BLOCK_T=BLOCK_T, BLOCK_C=BLOCK_C, NUM_SMS=NUM_SMS,
+            num_warps=nw, num_stages=ns
         )
 
         # Kernel B: grad_H and grad_hp (tiles over T, reduces over C, no atomics)
@@ -295,6 +513,7 @@ class FusedPostRes(torch.autograd.Function):
             grad_H, grad_hp,
             T, C, n,
             BLOCK_T=BLOCK_T, BLOCK_C=BLOCK_C, NUM_SMS=NUM_SMS,
+            num_warps=nw, num_stages=ns
         )
 
         return grad_x, grad_lo, grad_H, grad_hp
@@ -328,12 +547,28 @@ def _fused_pre_map_fwd_kernel(
         acc = tl.zeros((BLOCK_T, BLOCK_C), dtype=tl.float32)
         for j in tl.static_range(n):
             hp_j = tl.load(h_pre_ptr + t_offs * n + j, mask=t_mask, other=0.0)
-            x_idx = t_offs[:, None] * (n * C) + j * C + c_offs[None, :]
-            x_j = tl.load(x_ptr + x_idx, mask=tc_mask, other=0.0).to(tl.float32)
+            
+            x_base_offset = j * C
+            x_block_ptr = tl.make_block_ptr(
+                base=x_ptr + x_base_offset,
+                shape=(T, C),
+                strides=(n * C, 1),
+                offsets=(pid_t * BLOCK_T, pid_c * BLOCK_C),
+                block_shape=(BLOCK_T, BLOCK_C),
+                order=(1, 0)
+            )
+            x_j = tl.load(x_block_ptr, boundary_check=(0, 1)).to(tl.float32)
             acc += hp_j[:, None] * x_j
 
-        out_idx = t_offs[:, None] * C + c_offs[None, :]
-        tl.store(out_ptr + out_idx, acc.to(tl.bfloat16), mask=tc_mask)
+        out_block_ptr = tl.make_block_ptr(
+            base=out_ptr,
+            shape=(T, C),
+            strides=(C, 1),
+            offsets=(pid_t * BLOCK_T, pid_c * BLOCK_C),
+            block_shape=(BLOCK_T, BLOCK_C),
+            order=(1, 0)
+        )
+        tl.store(out_block_ptr, acc.to(tl.bfloat16), boundary_check=(0, 1))
 
 
 @triton.jit
@@ -379,14 +614,16 @@ class FusedPreMap(torch.autograd.Function):
     def forward(ctx, x_streams, h_pre):
         T, n, C = x_streams.shape
         out = torch.empty((T, C), device=x_streams.device, dtype=x_streams.dtype)
-        NUM_SMS = _get_num_sms()
+        NUM_SMS, nw, ns = _get_hw_config()
         BLOCK_T = 64
         BLOCK_C = min(256, triton.next_power_of_2(C))
         grid = (NUM_SMS,)
+        # SM120 99KB limit
         _fused_pre_map_fwd_kernel[grid](
             x_streams, h_pre, out,
             T, C, n,
             BLOCK_T=BLOCK_T, BLOCK_C=BLOCK_C, NUM_SMS=NUM_SMS,
+            num_warps=nw, num_stages=ns
         )
         ctx.save_for_backward(x_streams, h_pre)
         return out
@@ -399,7 +636,7 @@ class FusedPreMap(torch.autograd.Function):
         
         grad_x = torch.empty_like(x_streams)
         grad_hp = torch.zeros((T, n), device=x_streams.device, dtype=torch.float32)
-        NUM_SMS = _get_num_sms()
+        NUM_SMS, nw, ns = _get_hw_config()
         BLOCK_T = 64
         BLOCK_C = min(256, triton.next_power_of_2(C))
         grid = (NUM_SMS,)
@@ -409,6 +646,7 @@ class FusedPreMap(torch.autograd.Function):
             grad_x, grad_hp,
             T, C, n,
             BLOCK_T=BLOCK_T, BLOCK_C=BLOCK_C, NUM_SMS=NUM_SMS,
+            num_warps=nw, num_stages=ns
         )
         return grad_x, grad_hp
 

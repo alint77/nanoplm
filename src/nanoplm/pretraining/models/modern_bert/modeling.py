@@ -1084,16 +1084,17 @@ class MHCLiteBlock(nn.Module):
         Uses Triton for the memory-heavy stream operations (K3: pre-map,
         K4: post-res) and PyTorch for the coefficient computation (tiny ops).
         """
-        from .mhc_triton_kernels import FusedPreMap, FusedPostRes
+        from .mhc_triton_kernels import FusedRMSNormProject, FusedPreMap, FusedPostRes
 
         n = self.n
         T = x_streams.shape[0]
         dt = x_streams.dtype
 
-        # Coefficient computation in PyTorch (operates on only 32 values per token)
+        # K1: Fused RMSNorm + projection
+        # This replaces: x_norm = F.rms_norm(x_flat); all_proj = F.linear(x_norm, W_all)
         x_flat = x_streams.reshape(T, self.nC)
-        x_norm = F.rms_norm(x_flat, (self.nC,))
-        all_proj = F.linear(x_norm, self.W_all.weight.to(dt), None)
+        all_proj = FusedRMSNormProject.apply(x_flat, self.W_all.weight.to(dt))
+
         pre_proj, post_proj, res_proj = all_proj.split(
             [n, n, self.n_fact], dim=-1
         )

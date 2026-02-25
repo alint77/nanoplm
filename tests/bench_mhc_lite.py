@@ -102,7 +102,7 @@ def main():
     layer_new.load_state_dict(layer_old.state_dict())
 
     old_block = MHCLiteBlockOld(n, C, layer_old).to(device=device, dtype=dtype)
-    new_block = MHCLiteBlock(n, C, layer_new).to(device=device, dtype=dtype)
+    new_block = MHCLiteBlock(n, C, layer_new, triton_fused=True).to(device=device, dtype=dtype)
 
     # Sync weights: map old W_pre/W_post/W_res -> new W_all
     with torch.no_grad():
