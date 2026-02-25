@@ -145,23 +145,41 @@ def _fused_rmsnorm_project_bwd_dx_kernel(
 
     # Single pass to compute dx
     for k_start in tl.range(0, nC, BLOCK_K):
-        k_offs = k_start + tl.arange(0, BLOCK_K)
-        k_mask = k_offs < nC
-        
-        x_ptrs = x_ptr + t_offs[:, None] * nC + k_offs[None, :]
-        x_tile = tl.load(x_ptrs, mask=t_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
+        x_block_ptr = tl.make_block_ptr(
+            base=x_ptr,
+            shape=(T, nC),
+            strides=(nC, 1),
+            offsets=(t_start, k_start),
+            block_shape=(BLOCK_T, BLOCK_K),
+            order=(1, 0)
+        )
+        x_tile = tl.load(x_block_ptr, boundary_check=(0, 1)).to(tl.float32)
         
         # Load W_tile: need (D_out, BLOCK_K)
-        w_ptrs = W_ptr + d_offs[:, None] * nC + k_offs[None, :]
-        w_tile = tl.load(w_ptrs, mask=k_mask[None, :], other=0.0)
+        w_block_ptr = tl.make_block_ptr(
+            base=W_ptr,
+            shape=(D_out, nC),
+            strides=(nC, 1),
+            offsets=(0, k_start),
+            block_shape=(D_out, BLOCK_K),
+            order=(1, 0)
+        )
+        w_tile = tl.load(w_block_ptr, boundary_check=(0, 1))
         
         # Tensor Core matmul: (BLOCK_T, D_out) @ (D_out, BLOCK_K)
         dx_norm_tile = tl.dot(go, w_tile) # (BLOCK_T, BLOCK_K)
         
         dx_tile = c1[:, None] * dx_norm_tile - scale[:, None] * x_tile
         
-        gx_ptrs = grad_x_ptr + t_offs[:, None] * nC + k_offs[None, :]
-        tl.store(gx_ptrs, dx_tile.to(tl.bfloat16), mask=t_mask[:, None] & k_mask[None, :])
+        gx_block_ptr = tl.make_block_ptr(
+            base=grad_x_ptr,
+            shape=(T, nC),
+            strides=(nC, 1),
+            offsets=(t_start, k_start),
+            block_shape=(BLOCK_T, BLOCK_K),
+            order=(1, 0)
+        )
+        tl.store(gx_block_ptr, dx_tile.to(tl.bfloat16), boundary_check=(0, 1))
 
 class FusedRMSNormProject(torch.autograd.Function):
     """RMSNorm(x_flat) @ W.T -> proj_out (T, D_out).
@@ -322,23 +340,52 @@ def _fused_post_res_bwd_xlo_kernel(
 
         for i in tl.static_range(n):
             hp_i = tl.load(hp_ptr + t_offs * n + i, mask=t_mask, other=0.0)
-            go_idx = t_offs[:, None] * (n * C) + i * C + c_offs[None, :]
-            grad_i = tl.load(grad_out_ptr + go_idx, mask=tc_mask, other=0.0).to(tl.float32)
+            go_block_ptr = tl.make_block_ptr(
+                base=grad_out_ptr + i * C,
+                shape=(T, C),
+                strides=(n * C, 1),
+                offsets=(pid_t * BLOCK_T, pid_c * BLOCK_C),
+                block_shape=(BLOCK_T, BLOCK_C),
+                order=(1, 0)
+            )
+            grad_i = tl.load(go_block_ptr, boundary_check=(0, 1)).to(tl.float32)
             grad_lo_acc += hp_i[:, None] * grad_i
 
-        lo_idx = t_offs[:, None] * C + c_offs[None, :]
-        tl.store(grad_lo_ptr + lo_idx, grad_lo_acc.to(tl.bfloat16), mask=tc_mask)
+        lo_block_ptr = tl.make_block_ptr(
+            base=grad_lo_ptr,
+            shape=(T, C),
+            strides=(C, 1),
+            offsets=(pid_t * BLOCK_T, pid_c * BLOCK_C),
+            block_shape=(BLOCK_T, BLOCK_C),
+            order=(1, 0)
+        )
+        tl.store(lo_block_ptr, grad_lo_acc.to(tl.bfloat16), boundary_check=(0, 1))
 
         # ∂L/∂x[t,j,c] = Σ_i H_merged[t,i,j] * grad_out[t,i,c]
         for j in tl.static_range(n):
             grad_x_j = tl.zeros((BLOCK_T, BLOCK_C), dtype=tl.float32)
             for i in tl.static_range(n):
                 h_ij = tl.load(H_ptr + t_offs * (n * n) + i * n + j, mask=t_mask, other=0.0)
-                go_idx = t_offs[:, None] * (n * C) + i * C + c_offs[None, :]
-                grad_i = tl.load(grad_out_ptr + go_idx, mask=tc_mask, other=0.0).to(tl.float32)
+                go_block_ptr = tl.make_block_ptr(
+                    base=grad_out_ptr + i * C,
+                    shape=(T, C),
+                    strides=(n * C, 1),
+                    offsets=(pid_t * BLOCK_T, pid_c * BLOCK_C),
+                    block_shape=(BLOCK_T, BLOCK_C),
+                    order=(1, 0)
+                )
+                grad_i = tl.load(go_block_ptr, boundary_check=(0, 1)).to(tl.float32)
                 grad_x_j += h_ij[:, None] * grad_i
-            x_out_idx = t_offs[:, None] * (n * C) + j * C + c_offs[None, :]
-            tl.store(grad_x_ptr + x_out_idx, grad_x_j.to(tl.bfloat16), mask=tc_mask)
+                
+            gx_block_ptr = tl.make_block_ptr(
+                base=grad_x_ptr + j * C,
+                shape=(T, C),
+                strides=(n * C, 1),
+                offsets=(pid_t * BLOCK_T, pid_c * BLOCK_C),
+                block_shape=(BLOCK_T, BLOCK_C),
+                order=(1, 0)
+            )
+            tl.store(gx_block_ptr, grad_x_j.to(tl.bfloat16), boundary_check=(0, 1))
 
 
 # ---------- K4 Backward: Kernel B (grad_H, grad_hp) ----------
@@ -395,25 +442,38 @@ def _fused_post_res_bwd_Hhp_kernel(
 
         # Iterate over C in chunks
         for c_start in tl.range(0, C, BLOCK_C):
-            c_offs = c_start + tl.arange(0, BLOCK_C)
-            c_mask = c_offs < C
-            tc_mask = t_mask[:, None] & c_mask[None, :]
-
             # Load lo[t, c]
-            lo_idx = t_offs[:, None] * C + c_offs[None, :]
-            lo = tl.load(lo_ptr + lo_idx, mask=tc_mask, other=0.0).to(tl.float32)
+            lo_block_ptr = tl.make_block_ptr(
+                base=lo_ptr,
+                shape=(T, C),
+                strides=(C, 1),
+                offsets=(tile_id * BLOCK_T, c_start),
+                block_shape=(BLOCK_T, BLOCK_C),
+                order=(1, 0)
+            )
+            lo = tl.load(lo_block_ptr, boundary_check=(0, 1)).to(tl.float32)
 
             # Load x[t, j, c] for all j
-            x0 = tl.load(x_ptr + t_offs[:, None] * (n * C) + 0 * C + c_offs[None, :], mask=tc_mask, other=0.0).to(tl.float32)
-            x1 = tl.load(x_ptr + t_offs[:, None] * (n * C) + 1 * C + c_offs[None, :], mask=tc_mask, other=0.0).to(tl.float32)
-            x2 = tl.load(x_ptr + t_offs[:, None] * (n * C) + 2 * C + c_offs[None, :], mask=tc_mask, other=0.0).to(tl.float32)
-            x3 = tl.load(x_ptr + t_offs[:, None] * (n * C) + 3 * C + c_offs[None, :], mask=tc_mask, other=0.0).to(tl.float32)
+            x0_ptr = tl.make_block_ptr(base=x_ptr + 0 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            x1_ptr = tl.make_block_ptr(base=x_ptr + 1 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            x2_ptr = tl.make_block_ptr(base=x_ptr + 2 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            x3_ptr = tl.make_block_ptr(base=x_ptr + 3 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            
+            x0 = tl.load(x0_ptr, boundary_check=(0, 1)).to(tl.float32)
+            x1 = tl.load(x1_ptr, boundary_check=(0, 1)).to(tl.float32)
+            x2 = tl.load(x2_ptr, boundary_check=(0, 1)).to(tl.float32)
+            x3 = tl.load(x3_ptr, boundary_check=(0, 1)).to(tl.float32)
 
             # Load grad_out[t, i, c] for all i
-            go0 = tl.load(grad_out_ptr + t_offs[:, None] * (n * C) + 0 * C + c_offs[None, :], mask=tc_mask, other=0.0).to(tl.float32)
-            go1 = tl.load(grad_out_ptr + t_offs[:, None] * (n * C) + 1 * C + c_offs[None, :], mask=tc_mask, other=0.0).to(tl.float32)
-            go2 = tl.load(grad_out_ptr + t_offs[:, None] * (n * C) + 2 * C + c_offs[None, :], mask=tc_mask, other=0.0).to(tl.float32)
-            go3 = tl.load(grad_out_ptr + t_offs[:, None] * (n * C) + 3 * C + c_offs[None, :], mask=tc_mask, other=0.0).to(tl.float32)
+            go0_ptr = tl.make_block_ptr(base=grad_out_ptr + 0 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            go1_ptr = tl.make_block_ptr(base=grad_out_ptr + 1 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            go2_ptr = tl.make_block_ptr(base=grad_out_ptr + 2 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            go3_ptr = tl.make_block_ptr(base=grad_out_ptr + 3 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+
+            go0 = tl.load(go0_ptr, boundary_check=(0, 1)).to(tl.float32)
+            go1 = tl.load(go1_ptr, boundary_check=(0, 1)).to(tl.float32)
+            go2 = tl.load(go2_ptr, boundary_check=(0, 1)).to(tl.float32)
+            go3 = tl.load(go3_ptr, boundary_check=(0, 1)).to(tl.float32)
 
             # grad_hp[t,i] += Σ_c grad_out[t,i,c] * lo[t,c]
             ghp_0 += tl.sum(go0 * lo, axis=1)
