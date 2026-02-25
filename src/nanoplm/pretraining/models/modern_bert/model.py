@@ -48,6 +48,9 @@ class ProtModernBertMLMConfig:
     canon_layers_kernel_size: Optional[int] = None
     resid_lambda_init: float = 1.0
     x0_lambda_init: float = 0.1
+    use_repo: bool = False
+    repo_after_n_layers: int = 3
+
 
 class ProtModernBertMLM(ModernBertForMaskedLM):
 

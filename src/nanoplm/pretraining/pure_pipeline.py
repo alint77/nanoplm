@@ -963,6 +963,31 @@ def run_pure_pretraining(
         f"{'disabled (max_grad_norm=inf)' if math.isinf(max_grad_norm) else f'max_grad_norm={max_grad_norm}'}"
     )
 
+    # ---- RePO activation schedule ----
+    # Decoupled from LR warmup: when repo_rope_warmup_steps is not set,
+    # fall back to warmup_steps for backward-compatible behavior.
+    _repo_rope_warmup_cfg = getattr(pretrain_config, "repo_rope_warmup_steps", None)
+    repo_rope_warmup_steps = (
+        warmup_steps
+        if _repo_rope_warmup_cfg is None
+        else max(0, int(_repo_rope_warmup_cfg))
+    )
+    _use_repo = getattr(_cfg, "use_repo", False)
+    if _use_repo:
+        # Access the inner ModernBertModel to toggle repo_active
+        _repo_model = _raw.model if hasattr(_raw, "model") else None
+        if _repo_model is not None and hasattr(_repo_model, "repo_active"):
+            # If resuming past RePO warmup, enable immediately.
+            _repo_model.repo_active = start_step >= repo_rope_warmup_steps
+            logger.info(
+                f"RePO: repo_after_n_layers={_cfg.repo_after_n_layers}, "
+                f"repo_rope_warmup_steps={repo_rope_warmup_steps}, "
+                f"active={'yes' if _repo_model.repo_active else f'no (activates after step {repo_rope_warmup_steps})'}"
+            )
+        else:
+            logger.warning("RePO: use_repo=True but model has no repo_active attribute")
+            _use_repo = False
+
     # ---- Training loop ----
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -1108,6 +1133,13 @@ def run_pure_pretraining(
 
                 global_step += 1
                 profiler_step_cb(global_step)
+
+                # RePO: activate once RePO warmup completes.
+                if _use_repo and global_step == repo_rope_warmup_steps:
+                    _repo_model.repo_active = True
+                    if is_main:
+                        logger.info(f"[step {global_step}] RePO activated (repo warmup complete)")
+
                 window_loss += accum_loss.detach()
                 window_steps += 1
                 accum_loss.zero_()
@@ -1116,6 +1148,7 @@ def run_pure_pretraining(
                 should_log = global_step % logging_steps == 0
                 vram_log = ""
                 tps = mfu = tok = raw_tok = 0.0
+                step_tok = step_raw_tok = 0.0
                 avg_step_ms = 0.0
                 if should_log:
                     # Synchronize and measure only at logging boundaries to amortize sync cost.
@@ -1138,6 +1171,8 @@ def run_pure_pretraining(
                         tok_buf = torch.tensor([tok, raw_tok], device=device)
                         dist.all_reduce(tok_buf, op=dist.ReduceOp.SUM)
                         tok, raw_tok = float(tok_buf[0].item()), float(tok_buf[1].item())
+                    step_tok = tok / max(1, window_steps)
+                    step_raw_tok = raw_tok / max(1, window_steps)
                     mfu = (
                         _flops_per_token * achieved_global_batch_tokens * window_steps / window_dt
                     ) / (_peak_flops * max(effective_world_size, 1))
@@ -1153,7 +1188,7 @@ def run_pure_pretraining(
                             reset_peak=True,
                         )
                 if should_log and is_main:
-                    waste = (1.0 - tok / max(raw_tok, 1)) * 100
+                    waste = (1.0 - step_tok / max(step_raw_tok, 1)) * 100
                     muon_str = f"muon_lr={muon_lr:.2e} " if muon_lr is not None else ""
                     wall_elapsed = time.perf_counter() - _run_t0
                     logger.info(
@@ -1170,8 +1205,8 @@ def run_pure_pretraining(
                         "train/learning_rate": learning_rate,
                         "train/epoch": epoch + (micro_step + 1) / synced_len,
                         "train/tokens_per_sec": tps,
-                        "train/step_real_tokens": int(tok),
-                        "train/step_raw_tokens": int(raw_tok),
+                        "train/step_real_tokens": step_tok,
+                        "train/step_raw_tokens": step_raw_tok,
                         "train/packing_waste_pct": waste,
                         "time_elapsed_sec": wall_elapsed,
                         "train/time_elapsed_sec": wall_elapsed,

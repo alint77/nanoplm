@@ -37,8 +37,11 @@ if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
     except ImportError:
         pass
 
+USE_TRITON_SRELU = False
+
 if torch.cuda.is_available() and (torch.cuda.get_device_capability() == (9, 0) or torch.cuda.get_device_capability() == (12, 0)):
     USE_TRITON_SRELU = True
+
 
 if not _HAS_FLASH_VARLEN:
     try:
@@ -146,6 +149,8 @@ class ModernBertConfig:
     canon_layers_kernel_size: Optional[int] = None
     resid_lambda_init: float = 1.0
     x0_lambda_init: float = 0.1
+    use_repo: bool = False
+    repo_after_n_layers: int = 3
 
     head_dim: int = field(init=False)
     sliding_window: int = field(init=False)
@@ -220,6 +225,75 @@ def _apply_rope(
     k_dtype = k.dtype
     cos = cos.unsqueeze(1)
     sin = sin.unsqueeze(1)
+    qf, kf = q.float(), k.float()
+    q = qf * cos + _rotate_half(qf) * sin
+    k = kf * cos + _rotate_half(kf) * sin
+    return q.to(dtype=q_dtype), k.to(dtype=k_dtype)
+
+
+class RePOModule(nn.Module):
+    """RePO (Re-Positioning): predicts continuous per-head positions from hidden states.
+
+    Replaces fixed integer RoPE positions with learned content-dependent positions.
+    Architecture: SwiGLU position representation + linear per-head position assignment.
+    """
+
+    def __init__(self, hidden_size: int, num_heads: int, head_dim: int, d_p: Optional[int] = None):
+        super().__init__()
+        d_p = d_p or hidden_size // 8
+        self.W_g = nn.Linear(hidden_size, d_p, bias=False)
+        self.W_c = nn.Linear(hidden_size, d_p, bias=False)
+        self.W_z = nn.Linear(d_p, num_heads, bias=False)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """h: (..., hidden_size) -> (..., num_heads) scalar positions per head."""
+        r = F.silu(self.W_g(h)) * self.W_c(h)
+        return self.W_z(r)
+
+
+def _apply_rope_repo(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    positions: torch.Tensor,
+    inv_freq: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply RoPE using learned per-head positions (varlen path).
+
+    q, k:      (T, H, D)
+    positions: (T, H)     – learned scalar position per head
+    inv_freq:  (D//2,)
+    """
+    q_dtype, k_dtype = q.dtype, k.dtype
+    # (T, H, 1) * (1, 1, D//2) -> (T, H, D//2)
+    freqs = positions.unsqueeze(-1).float() * inv_freq.unsqueeze(0).unsqueeze(0)
+    emb = torch.cat((freqs, freqs), dim=-1)  # (T, H, D)
+    cos = emb.cos()
+    sin = emb.sin()
+    qf, kf = q.float(), k.float()
+    q = qf * cos + _rotate_half(qf) * sin
+    k = kf * cos + _rotate_half(kf) * sin
+    return q.to(dtype=q_dtype), k.to(dtype=k_dtype)
+
+
+def _apply_rope_repo_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    positions: torch.Tensor,
+    inv_freq: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply RoPE using learned per-head positions (SDPA/padded path).
+
+    q, k:      (B, H, S, D)
+    positions: (B, S, H)    – learned scalar position per head
+    inv_freq:  (D//2,)
+    """
+    q_dtype, k_dtype = q.dtype, k.dtype
+    # (B, S, H) -> (B, H, S, 1)
+    pos = positions.permute(0, 2, 1).unsqueeze(-1).float()
+    freqs = pos * inv_freq.view(1, 1, 1, -1)  # (B, H, S, D//2)
+    emb = torch.cat((freqs, freqs), dim=-1)  # (B, H, S, D)
+    cos = emb.cos()
+    sin = emb.sin()
     qf, kf = q.float(), k.float()
     q = qf * cos + _rotate_half(qf) * sin
     k = kf * cos + _rotate_half(kf) * sin
@@ -686,7 +760,7 @@ class ModernBertSwiGLUMLP(nn.Module):
 
 
 class ModernBertAttention(nn.Module):
-    def __init__(self, config: ModernBertConfig):
+    def __init__(self, config: ModernBertConfig, layer_idx: int = 0):
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
@@ -715,6 +789,24 @@ class ModernBertAttention(nn.Module):
             else None
         )
 
+        # RePO: learned per-head positions replacing fixed RoPE indices
+        self.repo = None
+        if config.use_repo and layer_idx >= config.repo_after_n_layers:
+            self.repo = RePOModule(
+                config.hidden_size, config.num_attention_heads, config.head_dim,
+            )
+            theta = (
+                config.global_rope_theta
+                if config.layer_types[layer_idx] == "full_attention"
+                else config.local_rope_theta
+            )
+            channel = torch.arange(0, config.head_dim, 2, dtype=torch.float32)
+            self.register_buffer(
+                "repo_inv_freq",
+                1.0 / (theta ** (channel / config.head_dim)),
+                persistent=False,
+            )
+
     # -- varlen (flash-attention) path -----------------------------------------
 
     def _forward_varlen(
@@ -725,6 +817,7 @@ class ModernBertAttention(nn.Module):
         max_seqlen: int | torch.Tensor,
         window_size: tuple[int, int],
         position_ids: Optional[torch.Tensor] = None,
+        repo_active: bool = False,
     ) -> torch.Tensor:
         total = x.shape[0]  # (total_tokens, hidden)
         qkv = self.Wqkv(x)
@@ -733,8 +826,12 @@ class ModernBertAttention(nn.Module):
         qkv = qkv.view(total, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=1)  # each: (total, H, D)
 
-        cos, sin = cos_sin
-        q, k = _apply_rope(q, k, cos, sin)
+        if self.repo is not None and repo_active:
+            positions = self.repo(x)  # (T, num_heads)
+            q, k = _apply_rope_repo(q, k, positions, self.repo_inv_freq)
+        else:
+            cos, sin = cos_sin
+            q, k = _apply_rope(q, k, cos, sin)
         if self.use_qk_norm:
             q = F.rms_norm(q, (self.head_dim,))
             k = F.rms_norm(k, (self.head_dim,))
@@ -773,6 +870,7 @@ class ModernBertAttention(nn.Module):
         window_size: Optional[tuple[int, int]] = None,
         position_ids: Optional[torch.Tensor] = None,
         token_mask: Optional[torch.Tensor] = None,
+        repo_active: bool = False,
     ) -> torch.Tensor:
         if cu_seqlens is not None:
             return self._forward_varlen(
@@ -782,6 +880,7 @@ class ModernBertAttention(nn.Module):
                 max_seqlen,
                 window_size,
                 position_ids=position_ids,
+                repo_active=repo_active,
             )
 
         bsz, seq_len, _ = x.shape
@@ -794,8 +893,12 @@ class ModernBertAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        cos, sin = cos_sin
-        q, k = _apply_rope(q, k, cos, sin)
+        if self.repo is not None and repo_active:
+            positions = self.repo(x)  # (B, S, num_heads)
+            q, k = _apply_rope_repo_sdpa(q, k, positions, self.repo_inv_freq)
+        else:
+            cos, sin = cos_sin
+            q, k = _apply_rope(q, k, cos, sin)
         if self.use_qk_norm:
             q = F.rms_norm(q, (self.head_dim,))
             k = F.rms_norm(k, (self.head_dim,))
@@ -826,7 +929,7 @@ class ModernBertEncoderLayer(nn.Module):
             if "a" in config.canon_layer_set
             else None
         )
-        self.attn = ModernBertAttention(config)
+        self.attn = ModernBertAttention(config, layer_idx=layer_idx)
         self.mlp_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
         self.canon_c = (
             _make_canon_layer(config.hidden_size, config)
@@ -850,6 +953,7 @@ class ModernBertEncoderLayer(nn.Module):
         window_size: Optional[tuple[int, int]] = None,
         position_ids: Optional[torch.Tensor] = None,
         token_mask: Optional[torch.Tensor] = None,
+        repo_active: bool = False,
     ) -> torch.Tensor:
         attn_in = self.attn_norm(x)
         if self.canon_a is not None:
@@ -868,6 +972,7 @@ class ModernBertEncoderLayer(nn.Module):
             window_size=window_size,
             position_ids=position_ids,
             token_mask=token_mask,
+            repo_active=repo_active,
         )
         mlp_in = self.mlp_norm(x)
         if self.canon_c is not None:
@@ -904,6 +1009,9 @@ class ModernBertModel(nn.Module):
             self.register_parameter("x0_lambdas", None)
         self.final_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
         self.rotary_emb = ModernBertRotaryEmbedding(config)
+        # RePO: disabled at init; enabled by the training loop after
+        # repo_rope_warmup_steps (or warmup_steps fallback).
+        self.repo_active = False
 
     def forward(
         self,
@@ -950,6 +1058,8 @@ class ModernBertModel(nn.Module):
                 ),
             }
 
+            repo_active = self.repo_active
+
             for i, layer in enumerate(self.layers):
                 if self.resid_lambdas is not None:
                     x = self.resid_lambdas[i] * x
@@ -963,6 +1073,7 @@ class ModernBertModel(nn.Module):
                     max_seqlen=_max_seqlen,
                     window_size=windows[lt],
                     position_ids=_position_ids,
+                    repo_active=repo_active,
                 )
 
             return self.final_norm(x)
@@ -1003,6 +1114,8 @@ class ModernBertModel(nn.Module):
             ),
         }
 
+        repo_active = self.repo_active
+
         for i, layer in enumerate(self.layers):
             if self.resid_lambdas is not None:
                 x = self.resid_lambdas[i] * x
@@ -1015,6 +1128,7 @@ class ModernBertModel(nn.Module):
                 cos_sin=rope[layer_type],
                 position_ids=None,
                 token_mask=attention_mask,
+                repo_active=repo_active,
             )
 
         return self.final_norm(x)
@@ -1094,6 +1208,11 @@ class ModernBertForMaskedLM(nn.Module):
                     nn.init.zeros_(layer.mlp.Wo.bias)
             elif layer.mlp.Wo_bias is not None:
                 nn.init.zeros_(layer.mlp.Wo_bias)
+
+            # RePO: zero-init W_z so positions start at zero (NoPE-like).
+            # W_g and W_c keep default Kaiming uniform init.
+            if layer.attn.repo is not None:
+                nn.init.zeros_(layer.attn.repo.W_z.weight)
 
         nn.init.uniform_(self.head.dense.weight, -bound, bound)
         if self.head.dense.bias is not None:

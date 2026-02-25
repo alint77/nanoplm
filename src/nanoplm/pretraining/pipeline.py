@@ -211,6 +211,9 @@ class PretrainingConfig:
     micro_batch_size: int = 64
     num_epochs: int = 10
     warmup_steps: int = 302
+    # RePO activation warmup (optimizer-step based) for pure-torch path.
+    # If None, defaults to warmup_steps (backward-compatible behavior).
+    repo_rope_warmup_steps: Optional[int] = None
     lr_decay_to_fraction: float = 0.1
     lr_schedule: str = "cosine"
     optimizer: str = "normuon"

@@ -721,6 +721,7 @@ def run_te_pretraining(
                 should_log = global_step % logging_steps == 0
                 vram_log = ""
                 tokens_per_sec = mfu = tok = raw_tok = 0.0
+                step_tok = step_raw_tok = 0.0
                 avg_step_ms = 0.0
                 if should_log:
                     # Synchronize and measure only at logging boundaries to amortize sync cost.
@@ -742,6 +743,8 @@ def run_te_pretraining(
                         tok_buf = torch.tensor([tok, raw_tok], device=device)
                         dist.all_reduce(tok_buf, op=dist.ReduceOp.SUM)
                         tok, raw_tok = float(tok_buf[0].item()), float(tok_buf[1].item())
+                    step_tok = tok / max(1, window_steps)
+                    step_raw_tok = raw_tok / max(1, window_steps)
                     mfu = (
                         _flops_per_token * achieved_global_batch_tokens * window_steps / window_dt
                     ) / (_peak_flops_per_gpu * max(effective_world_size, 1))
@@ -757,7 +760,7 @@ def run_te_pretraining(
                             reset_peak=True,
                         )
                 if should_log and is_main:
-                    waste_pct = (1.0 - tok / max(raw_tok, 1)) * 100
+                    waste_pct = (1.0 - step_tok / max(step_raw_tok, 1)) * 100
                     wall_elapsed = time.perf_counter() - _run_t0
                     payload = {
                         "train/global_step": global_step,
@@ -766,8 +769,8 @@ def run_te_pretraining(
                         "train/learning_rate": learning_rate,
                         "train/epoch": epoch + (micro_step + 1) / synced_train_loader_len,
                         "train/tokens_per_sec": tokens_per_sec,
-                        "train/step_real_tokens": int(tok),
-                        "train/step_raw_tokens": int(raw_tok),
+                        "train/step_real_tokens": step_tok,
+                        "train/step_raw_tokens": step_raw_tok,
                         "train/packing_waste_pct": waste_pct,
                         "time_elapsed_sec": wall_elapsed,
                         "train/time_elapsed_sec": wall_elapsed,

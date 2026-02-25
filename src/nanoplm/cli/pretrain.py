@@ -149,7 +149,14 @@ def pretrain():
     "--warmup-steps",
     type=int,
     default=302,
-    help="Number of warmup steps"
+    help="Number of optimizer steps for LR warmup",
+)
+@click.option(
+    "--repo-rope-warmup-steps",
+    type=int,
+    default=None,
+    help="Number of optimizer steps before enabling RePO RoPE offsets (pure-torch only). "
+         "If unset, defaults to --warmup-steps.",
 )
 @click.option(
     "--lr-decay-to-fraction",
@@ -443,6 +450,17 @@ def pretrain():
          "Allowed values: causal -> {2,3,4}, symmetric -> {3,5,7}.",
 )
 @click.option(
+    "--use-repo/--no-use-repo",
+    default=False,
+    help="Enable RePO: learned per-head positions replacing fixed RoPE indices (pure-torch only)",
+)
+@click.option(
+    "--repo-after-n-layers",
+    type=int,
+    default=3,
+    help="First N layers keep standard RoPE; layers after use RePO (only when --use-repo)",
+)
+@click.option(
     "--pure-torch",
     is_flag=True,
     default=False,
@@ -465,6 +483,7 @@ def run(
     weight_decay: float,
     gradient_clipping: bool,
     warmup_steps: int,
+    repo_rope_warmup_steps: Optional[int],
     lr_decay_to_fraction: float,
     lr_schedule: str,
     global_batch_size: int,
@@ -516,6 +535,8 @@ def run(
     canon_layers_mode: str,
     canon_layer_type: str,
     canon_layers_kernel_size: Optional[int],
+    use_repo: bool,
+    repo_after_n_layers: int,
     pure_torch: bool,
     pure_te: bool,
 ):
@@ -531,6 +552,7 @@ def run(
         weight_decay=weight_decay,
         max_grad_norm=1.0 if gradient_clipping else float("inf"),
         warmup_steps=warmup_steps,
+        repo_rope_warmup_steps=repo_rope_warmup_steps,
         lr_decay_to_fraction=lr_decay_to_fraction,
         lr_schedule=lr_schedule,
         global_batch_size=global_batch_size,
@@ -599,6 +621,8 @@ def run(
         canon_layers_mode=canon_layers_mode,
         canon_layer_type=canon_layer_type,
         canon_layers_kernel_size=canon_layers_kernel_size,
+        use_repo=use_repo,
+        repo_after_n_layers=repo_after_n_layers,
     )
 
     _set_seed_for_init(seed)
@@ -801,6 +825,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  canon_layers_mode: \"ac\"  # subset of Canon sites: A/B/C/D (e.g. \"ac\" for lighter mode)\n"
         "  canon_layer_type: \"causal\"  # 'causal' (fused CUDA kernel, fast) or 'symmetric' (nn.Conv1d, bidirectional)\n"
         "  canon_layers_kernel_size: 4  # causal: 2/3/4, symmetric: 3/5/7 (defaults: causal=4, symmetric=5)\n"
+        "  use_repo: false  # RePO: learned per-head positions replacing fixed RoPE (pure_torch only)\n"
+        "  repo_after_n_layers: 3  # first N layers keep standard RoPE, layers after use RePO\n"
         "\n"
         "pretraining:\n"
         "  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)\n"
@@ -826,7 +852,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  adam_epsilon: 1e-8\n"
         "  learning_rate: 1e-4  # AdamW LR (Muon uses muon_learning_rate)\n"
         "  max_grad_norm: .inf  # set to .inf (equivalent to float(\"inf\")) to disable clipping\n"
-        "  warmup_steps: 302\n"
+        "  warmup_steps: 302  # LR warmup steps\n"
+        "  repo_rope_warmup_steps: 302  # RePO activation delay (pure_torch only); separate from LR warmup\n"
         "  lr_decay_to_fraction: 0.1\n"
         "  lr_schedule: \"cosine\" # Linear or Cosine \n" 
         "  weight_decay: 0.0\n"
@@ -974,12 +1001,15 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         if field in kwargs and kwargs[field] is not None:
             kwargs[field] = _parse_float_like(kwargs[field], field)
 
-    # Ensure warmup_steps is int (YAML may load as int or float).
-    if "warmup_steps" in kwargs and kwargs["warmup_steps"] is not None:
-        try:
-            kwargs["warmup_steps"] = int(kwargs["warmup_steps"])
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"Invalid warmup_steps value: {kwargs['warmup_steps']}. Must be an integer.") from exc
+    # Ensure warmup-related fields are ints (YAML may load as int or float).
+    for warmup_key in ("warmup_steps", "repo_rope_warmup_steps"):
+        if warmup_key in kwargs and kwargs[warmup_key] is not None:
+            try:
+                kwargs[warmup_key] = int(kwargs[warmup_key])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid {warmup_key} value: {kwargs[warmup_key]}. Must be an integer."
+                ) from exc
 
     # Handle boolean values
     for bool_key in [

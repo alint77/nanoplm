@@ -66,6 +66,8 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             canon_layers_kernel_size=config.canon_layers_kernel_size,
             resid_lambda_init=config.resid_lambda_init,
             x0_lambda_init=config.x0_lambda_init,
+            use_repo=config.use_repo,
+            repo_after_n_layers=config.repo_after_n_layers,
         )
 
         super().__init__(mb_config)
@@ -111,6 +113,8 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             canon_layers_kernel_size=config.canon_layers_kernel_size,
             resid_lambda_init=config.resid_lambda_init,
             x0_lambda_init=config.x0_lambda_init,
+            use_repo=config.use_repo,
+            repo_after_n_layers=config.repo_after_n_layers,
         )
 
         super().__init__(mb_config)
