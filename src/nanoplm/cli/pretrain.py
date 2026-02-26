@@ -819,13 +819,8 @@ def get_yaml(output: Optional[str], force: bool):
     # Ensure target directory exists
     create_dirs(output_path)
 
-    # Prevent accidental overwrite unless forced
-    if output_path.exists() and not force:
-        raise click.ClickException(
-            f"File already exists: {output_path}. Use --force to overwrite."
-        )
-
-        template = (
+    # Define the YAML template
+    template = (
         "# Pretraining configuration for nanoPLM\n"
         "#\n"
         "# IMPORTANT: Before running pretraining, ensure you have prepared your data with:\n"
@@ -846,46 +841,33 @@ def get_yaml(output: Optional[str], force: bool):
         "  attention_dropout: 0.0\n"
         "  classifier_activation: \"gelu\"\n"
         "  # The options below only work on pure-torch and TE pipelines\n"
-        "  use_resid_lambdas: true  # scales residual stream per layer (not compatible with use_mhc_lite)\n"
-        "  use_x0_lambdas: true  # blends initial embedding x0 per layer\n"
-        "  use_qk_norm: false  # applies RMS norm to Q/K in attention\n"
-        "  use_canon_layers: true  # enables Canon-ABCD local mixing layers (pure_torch only)\n"
-        "  canon_layers_mode: \"ac\"  # subset of Canon sites: A/B/C/D (e.g. \"ac\" for lighter mode)\n"
-        "  canon_layer_type: \"causal\"  # 'causal' (fused CUDA kernel, fast) or 'symmetric' (nn.Conv1d, bidirectional)\n"
-        "  canon_layers_kernel_size: 4  # causal: 2/3/4, symmetric: 3/5/7 (defaults: causal=4, symmetric=5)\n"
-        "  use_repo: false  # RePO: learned per-head positions replacing fixed RoPE (pure_torch only)\n"
-        "  repo_after_n_layers: 3  # first N layers keep standard RoPE, layers after use RePO\n"
+        "  use_resid_lambdas: true\n"
+        "  use_x0_lambdas: true\n"
+        "  use_qk_norm: false\n"
+        "  use_canon_layers: true\n"
+        "  canon_layers_mode: \"ac\"\n"
+        "  canon_layer_type: \"causal\"\n"
+        "  canon_layers_kernel_size: 4\n"
+        "  use_repo: false\n"
+        "  repo_after_n_layers: 3\n"
         "\n"
         "pretraining:\n"
-        "  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)\n"
-        "  # Note: paths are RELATIVE to where you RUN the command, NOT the YAML file.\n"
         "  dataset_dir: \"output/data/pretrain_data\"\n"
-        "\n"
-        "  # Output model path\n"
         "  ckp_dir: \"output/pretraining_checkpoints\"\n"
-        "\n"
-        "  # Hyperparameters\n"
-        "  #   micro_batch_size: samples per GPU per forward pass (limited by GPU memory)\n"
-        "  #   global_batch_size: total tokens per optimizer step across all GPUs\n"
-        "  #   gradient_accumulation_steps is inferred automatically:\n"
-        "  #     grad_accum = ceil(global_batch_size / (micro_batch_size * max_seq_len * num_gpus))\n"
         "  micro_batch_size: 64\n"
-        "  global_batch_size: 256000  # 2^20 ≈ 1M tokens/step (based on PLM best practices)\n"
+        "  global_batch_size: 256000\n"
         "  num_epochs: 10\n"
-        "\n"
-        "  optimizer: \"normuon\"  # adamw, stable_adamw, muon, normuon\n"
-        "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon or normuon)\n"
+        "  optimizer: \"normuon\"\n"
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
-        "  learning_rate: 1e-4  # AdamW LR (Muon uses muon_learning_rate)\n"
-        "  max_grad_norm: .inf  # set to .inf (equivalent to float(\"inf\")) to disable clipping\n"
-        "  warmup_steps: 302  # LR warmup steps\n"
-        "  repo_rope_warmup_steps: 302  # RePO activation delay (pure_torch only); separate from LR warmup\n"
+        "  learning_rate: 1e-4\n"
+        "  max_grad_norm: .inf\n"
+        "  warmup_steps: 302\n"
+        "  repo_rope_warmup_steps: 302\n"
         "  lr_decay_to_fraction: 0.1\n"
-        "  lr_schedule: \"cosine\" # Linear or Cosine \n" 
+        "  lr_schedule: \"cosine\"\n"
         "  weight_decay: 0.0\n"
-        "  # Muon/NorMuon hyperparameters (used only when optimizer: muon or normuon)\n"
         "  muon_learning_rate: 1e-3\n"
         "  muon_weight_decay: 0.01\n"
         "  muon_cautious_weight_decay: true\n"
@@ -903,47 +885,31 @@ def get_yaml(output: Optional[str], force: bool):
         "  seed: 42\n"
         "  num_workers: \"auto\"\n"
         "  prefetch_factor: 2\n"
-        "  # Sequence packing: concatenates shorter sequences into fewer rows to eliminate\n"
-        "  # padding waste and increase GPU utilization. Requires flash attention and --pure-torch/--pure-te\n"
         "  use_packing: true\n"
-        "  # Experimental throughput optimization: with packing, enables static input sizes which enables the use of torch.compile(dynamic=False) and cudagraphs\n"
-        "  use_static_inp_size: true \n"
-        "\n"
-        "  # Mixed precision training (recommended: keep enabled for 1.5-3x speedup)\n"
-        "  # When bf16 is true, automatically selects the best precision for your hardware:\n"
-        "  #   - CUDA Ampere+ (A100, RTX 3090+): bf16 + TF32\n"
-        "  #   - CUDA Volta/Turing (V100, RTX 2080): fp16 fallback\n"
-        "  #   - Apple Silicon (M1/M2/M3): fp16 (hardware accelerated)\n"
-        "  #   - CPU: fp32 (no mixed precision)\n"
+        "  use_static_inp_size: true\n"
         "  bf16: true\n"
-        "  tf32: true  # TF32 mode on Ampere+ CUDA GPUs only (automatically not used on MPS/CPU)\n"
-        "             # Provides 3x faster fp32 matmuls with negligible precision loss\n"
-        "  fp8: false  # Enable FP8 Linear matmuls in pure_torch/pure_te paths (CUDA, best on H100+)\n"
-        "\n"
+        "  tf32: true\n"
+        "  fp8: false\n"
         "  multi_gpu: true\n"
-        "  world_size: 'auto'  # Use \"auto\" if you want to use all available GPUs\n"
+        "  world_size: 'auto'\n"
         "  project_name: \"nanoplm-pretraining\"\n"
         "\n"
         "resume:\n"
-        "  # Set is_resume: true to resume training from a checkpoint\n"
-        "  # When resuming, the model, tokenizer, and training state will be loaded from checkpoint_dir\n"
-        "  # extra_epochs: adds to 'pretraining.num_epochs' to define total epochs.\n"
         "  is_resume: false\n"
         "  checkpoint_dir: \"output/pretraining_checkpoints/run-1/checkpoint-1\"\n"
         "  extra_epochs: 0\n"
         "\n"
-        "# Set pure_torch: true to use the custom pure-torch model and training loop\n"
-        "# instead of HF Trainer. CLI equivalent: --pure-torch\n"
         "# pure_torch: false\n"
-        "# Set pure_te: true to use Transformer Engine model and training loop.\n"
-        "# CLI equivalent: --pure-te (mutually exclusive with pure_torch)\n"
         "# pure_te: false\n"
     )
 
-    # If forcing, remove existing file first
-    if output_path.exists() and force:
-        output_path.unlink()
+    # Prevent accidental overwrite unless forced
+    if output_path.exists() and not force:
+        raise click.ClickException(
+            f"File already exists: {output_path}. Use --force to overwrite."
+        )
 
+    # Write the template to the file
     output_path.write_text(template, encoding="utf-8")
     click.echo(f"Template written to: {output_path}")
 
