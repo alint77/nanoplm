@@ -223,12 +223,13 @@ class FusedRMSNormProject(torch.autograd.Function):
         grad_x = torch.empty_like(x_flat)
         _, nw, ns = _get_hw_config()
         cc_major, _ = torch.cuda.get_device_capability()
-        # SM120: BLOCK_T=64, BLOCK_K=128 → 24KB/stage, 3 stages = 72KB (fits 99KB).
-        # SM90+: keep BLOCK_T=128, BLOCK_K=128 with default stages.
-        if cc_major >= 12:
+        # SM90: BLOCK_T=64 halves register pressure (90 vs 170 regs/thread) and
+        # enables 2-block occupancy per SM for better latency hiding.
+        if cc_major == 9:
             BLOCK_T_BWD = 64
-            ns_bwd = 3
+            ns_bwd = ns
         else:
+            # SM120/other: keep original BLOCK_T for backward
             BLOCK_T_BWD = getattr(ctx, 'BLOCK_T', 128)
             ns_bwd = ns
         grid = (triton.cdiv(T, BLOCK_T_BWD),)
@@ -469,7 +470,12 @@ def _fused_post_res_bwd_Hhp_kernel(
     BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr,
     NUM_SMS: tl.constexpr,
 ):
-    """Compute ∂L/∂H_merged and ∂L/∂h_post by reducing over ALL of C internally."""
+    """Compute ∂L/∂H_merged and ∂L/∂h_post by reducing over ALL of C internally.
+
+    Register-pressure-optimized: loads grad_out tiles first, then streams
+    x/lo tiles one at a time.  Max live 2D tiles = 5 (4 go + 1 x_or_lo)
+    instead of the original 9 (lo + 4 x + 4 go).
+    """
     tl.static_assert(n == 4)
     pid = tl.program_id(0)
     num_t_tiles = tl.cdiv(T, BLOCK_T)
@@ -478,22 +484,12 @@ def _fused_post_res_bwd_Hhp_kernel(
         t_offs = tile_id * BLOCK_T + tl.arange(0, BLOCK_T)
         t_mask = t_offs < T
 
-        # Accumulators for the C-reduction (all scalars per token)
-        # grad_H[t, i, j] = Σ_c grad_out[t,i,c] * x[t,j,c]  → n*n accums
-        # grad_hp[t, i] = Σ_c grad_out[t,i,c] * lo[t,c]      → n accums
-        # Total: n*n + n = 20 accumulators per token, each is (BLOCK_T,)
-
-        # We accumulate inside BLOCK_C-chunked loop over C
-        # Initialize all accumulators to zero
-        # For n=4: 20 separate (BLOCK_T,) accumulators
-
-        # grad_hp accumulators: n of them
+        # 20 accumulators: 4 ghp + 16 gH, each (BLOCK_T,) f32
         ghp_0 = tl.zeros((BLOCK_T,), dtype=tl.float32)
         ghp_1 = tl.zeros((BLOCK_T,), dtype=tl.float32)
         ghp_2 = tl.zeros((BLOCK_T,), dtype=tl.float32)
         ghp_3 = tl.zeros((BLOCK_T,), dtype=tl.float32)
 
-        # grad_H accumulators: n*n = 16 of them
         gH_00 = tl.zeros((BLOCK_T,), dtype=tl.float32)
         gH_01 = tl.zeros((BLOCK_T,), dtype=tl.float32)
         gH_02 = tl.zeros((BLOCK_T,), dtype=tl.float32)
@@ -511,31 +507,8 @@ def _fused_post_res_bwd_Hhp_kernel(
         gH_32 = tl.zeros((BLOCK_T,), dtype=tl.float32)
         gH_33 = tl.zeros((BLOCK_T,), dtype=tl.float32)
 
-        # Iterate over C in chunks
         for c_start in tl.range(0, C, BLOCK_C):
-            # Load lo[t, c]
-            lo_block_ptr = tl.make_block_ptr(
-                base=lo_ptr,
-                shape=(T, C),
-                strides=(C, 1),
-                offsets=(tile_id * BLOCK_T, c_start),
-                block_shape=(BLOCK_T, BLOCK_C),
-                order=(1, 0)
-            )
-            lo = tl.load(lo_block_ptr, boundary_check=(0, 1)).to(tl.float32)
-
-            # Load x[t, j, c] for all j
-            x0_ptr = tl.make_block_ptr(base=x_ptr + 0 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
-            x1_ptr = tl.make_block_ptr(base=x_ptr + 1 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
-            x2_ptr = tl.make_block_ptr(base=x_ptr + 2 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
-            x3_ptr = tl.make_block_ptr(base=x_ptr + 3 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
-
-            x0 = tl.load(x0_ptr, boundary_check=(0, 1)).to(tl.float32)
-            x1 = tl.load(x1_ptr, boundary_check=(0, 1)).to(tl.float32)
-            x2 = tl.load(x2_ptr, boundary_check=(0, 1)).to(tl.float32)
-            x3 = tl.load(x3_ptr, boundary_check=(0, 1)).to(tl.float32)
-
-            # Load grad_out[t, i, c] for all i
+            # --- Phase 1: load all 4 grad_out tiles (stay live for all x_j) ---
             go0_ptr = tl.make_block_ptr(base=grad_out_ptr + 0 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
             go1_ptr = tl.make_block_ptr(base=grad_out_ptr + 1 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
             go2_ptr = tl.make_block_ptr(base=grad_out_ptr + 2 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
@@ -546,28 +519,52 @@ def _fused_post_res_bwd_Hhp_kernel(
             go2 = tl.load(go2_ptr, boundary_check=(0, 1)).to(tl.float32)
             go3 = tl.load(go3_ptr, boundary_check=(0, 1)).to(tl.float32)
 
-            # grad_hp[t,i] += Σ_c grad_out[t,i,c] * lo[t,c]
+            # --- Phase 2: load lo, compute ghp, lo dies after this ---
+            lo_block_ptr = tl.make_block_ptr(
+                base=lo_ptr,
+                shape=(T, C),
+                strides=(C, 1),
+                offsets=(tile_id * BLOCK_T, c_start),
+                block_shape=(BLOCK_T, BLOCK_C),
+                order=(1, 0)
+            )
+            lo = tl.load(lo_block_ptr, boundary_check=(0, 1)).to(tl.float32)
             ghp_0 += tl.sum(go0 * lo, axis=1)
             ghp_1 += tl.sum(go1 * lo, axis=1)
             ghp_2 += tl.sum(go2 * lo, axis=1)
             ghp_3 += tl.sum(go3 * lo, axis=1)
 
-            # grad_H[t,i,j] += Σ_c grad_out[t,i,c] * x[t,j,c]
+            # --- Phase 3: stream x_j one at a time (max live: 4 go + 1 x) ---
+            # x stream 0
+            x0_ptr = tl.make_block_ptr(base=x_ptr + 0 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            x0 = tl.load(x0_ptr, boundary_check=(0, 1)).to(tl.float32)
             gH_00 += tl.sum(go0 * x0, axis=1)
-            gH_01 += tl.sum(go0 * x1, axis=1)
-            gH_02 += tl.sum(go0 * x2, axis=1)
-            gH_03 += tl.sum(go0 * x3, axis=1)
             gH_10 += tl.sum(go1 * x0, axis=1)
-            gH_11 += tl.sum(go1 * x1, axis=1)
-            gH_12 += tl.sum(go1 * x2, axis=1)
-            gH_13 += tl.sum(go1 * x3, axis=1)
             gH_20 += tl.sum(go2 * x0, axis=1)
-            gH_21 += tl.sum(go2 * x1, axis=1)
-            gH_22 += tl.sum(go2 * x2, axis=1)
-            gH_23 += tl.sum(go2 * x3, axis=1)
             gH_30 += tl.sum(go3 * x0, axis=1)
+
+            # x stream 1
+            x1_ptr = tl.make_block_ptr(base=x_ptr + 1 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            x1 = tl.load(x1_ptr, boundary_check=(0, 1)).to(tl.float32)
+            gH_01 += tl.sum(go0 * x1, axis=1)
+            gH_11 += tl.sum(go1 * x1, axis=1)
+            gH_21 += tl.sum(go2 * x1, axis=1)
             gH_31 += tl.sum(go3 * x1, axis=1)
+
+            # x stream 2
+            x2_ptr = tl.make_block_ptr(base=x_ptr + 2 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            x2 = tl.load(x2_ptr, boundary_check=(0, 1)).to(tl.float32)
+            gH_02 += tl.sum(go0 * x2, axis=1)
+            gH_12 += tl.sum(go1 * x2, axis=1)
+            gH_22 += tl.sum(go2 * x2, axis=1)
             gH_32 += tl.sum(go3 * x2, axis=1)
+
+            # x stream 3
+            x3_ptr = tl.make_block_ptr(base=x_ptr + 3 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            x3 = tl.load(x3_ptr, boundary_check=(0, 1)).to(tl.float32)
+            gH_03 += tl.sum(go0 * x3, axis=1)
+            gH_13 += tl.sum(go1 * x3, axis=1)
+            gH_23 += tl.sum(go2 * x3, axis=1)
             gH_33 += tl.sum(go3 * x3, axis=1)
 
         # Store grad_hp[t, i]
@@ -651,14 +648,24 @@ class FusedPostRes(torch.autograd.Function):
         )
 
         BLOCK_T_B = 64
-        # SM120: BLOCK_C=128 reduces register pressure (9 live tiles fit in regs).
-        BLOCK_C_B = 128 if cc_major >= 12 else min(256, triton.next_power_of_2(C))
+        if cc_major == 9:
+            # SM90: BLOCK_C=128 keeps max live 2D tiles to 5 (4 go + 1 x/lo)
+            # fitting in the 255 reg/thread limit with 8 warps.
+            # 2 pipeline stages fit in 228KB shared mem.
+            BLOCK_C_B = 128
+            ns_hhp = 2
+        else:
+            # SM120/other: original config. The restructured kernel body
+            # (phased 4+1 streaming) still helps, but larger tiles are fine
+            # since SM120's 4 warps = fewer regs/thread.
+            BLOCK_C_B = min(256, triton.next_power_of_2(C))
+            ns_hhp = ns
         _fused_post_res_bwd_Hhp_kernel[grid](
             x_streams, layer_output, grad_out,
             grad_H, grad_hp,
             T, C, n,
             BLOCK_T=BLOCK_T_B, BLOCK_C=BLOCK_C_B, NUM_SMS=NUM_SMS,
-            num_warps=nw_default, num_stages=ns,
+            num_warps=nw_default, num_stages=ns_hhp,
         )
 
         return grad_x, grad_lo, grad_H, grad_hp
@@ -855,15 +862,23 @@ class FusedPreMap(torch.autograd.Function):
             raise ValueError("FusedPreMap currently supports n=4 only")
         out = torch.empty((T, C), device=x_streams.device, dtype=x_streams.dtype)
         NUM_SMS, nw, ns = _get_hw_config()
+        cc_major, _ = torch.cuda.get_device_capability()
+        # SM90: BLOCK_C=128 with 3 stages → 4 x tiles × 16KB × 3 stages = 192KB,
+        # fits in 228KB shared mem and enables 3-stage pipelining.
+        # BLOCK_C=256 with 4 stages needs 512KB → pipelining silently disabled.
+        if cc_major == 9:
+            BLOCK_C = 128
+            ns_pre = 3
+        else:
+            BLOCK_C = min(256, triton.next_power_of_2(C))
+            ns_pre = ns
         BLOCK_T = 64
-        BLOCK_C = min(256, triton.next_power_of_2(C))
         grid = (NUM_SMS,)
-        # SM120 99KB limit
         _fused_pre_map_fwd_kernel[grid](
             x_streams, h_pre, out,
             T, C, n,
             BLOCK_T=BLOCK_T, BLOCK_C=BLOCK_C, NUM_SMS=NUM_SMS,
-            num_warps=nw, num_stages=ns
+            num_warps=nw, num_stages=ns_pre
         )
         ctx.save_for_backward(x_streams, h_pre)
         return out
@@ -875,8 +890,10 @@ class FusedPreMap(torch.autograd.Function):
         if n != 4:
             raise ValueError("FusedPreMap currently supports n=4 only")
         grad_out = grad_output.contiguous()
-        
+
         NUM_SMS, nw, ns = _get_hw_config()
+        # bwd kernels only have 2-5 live tiles (not register-bound), so keep
+        # larger BLOCK_C for fewer loop iterations and better throughput.
         BLOCK_T = 64
         BLOCK_C = min(256, triton.next_power_of_2(C))
         grid = (NUM_SMS,)

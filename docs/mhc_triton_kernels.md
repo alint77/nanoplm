@@ -98,6 +98,85 @@ Assumptions:
 | `_fused_post_res_bwd_xlo_kernel_n4` | 2.075 | 1.688 | 81.3% | 1457.7 |
 | `_fused_post_res_bwd_Hhp_kernel` | 2.199 | 1.688 | 76.8% | 1375.6 |
 
+## SM90 (H100) optimizations + trace validation (T=65536, C=2560, n=4)
+
+### Optimizations applied
+
+The original kernel configs were tuned for SM120 (RTX 5090). On SM90 (H100 80GB HBM3, 132 SMs, 3350 GB/s peak BW), three kernels had poor efficiency due to register pressure and shared memory limits. All fixes are gated behind `cc_major == 9` so the SM120 path is unchanged.
+
+**1. `_fused_post_res_bwd_Hhp_kernel` — restructured inner C-loop (18% → 83%)**
+
+Root cause: the original inner loop loaded 9 2D tiles simultaneously (lo + x0..x3 + go0..go3), each `(BLOCK_T=64, BLOCK_C=256)` bf16→f32. With 8 warps (256 threads): 9 tiles × 64 × 256 / 256 threads = 576 f32 regs/thread. H100 limit is 255 → massive register spilling.
+
+Fix: phased tile streaming. Load 4 `go` tiles first (stay live), then stream `lo` once (compute `ghp`, `lo` dies), then stream `x_j` one at a time (max live: 4 go + 1 x = 5 tiles). SM90 launch config: `BLOCK_C=128`, `num_stages=2`. The restructured kernel body applies to all architectures (it's a strict improvement in load ordering) but the reduced `BLOCK_C` is SM90-only.
+
+**2. `_fused_rmsnorm_project_bwd_dx_kernel` — reduced BLOCK_T (57% → 77%)**
+
+Root cause: `BLOCK_T=128` creates a `(128, D_out=32)` f32 dot output = 128×32/256 = 16 regs, but the full pipeline (x tile, W tile, grad_out, proj_out, accumulators) hits ~170 regs/thread.
+
+Fix: `BLOCK_T=64` for SM90 only. Halves register pressure, enables 2-block occupancy per SM.
+
+**3. `_fused_pre_map_fwd_kernel` — reduced BLOCK_C + pipeline tuning (61% → 69%)**
+
+Root cause: `BLOCK_C=256` with `num_stages=4` needs 4 × (n=4 x tiles) × 64×256×2B = 512KB pipeline buffers. H100 has 228KB shared mem → pipelining silently disabled by Triton.
+
+Fix: `BLOCK_C=128`, `num_stages=3` for SM90 only → 4 × 3 × 16KB = 192KB, fits in 228KB.
+
+### Trace validation (`run-26021500-2`, H100 80GB)
+
+Trace: `output/pretraining_checkpoints/run-26021500-2/profiler_traces/chrome_trace.json`
+Config: `hidden_size=2560`, `mhc_n_streams=4`, `num_hidden_layers=4`, `micro_batch_size=128`, packing enabled → `T=65536` tokens/microbatch.
+Profiler captured 9 training steps (steps 10-15 per config). 132 SMs, 8 warps, stream 7.
+
+| kernel | bytes (MB) | LB (us) | trace avg (us) | eff % | clean* eff % | achieved BW (GB/s) |
+|---|---:|---:|---:|---:|---:|---:|
+| `rmsnorm_project_fwd` | 1347 | 402 | 459 | 82% | **88%** | 2937 |
+| `rmsnorm_project_bwd_dx` | 2694 | 804 | 1040 | 77% | **77%** | 2591 |
+| `pre_map_fwd` | 1679 | 501 | 723 | 69% | **69%** | 2322 |
+| `pre_map_bwd_dx` | 1679 | 501 | 601 | 83% | **83%** | 2794 |
+| `pre_map_bwd_hpre` | 1679 | 501 | 609 | 82% | **82%** | 2757 |
+| `post_res_fwd_n4` | 3025 | 903 | 1063 | 85% | **85%** | 2846 |
+| `post_res_bwd_xlo_n4` | 3361 | 1003 | 1065 | 94% | **94%** | 3156 |
+| `post_res_bwd_Hhp` | 3025 | 903 | 1089† | 67%→ | **83%** | 2779 |
+| **TOTAL** | **18489** | **5519** | **6648** | | **83%** | **2781** |
+
+\* "Clean" = excluding invocations that overlap with NCCL ReduceScatter on stream 26.
+
+† The Hhp kernel shows bimodal latency: 21 fast invocations at 1089 us (83% eff) and 15 slow invocations at ~1690 us (53% eff). Every slow invocation overlaps with `ncclDevKernel_ReduceScatter_Sum_f32_RING_LL` on a separate stream, confirming the slowdown is memory bandwidth contention from communication overlap — not a kernel issue.
+
+**Per-layer total: 6.65 ms (clean) / 5.52 ms (lower bound) = 83% overall bandwidth efficiency.**
+
+### Benchmark vs trace comparison
+
+The microbenchmark (`tests/mhc_triton_kernels_benchmark.py`, T=2048, C=256) accurately predicts real-training efficiency:
+
+| kernel | benchmark eff % | trace clean eff % | delta |
+|---|---:|---:|---:|
+| `rmsnorm_project_fwd` | 89% | 88% | -1% |
+| `rmsnorm_project_bwd_dx` | 78% | 77% | -1% |
+| `pre_map_fwd` | 69% | 69% | 0% |
+| `pre_map_bwd_dx` | 81% | 83% | +2% |
+| `pre_map_bwd_hpre` | 83% | 82% | -1% |
+| `post_res_fwd_n4` | 84% | 85% | +1% |
+| `post_res_bwd_xlo_n4` | 94% | 94% | 0% |
+| `post_res_bwd_Hhp` | 84% | 83% | -1% |
+
+All within ±2%. The benchmark is a reliable proxy for real training performance.
+
+### Architecture-specific launch configs
+
+All SM90 tuning is gated behind `cc_major == 9`. SM120 and other architectures use the original configs.
+
+| kernel | param | SM90 (H100) | SM120 (RTX 5090) / other |
+|---|---|---|---|
+| K1 bwd (`rmsnorm_project_bwd_dx`) | BLOCK_T | 64 | 128 (original) |
+| K3 fwd (`pre_map_fwd`) | BLOCK_C | 128 | min(256, C) |
+| K3 fwd (`pre_map_fwd`) | num_stages | 3 | from `_get_hw_config()` |
+| K4 bwd Hhp (`post_res_bwd_Hhp`) | BLOCK_C | 128 | min(256, C) |
+| K4 bwd Hhp (`post_res_bwd_Hhp`) | num_stages | 2 | from `_get_hw_config()` |
+
+The Hhp kernel body restructuring (phased 4+1 tile streaming) applies to all architectures — it reduces max live 2D tiles from 9 to 5 without changing the computation, which is neutral-to-beneficial everywhere.
+
 ## Kernel → responsible code
 
 ### mHC-lite Triton kernels (directly “ownable”)

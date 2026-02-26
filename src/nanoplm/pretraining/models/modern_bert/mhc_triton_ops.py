@@ -144,9 +144,9 @@ def _fused_rmsnorm_project_bwd_dx_cuda(
     _, nw, ns = k._get_hw_config()
 
     cc_major, _ = torch.cuda.get_device_capability()
-    if cc_major >= 12:
+    if cc_major == 9:
         BLOCK_T = 64
-        ns_bwd = 3
+        ns_bwd = ns
     else:
         BLOCK_T = 128
         ns_bwd = ns
@@ -180,8 +180,14 @@ def _fused_pre_map_cuda(x_streams: torch.Tensor, h_pre: torch.Tensor):
         raise ValueError("nanoplm_mhc::fused_pre_map currently supports n=4 only")
     out = torch.empty((T, C), device=x_streams.device, dtype=x_streams.dtype)
     NUM_SMS, nw, ns = k._get_hw_config()
+    cc_major, _ = torch.cuda.get_device_capability()
+    if cc_major == 9:
+        BLOCK_C = 128
+        ns_pre = 3
+    else:
+        BLOCK_C = min(256, k.triton.next_power_of_2(C))
+        ns_pre = ns
     BLOCK_T = 64
-    BLOCK_C = min(256, k.triton.next_power_of_2(C))
     grid = (NUM_SMS,)
     k._fused_pre_map_fwd_kernel[grid](
         x_streams,
@@ -194,7 +200,7 @@ def _fused_pre_map_cuda(x_streams: torch.Tensor, h_pre: torch.Tensor):
         BLOCK_C=BLOCK_C,
         NUM_SMS=NUM_SMS,
         num_warps=nw,
-        num_stages=ns,
+        num_stages=ns_pre,
     )
     return out
 
@@ -328,7 +334,12 @@ def _fused_post_res_backward_cuda(
     )
 
     BLOCK_T_B = 64
-    BLOCK_C_B = 128 if cc_major >= 12 else min(256, k.triton.next_power_of_2(C))
+    if cc_major == 9:
+        BLOCK_C_B = 128
+        ns_hhp = 2
+    else:
+        BLOCK_C_B = min(256, k.triton.next_power_of_2(C))
+        ns_hhp = ns
     k._fused_post_res_bwd_Hhp_kernel[grid](
         x_streams,
         layer_output,
@@ -342,7 +353,7 @@ def _fused_post_res_backward_cuda(
         BLOCK_C=BLOCK_C_B,
         NUM_SMS=NUM_SMS,
         num_warps=nw_default,
-        num_stages=ns,
+        num_stages=ns_hhp,
     )
 
     return grad_x, grad_layer_output, grad_H, grad_hp
