@@ -305,10 +305,6 @@ def _fused_post_res_backward_cuda(
     grad_out = grad_out.contiguous()
     NUM_SMS, nw_default, ns = k._get_hw_config()
     cc_major, _ = torch.cuda.get_device_capability()
-
-    BLOCK_T = 64 if cc_major >= 9 else 32
-    BLOCK_C = 128 if C >= 128 else k.triton.next_power_of_2(C)
-    nw = 8 if cc_major >= 9 else nw_default
     grid = (NUM_SMS,)
 
     grad_x = torch.empty_like(x_streams)
@@ -316,44 +312,32 @@ def _fused_post_res_backward_cuda(
     grad_H = torch.empty((T, n, n), device=x_streams.device, dtype=torch.float32)
     grad_hp = torch.empty((T, n), device=x_streams.device, dtype=torch.float32)
 
-    k._fused_post_res_bwd_xlo_kernel_n4[grid](
+    if cc_major == 9:
+        BLOCK_T_F = 32
+        BLOCK_C_F = 128
+        ns_fused = 2
+    else:
+        BLOCK_T_F = 32
+        BLOCK_C_F = min(256, k.triton.next_power_of_2(C))
+        ns_fused = ns
+    k._fused_post_res_bwd_fused_kernel_n4[grid](
+        x_streams,
+        layer_output,
         H_merged,
         h_post,
         grad_out,
-        layer_output,
         grad_x,
         grad_layer_output,
-        T,
-        C,
-        n,
-        BLOCK_T=BLOCK_T,
-        BLOCK_C=BLOCK_C,
-        NUM_SMS=NUM_SMS,
-        num_warps=nw,
-        num_stages=ns,
-    )
-
-    BLOCK_T_B = 64
-    if cc_major == 9:
-        BLOCK_C_B = 128
-        ns_hhp = 2
-    else:
-        BLOCK_C_B = min(256, k.triton.next_power_of_2(C))
-        ns_hhp = ns
-    k._fused_post_res_bwd_Hhp_kernel[grid](
-        x_streams,
-        layer_output,
-        grad_out,
         grad_H,
         grad_hp,
         T,
         C,
         n,
-        BLOCK_T=BLOCK_T_B,
-        BLOCK_C=BLOCK_C_B,
+        BLOCK_T=BLOCK_T_F,
+        BLOCK_C=BLOCK_C_F,
         NUM_SMS=NUM_SMS,
         num_warps=nw_default,
-        num_stages=ns_hhp,
+        num_stages=ns_fused,
     )
 
     return grad_x, grad_layer_output, grad_H, grad_hp

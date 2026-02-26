@@ -593,6 +593,185 @@ def _fused_post_res_bwd_Hhp_kernel(
         tl.store(grad_H_ptr + H_base + 15, gH_33, mask=t_mask)
 
 
+# ---------- K4 Backward: Fused kernel (grad_x, grad_lo, grad_H, grad_hp) ----------
+# Fuses bwd_xlo + bwd_Hhp into a single kernel. Tiles over T only, inner-loop C.
+# Eliminates one redundant HBM read of grad_out (T, n, C).
+
+@triton.jit
+def _fused_post_res_bwd_fused_kernel_n4(
+    x_ptr, lo_ptr, H_ptr, hp_ptr, grad_out_ptr,
+    grad_x_ptr, grad_lo_ptr, grad_H_ptr, grad_hp_ptr,
+    T, C: tl.constexpr, n: tl.constexpr,
+    BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    """Fused K4 backward: computes all 4 gradient tensors in a single pass.
+
+    Combines bwd_xlo (grad_x, grad_lo) and bwd_Hhp (grad_H, grad_hp).
+    grad_out is read once from HBM instead of twice.
+
+    Tiling: persistent grid over T-tiles, inner loop over C.
+    - grad_H, grad_hp: reduce over C (accumulated across C-tiles, stored after sweep)
+    - grad_x, grad_lo: no reduction (computed and stored per C-tile)
+
+    Register-pressure-optimized phased streaming:
+      Phase 1: Load 4 go tiles (stay live for all subsequent phases)
+      Phase 2a: Compute grad_lo = sum_i hp_i * go_i, store immediately
+      Phase 2b: Load lo, accumulate ghp, release lo
+      Phase 3 (per j): Load x_j, accumulate gH_ij, compute+store grad_x_j, release x_j
+    Max live 2D tiles: 5 (4 go + 1 streaming x/lo)
+    """
+    tl.static_assert(n == 4)
+    pid = tl.program_id(0)
+    num_t_tiles = tl.cdiv(T, BLOCK_T)
+
+    for tile_id in tl.range(pid, num_t_tiles, NUM_SMS, flatten=True):
+        t_offs = tile_id * BLOCK_T + tl.arange(0, BLOCK_T)
+        t_mask = t_offs < T
+
+        # Load H[t, i, j] and hp[t, i] scalars once per T-tile (don't depend on c)
+        H_00 = tl.load(H_ptr + t_offs * (n * n) + 0,  mask=t_mask, other=0.0).to(tl.float32)
+        H_01 = tl.load(H_ptr + t_offs * (n * n) + 1,  mask=t_mask, other=0.0).to(tl.float32)
+        H_02 = tl.load(H_ptr + t_offs * (n * n) + 2,  mask=t_mask, other=0.0).to(tl.float32)
+        H_03 = tl.load(H_ptr + t_offs * (n * n) + 3,  mask=t_mask, other=0.0).to(tl.float32)
+        H_10 = tl.load(H_ptr + t_offs * (n * n) + 4,  mask=t_mask, other=0.0).to(tl.float32)
+        H_11 = tl.load(H_ptr + t_offs * (n * n) + 5,  mask=t_mask, other=0.0).to(tl.float32)
+        H_12 = tl.load(H_ptr + t_offs * (n * n) + 6,  mask=t_mask, other=0.0).to(tl.float32)
+        H_13 = tl.load(H_ptr + t_offs * (n * n) + 7,  mask=t_mask, other=0.0).to(tl.float32)
+        H_20 = tl.load(H_ptr + t_offs * (n * n) + 8,  mask=t_mask, other=0.0).to(tl.float32)
+        H_21 = tl.load(H_ptr + t_offs * (n * n) + 9,  mask=t_mask, other=0.0).to(tl.float32)
+        H_22 = tl.load(H_ptr + t_offs * (n * n) + 10, mask=t_mask, other=0.0).to(tl.float32)
+        H_23 = tl.load(H_ptr + t_offs * (n * n) + 11, mask=t_mask, other=0.0).to(tl.float32)
+        H_30 = tl.load(H_ptr + t_offs * (n * n) + 12, mask=t_mask, other=0.0).to(tl.float32)
+        H_31 = tl.load(H_ptr + t_offs * (n * n) + 13, mask=t_mask, other=0.0).to(tl.float32)
+        H_32 = tl.load(H_ptr + t_offs * (n * n) + 14, mask=t_mask, other=0.0).to(tl.float32)
+        H_33 = tl.load(H_ptr + t_offs * (n * n) + 15, mask=t_mask, other=0.0).to(tl.float32)
+
+        hp_0 = tl.load(hp_ptr + t_offs * n + 0, mask=t_mask, other=0.0).to(tl.float32)
+        hp_1 = tl.load(hp_ptr + t_offs * n + 1, mask=t_mask, other=0.0).to(tl.float32)
+        hp_2 = tl.load(hp_ptr + t_offs * n + 2, mask=t_mask, other=0.0).to(tl.float32)
+        hp_3 = tl.load(hp_ptr + t_offs * n + 3, mask=t_mask, other=0.0).to(tl.float32)
+
+        # 20 reduction accumulators: 4 ghp + 16 gH, each (BLOCK_T,) f32
+        ghp_0 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        ghp_1 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        ghp_2 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        ghp_3 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+
+        gH_00 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_01 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_02 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_03 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_10 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_11 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_12 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_13 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_20 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_21 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_22 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_23 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_30 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_31 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_32 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        gH_33 = tl.zeros((BLOCK_T,), dtype=tl.float32)
+
+        for c_start in tl.range(0, C, BLOCK_C):
+            # --- Phase 1: load all 4 grad_out tiles (stay live) ---
+            go0_ptr = tl.make_block_ptr(base=grad_out_ptr + 0 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            go1_ptr = tl.make_block_ptr(base=grad_out_ptr + 1 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            go2_ptr = tl.make_block_ptr(base=grad_out_ptr + 2 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            go3_ptr = tl.make_block_ptr(base=grad_out_ptr + 3 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+
+            go0 = tl.load(go0_ptr, boundary_check=(0, 1)).to(tl.float32)
+            go1 = tl.load(go1_ptr, boundary_check=(0, 1)).to(tl.float32)
+            go2 = tl.load(go2_ptr, boundary_check=(0, 1)).to(tl.float32)
+            go3 = tl.load(go3_ptr, boundary_check=(0, 1)).to(tl.float32)
+
+            # --- Phase 2a: compute grad_lo for this C-tile and store immediately ---
+            # grad_lo[t, c] = sum_i hp[t, i] * go[t, i, c]  (no reduction over C)
+            glo = hp_0[:, None] * go0 + hp_1[:, None] * go1 + hp_2[:, None] * go2 + hp_3[:, None] * go3
+            glo_ptr = tl.make_block_ptr(base=grad_lo_ptr, shape=(T, C), strides=(C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            tl.store(glo_ptr, glo.to(tl.bfloat16), boundary_check=(0, 1))
+
+            # --- Phase 2b: load lo, accumulate ghp, release lo ---
+            lo_block_ptr = tl.make_block_ptr(base=lo_ptr, shape=(T, C), strides=(C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            lo = tl.load(lo_block_ptr, boundary_check=(0, 1)).to(tl.float32)
+            ghp_0 += tl.sum(go0 * lo, axis=1)
+            ghp_1 += tl.sum(go1 * lo, axis=1)
+            ghp_2 += tl.sum(go2 * lo, axis=1)
+            ghp_3 += tl.sum(go3 * lo, axis=1)
+
+            # --- Phase 3: stream x_j one at a time, accumulate gH + compute+store grad_x_j ---
+            # x stream 0
+            x0_ptr = tl.make_block_ptr(base=x_ptr + 0 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            x0 = tl.load(x0_ptr, boundary_check=(0, 1)).to(tl.float32)
+            gH_00 += tl.sum(go0 * x0, axis=1)
+            gH_10 += tl.sum(go1 * x0, axis=1)
+            gH_20 += tl.sum(go2 * x0, axis=1)
+            gH_30 += tl.sum(go3 * x0, axis=1)
+            # grad_x[t, 0, c] = sum_i H[t, i, 0] * go[t, i, c]
+            gx0 = H_00[:, None] * go0 + H_10[:, None] * go1 + H_20[:, None] * go2 + H_30[:, None] * go3
+            gx0_ptr = tl.make_block_ptr(base=grad_x_ptr + 0 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            tl.store(gx0_ptr, gx0.to(tl.bfloat16), boundary_check=(0, 1))
+
+            # x stream 1
+            x1_ptr = tl.make_block_ptr(base=x_ptr + 1 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            x1 = tl.load(x1_ptr, boundary_check=(0, 1)).to(tl.float32)
+            gH_01 += tl.sum(go0 * x1, axis=1)
+            gH_11 += tl.sum(go1 * x1, axis=1)
+            gH_21 += tl.sum(go2 * x1, axis=1)
+            gH_31 += tl.sum(go3 * x1, axis=1)
+            gx1 = H_01[:, None] * go0 + H_11[:, None] * go1 + H_21[:, None] * go2 + H_31[:, None] * go3
+            gx1_ptr = tl.make_block_ptr(base=grad_x_ptr + 1 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            tl.store(gx1_ptr, gx1.to(tl.bfloat16), boundary_check=(0, 1))
+
+            # x stream 2
+            x2_ptr = tl.make_block_ptr(base=x_ptr + 2 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            x2 = tl.load(x2_ptr, boundary_check=(0, 1)).to(tl.float32)
+            gH_02 += tl.sum(go0 * x2, axis=1)
+            gH_12 += tl.sum(go1 * x2, axis=1)
+            gH_22 += tl.sum(go2 * x2, axis=1)
+            gH_32 += tl.sum(go3 * x2, axis=1)
+            gx2 = H_02[:, None] * go0 + H_12[:, None] * go1 + H_22[:, None] * go2 + H_32[:, None] * go3
+            gx2_ptr = tl.make_block_ptr(base=grad_x_ptr + 2 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            tl.store(gx2_ptr, gx2.to(tl.bfloat16), boundary_check=(0, 1))
+
+            # x stream 3
+            x3_ptr = tl.make_block_ptr(base=x_ptr + 3 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            x3 = tl.load(x3_ptr, boundary_check=(0, 1)).to(tl.float32)
+            gH_03 += tl.sum(go0 * x3, axis=1)
+            gH_13 += tl.sum(go1 * x3, axis=1)
+            gH_23 += tl.sum(go2 * x3, axis=1)
+            gH_33 += tl.sum(go3 * x3, axis=1)
+            gx3 = H_03[:, None] * go0 + H_13[:, None] * go1 + H_23[:, None] * go2 + H_33[:, None] * go3
+            gx3_ptr = tl.make_block_ptr(base=grad_x_ptr + 3 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
+            tl.store(gx3_ptr, gx3.to(tl.bfloat16), boundary_check=(0, 1))
+
+        # Store reduction outputs: grad_hp[t, i] and grad_H[t, i, j]
+        tl.store(grad_hp_ptr + t_offs * n + 0, ghp_0, mask=t_mask)
+        tl.store(grad_hp_ptr + t_offs * n + 1, ghp_1, mask=t_mask)
+        tl.store(grad_hp_ptr + t_offs * n + 2, ghp_2, mask=t_mask)
+        tl.store(grad_hp_ptr + t_offs * n + 3, ghp_3, mask=t_mask)
+
+        H_base = t_offs * (n * n)
+        tl.store(grad_H_ptr + H_base + 0,  gH_00, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 1,  gH_01, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 2,  gH_02, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 3,  gH_03, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 4,  gH_10, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 5,  gH_11, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 6,  gH_12, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 7,  gH_13, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 8,  gH_20, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 9,  gH_21, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 10, gH_22, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 11, gH_23, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 12, gH_30, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 13, gH_31, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 14, gH_32, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 15, gH_33, mask=t_mask)
+
+
 class FusedPostRes(torch.autograd.Function):
     """output = H_merged @ x_streams + h_post[:,:,None] * layer_output[:,None,:]"""
 
@@ -629,43 +808,26 @@ class FusedPostRes(torch.autograd.Function):
         NUM_SMS, nw_default, ns = _get_hw_config()
         cc_major, _ = torch.cuda.get_device_capability()
 
-        BLOCK_T = 64 if cc_major >= 9 else 32
-        BLOCK_C = 128 if C >= 128 else triton.next_power_of_2(C)
-        nw = 8 if cc_major >= 9 else nw_default
         grid = (NUM_SMS,)
-
         grad_x = torch.empty_like(x_streams)
         grad_lo = torch.empty((T, C), device=x_streams.device, dtype=x_streams.dtype)
         grad_H = torch.empty((T, n, n), device=x_streams.device, dtype=torch.float32)
         grad_hp = torch.empty((T, n), device=x_streams.device, dtype=torch.float32)
 
-        _fused_post_res_bwd_xlo_kernel_n4[grid](
-            H_merged, h_post, grad_out, layer_output,
-            grad_x, grad_lo,
-            T, C, n,
-            BLOCK_T=BLOCK_T, BLOCK_C=BLOCK_C, NUM_SMS=NUM_SMS,
-            num_warps=nw, num_stages=ns,
-        )
-
-        BLOCK_T_B = 64
         if cc_major == 9:
-            # SM90: BLOCK_C=128 keeps max live 2D tiles to 5 (4 go + 1 x/lo)
-            # fitting in the 255 reg/thread limit with 8 warps.
-            # 2 pipeline stages fit in 228KB shared mem.
-            BLOCK_C_B = 128
-            ns_hhp = 2
+            BLOCK_T_F = 32
+            BLOCK_C_F = 128
+            ns_fused = 2
         else:
-            # SM120/other: original config. The restructured kernel body
-            # (phased 4+1 streaming) still helps, but larger tiles are fine
-            # since SM120's 4 warps = fewer regs/thread.
-            BLOCK_C_B = min(256, triton.next_power_of_2(C))
-            ns_hhp = ns
-        _fused_post_res_bwd_Hhp_kernel[grid](
-            x_streams, layer_output, grad_out,
-            grad_H, grad_hp,
+            BLOCK_T_F = 32
+            BLOCK_C_F = min(256, triton.next_power_of_2(C))
+            ns_fused = ns
+        _fused_post_res_bwd_fused_kernel_n4[grid](
+            x_streams, layer_output, H_merged, h_post, grad_out,
+            grad_x, grad_lo, grad_H, grad_hp,
             T, C, n,
-            BLOCK_T=BLOCK_T_B, BLOCK_C=BLOCK_C_B, NUM_SMS=NUM_SMS,
-            num_warps=nw_default, num_stages=ns_hhp,
+            BLOCK_T=BLOCK_T_F, BLOCK_C=BLOCK_C_F, NUM_SMS=NUM_SMS,
+            num_warps=nw_default, num_stages=ns_fused,
         )
 
         return grad_x, grad_lo, grad_H, grad_hp

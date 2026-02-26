@@ -105,6 +105,16 @@ def _bytes_model(T: int, n: int, C: int, D_out: int) -> dict[str, int]:
         + b(T * n * C, bf16)
         + b(T * n * n, fp32)
         + b(T * n, fp32),
+        # Fused xlo+Hhp: grad_out read once (not twice), all other tensors same
+        "_fused_post_res_bwd_fused_kernel_n4": b(T * n * C, bf16)  # grad_out (read once)
+        + b(T * n * C, bf16)  # x_streams
+        + b(T * C, bf16)      # layer_output
+        + b(T * n * n, fp32)  # H_merged
+        + b(T * n, fp32)      # h_post
+        + b(T * n * C, bf16)  # grad_x (write)
+        + b(T * C, bf16)      # grad_lo (write)
+        + b(T * n * n, fp32)  # grad_H (write)
+        + b(T * n, fp32),     # grad_hp (write)
     }
 
 
@@ -425,6 +435,45 @@ def main() -> None:
                 peak_gbps,
             )
         )
+
+    # ---- K4 bwd_fused (xlo+Hhp combined) ----
+    grad_x_fused = torch.empty_like(x_streams)
+    grad_lo_fused = torch.empty((T, C), device=device, dtype=torch.bfloat16)
+    grad_H_fused = torch.empty((T, n, n), device=device, dtype=torch.float32)
+    grad_hp_fused = torch.empty((T, n), device=device, dtype=torch.float32)
+
+    if cc_major == 9:
+        BLOCK_TF = 32
+        BLOCK_CF = 128
+        ns_fused = 2
+    else:
+        BLOCK_TF = 32
+        BLOCK_CF = min(256, _next_pow2(C))
+        ns_fused = ns
+
+    def run_k4_bwd_fused():
+        k._fused_post_res_bwd_fused_kernel_n4[grid_sms](
+            x_streams,
+            layer_output,
+            H,
+            h_post,
+            grad_out_post,
+            grad_x_fused,
+            grad_lo_fused,
+            grad_H_fused,
+            grad_hp_fused,
+            T,
+            C,
+            n,
+            BLOCK_T=BLOCK_TF,
+            BLOCK_C=BLOCK_CF,
+            NUM_SMS=NUM_SMS,
+            num_warps=nw_default,
+            num_stages=ns_fused,
+        )
+
+    times = _time_cuda(run_k4_bwd_fused, iters=args.iters, warmup=args.warmup)
+    results.append(_summarize("_fused_post_res_bwd_fused_kernel_n4", times, bytes_model["_fused_post_res_bwd_fused_kernel_n4"], peak_gbps))
 
     # ---- Print ----
     print(f"Device: {torch.cuda.get_device_name(0)} cc={torch.cuda.get_device_capability()} NUM_SMS={NUM_SMS}")

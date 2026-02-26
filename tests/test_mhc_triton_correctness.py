@@ -246,6 +246,105 @@ class TestK4FusedPostRes:
         _assert_close("K4_grad_hp", hp.grad, hp_ref.grad, BWD_ATOL, BWD_RTOL)
 
 
+# ── K4 fused backward: bwd_xlo + bwd_Hhp → single kernel ────────────────────
+
+class TestK4FusedBackwardKernel:
+    """Validate that the fused backward kernel produces identical outputs
+    to the two separate kernels (bwd_xlo + bwd_Hhp).
+
+    The fused kernel reads grad_out once instead of twice, but the
+    computation and accumulation order are identical, so outputs should
+    match to machine precision for f32 and within 1 ULP for bf16.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.k = _import_kernels()
+        self.T, self.n, self.C = 2048, 4, 256
+
+    def _run_separate(self, x, lo, H, hp, go):
+        """Run the two separate kernels and return their outputs."""
+        T, n, C = x.shape
+        NUM_SMS, nw_default, ns = self.k._get_hw_config()
+        cc_major, _ = torch.cuda.get_device_capability()
+        grid = (NUM_SMS,)
+
+        BLOCK_T = 64 if cc_major >= 9 else 32
+        BLOCK_C = 128 if C >= 128 else self.k.triton.next_power_of_2(C)
+        nw = 8 if cc_major >= 9 else nw_default
+
+        grad_x = torch.empty_like(x)
+        grad_lo = torch.empty((T, C), device="cuda", dtype=torch.bfloat16)
+        self.k._fused_post_res_bwd_xlo_kernel_n4[grid](
+            H, hp, go, lo, grad_x, grad_lo,
+            T, C, n,
+            BLOCK_T=BLOCK_T, BLOCK_C=BLOCK_C, NUM_SMS=NUM_SMS,
+            num_warps=nw, num_stages=ns,
+        )
+
+        BLOCK_T_B = 64
+        if cc_major == 9:
+            BLOCK_C_B = 128
+            ns_hhp = 2
+        else:
+            BLOCK_C_B = min(256, self.k.triton.next_power_of_2(C))
+            ns_hhp = ns
+        grad_H = torch.empty((T, n, n), device="cuda", dtype=torch.float32)
+        grad_hp = torch.empty((T, n), device="cuda", dtype=torch.float32)
+        self.k._fused_post_res_bwd_Hhp_kernel[grid](
+            x, lo, go, grad_H, grad_hp,
+            T, C, n,
+            BLOCK_T=BLOCK_T_B, BLOCK_C=BLOCK_C_B, NUM_SMS=NUM_SMS,
+            num_warps=nw_default, num_stages=ns_hhp,
+        )
+        return grad_x, grad_lo, grad_H, grad_hp
+
+    def _run_fused(self, x, lo, H, hp, go):
+        """Run the fused kernel and return its outputs."""
+        T, n, C = x.shape
+        NUM_SMS, nw_default, ns = self.k._get_hw_config()
+        cc_major, _ = torch.cuda.get_device_capability()
+        grid = (NUM_SMS,)
+
+        if cc_major == 9:
+            BLOCK_T_F = 32
+            BLOCK_C_F = 128
+            ns_fused = 2
+        else:
+            BLOCK_T_F = 32
+            BLOCK_C_F = min(256, self.k.triton.next_power_of_2(C))
+            ns_fused = ns
+
+        grad_x = torch.empty_like(x)
+        grad_lo = torch.empty((T, C), device="cuda", dtype=torch.bfloat16)
+        grad_H = torch.empty((T, n, n), device="cuda", dtype=torch.float32)
+        grad_hp = torch.empty((T, n), device="cuda", dtype=torch.float32)
+        self.k._fused_post_res_bwd_fused_kernel_n4[grid](
+            x, lo, H, hp, go,
+            grad_x, grad_lo, grad_H, grad_hp,
+            T, C, n,
+            BLOCK_T=BLOCK_T_F, BLOCK_C=BLOCK_C_F, NUM_SMS=NUM_SMS,
+            num_warps=nw_default, num_stages=ns_fused,
+        )
+        return grad_x, grad_lo, grad_H, grad_hp
+
+    def test_fused_matches_separate(self):
+        x = _rand((self.T, self.n, self.C))
+        lo = _rand((self.T, self.C))
+        H = torch.randn(self.T, self.n, self.n, device="cuda", dtype=torch.float32)
+        hp = torch.randn(self.T, self.n, device="cuda", dtype=torch.float32)
+        go = _rand((self.T, self.n, self.C)).contiguous()
+
+        gx_ref, glo_ref, gH_ref, ghp_ref = self._run_separate(x, lo, H, hp, go)
+        gx_fused, glo_fused, gH_fused, ghp_fused = self._run_fused(x, lo, H, hp, go)
+
+        _assert_close("fused_grad_x", gx_fused, gx_ref, FWD_ATOL, FWD_RTOL)
+        _assert_close("fused_grad_lo", glo_fused, glo_ref, FWD_ATOL, FWD_RTOL)
+        # f32 reductions with same accumulation order should match tightly
+        _assert_close("fused_grad_H", gH_fused, gH_ref, 1e-5, 1e-5)
+        _assert_close("fused_grad_hp", ghp_fused, ghp_ref, 1e-5, 1e-5)
+
+
 # ── Full MHCLiteBlock: triton vs pytorch ─────────────────────────────────────
 
 class TestMHCLiteBlockEndToEnd:
