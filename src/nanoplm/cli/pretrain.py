@@ -436,18 +436,10 @@ def pretrain():
     help="Subset of Canon insertion points to enable (A/B/C/D), e.g. 'abcd' or 'ac'",
 )
 @click.option(
-    "--canon-layer-type",
-    type=click.Choice(["causal", "symmetric"], case_sensitive=False),
-    default="causal",
-    help="Canon layer conv type: 'causal' uses fused causal_conv1d CUDA kernel (fast, requires packing); "
-         "'symmetric' uses bidirectional nn.Conv1d (slower, original implementation)",
-)
-@click.option(
     "--canon-layers-kernel-size",
     type=int,
     default=None,
-    help="Canon kernel size. If omitted, defaults to 4 for 'causal' and 5 for 'symmetric'. "
-         "Allowed values: causal -> {2,3,4}, symmetric -> {3,5,7}.",
+    help="Canon kernel size. If omitted, defaults to 5. Allowed values: {3,5,7}.",
 )
 @click.option(
     "--use-repo/--no-use-repo",
@@ -545,7 +537,6 @@ def run(
     use_qk_norm: bool,
     use_canon_layers: bool,
     canon_layers_mode: str,
-    canon_layer_type: str,
     canon_layers_kernel_size: Optional[int],
     use_repo: bool,
     repo_after_n_layers: int,
@@ -608,11 +599,6 @@ def run(
             "use_canon_layers requires --pure-torch. "
             "Canon layers are not implemented in HF/TE paths."
         )
-    if use_canon_layers and not use_packing:
-        raise click.ClickException(
-            "use_canon_layers requires --use-packing. "
-            "Canon layers are only supported with sequence packing enabled."
-        )
     if use_mhc_lite and use_resid_lambdas:
         raise click.ClickException(
             "use_mhc_lite and use_resid_lambdas are mutually exclusive. "
@@ -639,7 +625,6 @@ def run(
         use_qk_norm=use_qk_norm,
         use_canon_layers=use_canon_layers,
         canon_layers_mode=canon_layers_mode,
-        canon_layer_type=canon_layer_type,
         canon_layers_kernel_size=canon_layers_kernel_size,
         use_repo=use_repo,
         repo_after_n_layers=repo_after_n_layers,
@@ -736,11 +721,6 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
         raise click.ClickException(
             "model.use_canon_layers=true requires pure_torch: true (or --pure-torch). "
             "Canon layers are not implemented in HF/TE paths."
-        )
-    if model_config.use_canon_layers and not pretrain_config.use_packing:
-        raise click.ClickException(
-            "model.use_canon_layers=true requires use_packing: true. "
-            "Canon layers are only supported with sequence packing enabled."
         )
     if model_config.use_mhc_lite and model_config.use_resid_lambdas:
         raise click.ClickException(
@@ -846,8 +826,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  use_qk_norm: false  # applies RMS norm to Q/K in attention\n"
         "  use_canon_layers: false # enables Canon-ABCD local mixing layers (pure_torch only)\n"
         "  canon_layers_mode: \"ac\"  # subset of Canon sites: A/B/C/D (e.g. \"ac\" for lighter mode)\n"
-        "  canon_layer_type: \"symmetric\"  # 'causal' (fused CUDA kernel, fast) or 'symmetric' (nn.Conv1d, bidirectional)\n"
-        "  canon_layers_kernel_size: 5  # causal: 2/3/4, symmetric: 3/5/7 (defaults: causal=4, symmetric=5)\n"
+        "  canon_layers_kernel_size: 5  # symmetric Canon kernel size (allowed: 3/5/7, default: 5)\n"
         "  use_repo: false  # RePO: learned per-head positions replacing fixed RoPE (pure_torch only)\n"
         "  repo_after_n_layers: 3  # first N layers keep standard RoPE, layers after use RePO\n"
         "  use_mhc_lite: false  # mHC-lite: multi-stream residual with doubly stochastic mixing (pure_torch only)\n"
@@ -1041,11 +1020,32 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
     expected_keys = set(model_fields.keys())
     present_keys = set(config.keys())
 
+    if "canon_layer_type" in present_keys:
+        legacy_canon_layer_type = config.get("canon_layer_type")
+        if legacy_canon_layer_type is not None:
+            legacy_value = str(legacy_canon_layer_type).strip().lower()
+            if legacy_value == "causal":
+                raise ValueError(
+                    "model.canon_layer_type='causal' is no longer supported. "
+                    "Causal Canon layers were removed. Delete model.canon_layer_type "
+                    "and use the symmetric Canon layer (kernel sizes: 3/5/7)."
+                )
+            if legacy_value != "symmetric":
+                raise ValueError(
+                    f"model.canon_layer_type={legacy_canon_layer_type!r} is no longer supported. "
+                    "Delete model.canon_layer_type; Canon layers are now symmetric-only."
+                )
+        logger.warning(
+            "Ignoring deprecated model.canon_layer_type; Canon layers are now symmetric-only."
+        )
+
     extra = []
     kwargs: Dict[str, Any] = {}
 
     # Classify provided keys in one pass
     for key in present_keys:
+        if key == "canon_layer_type":
+            continue
         if key not in expected_keys:
             extra.append(key)
             continue
