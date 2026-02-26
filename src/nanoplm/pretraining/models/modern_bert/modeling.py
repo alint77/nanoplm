@@ -25,7 +25,7 @@ from . import mhc_triton_ops as _mhc_triton_ops  # noqa: F401
 _HAS_FLASH_VARLEN = False
 _flash_varlen_fn = None
 _FLASH_HAS_DROPOUT = False
-USE_ACTIVATION_CHECKPOINTING_CANON=False
+USE_ACTIVATION_CHECKPOINTING_CANON = False
 
 if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
     try:
@@ -435,13 +435,7 @@ class ModernBertCanonLayer(nn.Module):
         weight = self.conv.weight[:, 0, :]
         bias = self.conv.bias
 
-        if self.training and x.requires_grad and USE_ACTIVATION_CHECKPOINTING_CANON:
-            mixed = _checkpoint(
-                _varlen_canon_inner, x, seq_id, weight, bias, self.radius,
-                use_reentrant=False,
-            )
-        else:
-            mixed = _varlen_canon_inner(x, seq_id, weight, bias, self.radius)
+        mixed = _varlen_canon_inner(x, seq_id, weight, bias, self.radius)
         return x + mixed
 
     def _forward_padded(self, x, attention_mask=None):
@@ -471,15 +465,56 @@ class ModernBertCanonLayer(nn.Module):
         return out.to(dtype=x.dtype)
 
     def forward(self, x, position_ids=None, cu_seqlens=None, attention_mask=None):
+        # Checkpoint at the module boundary so all Canon insertion sites (A/B/C/D)
+        # and both varlen/padded paths are covered by the same flag.
+        use_ckpt = (
+            USE_ACTIVATION_CHECKPOINTING_CANON
+            and self.training
+            and torch.is_grad_enabled()
+            and x.requires_grad
+        )
+
         if cu_seqlens is not None:
+            if use_ckpt:
+                if position_ids is None:
+                    return _checkpoint(
+                        lambda x_, cu_: self._forward_varlen(
+                            x_, cu_seqlens=cu_, position_ids=None
+                        ),
+                        x,
+                        cu_seqlens,
+                        use_reentrant=False,
+                    )
+                return _checkpoint(
+                    lambda x_, cu_, pos_: self._forward_varlen(
+                        x_, cu_seqlens=cu_, position_ids=pos_
+                    ),
+                    x,
+                    cu_seqlens,
+                    position_ids,
+                    use_reentrant=False,
+                )
             return self._forward_varlen(x, cu_seqlens=cu_seqlens, position_ids=position_ids)
         if x.dim() == 3:
+            if use_ckpt:
+                if attention_mask is None:
+                    return _checkpoint(
+                        lambda x_: self._forward_padded(x_, attention_mask=None),
+                        x,
+                        use_reentrant=False,
+                    )
+                return _checkpoint(
+                    lambda x_, mask_: self._forward_padded(x_, attention_mask=mask_),
+                    x,
+                    attention_mask,
+                    use_reentrant=False,
+                )
             return self._forward_padded(x, attention_mask=attention_mask)
         raise ValueError(f"Expected padded input [B, S, C], got shape={tuple(x.shape)}")
 
 
 def _varlen_canon_inner(x, seq_id, weight, bias, radius):
-    """Depthwise conv with boundary masking (checkpointed to save memory)."""
+    """Depthwise conv with boundary masking for varlen Canon mixing."""
     acc_dtype = _canon_accum_dtype(x)
     x_acc = x.to(dtype=acc_dtype)
     weight_acc = weight.to(dtype=acc_dtype)

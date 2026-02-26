@@ -268,6 +268,10 @@ class PretrainingConfig:
     # (cu_seqlens/max_seqlen). This enables static-shape execution for torch.compile
     # (dynamic=False) and improves CUDA graph capture reuse.
     use_static_inp_size: bool = True
+    # If enabled, pure-torch compile uses mode='max-autotune-no-cudagraphs'.
+    # This may improve steady-state performance, but increases compile/autotune time
+    # noticeably at the start of a run.
+    use_compile_max_autotune: bool = False
 
     # Profiling (pure_torch / pure_te pipelines). When enabled on rank 0:
     # - If running under nsys: uses CUDA Profiler API (start/stop at steps) for .nsys-rep traces.

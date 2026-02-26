@@ -465,6 +465,12 @@ def pretrain():
     help="Number of residual streams for mHC-lite (uses n! permutation matrices)",
 )
 @click.option(
+    "--use-compile-max-autotune/--no-use-compile-max-autotune",
+    default=False,
+    help="Pure-torch only: compile with torch.compile(mode='max-autotune-no-cudagraphs'). "
+         "May improve throughput, but increases compile time significantly at run start.",
+)
+@click.option(
     "--pure-torch",
     is_flag=True,
     default=False,
@@ -514,6 +520,7 @@ def run(
     prefetch_factor: int,
     use_packing: bool,
     use_static_inp_size: bool,
+    use_compile_max_autotune: bool,
     bf16: bool,
     tf32: bool,
     fp8: bool,
@@ -584,6 +591,7 @@ def run(
         prefetch_factor=prefetch_factor,
         use_packing=use_packing,
         use_static_inp_size=use_static_inp_size,
+        use_compile_max_autotune=use_compile_max_autotune,
         bf16=bf16,
         tf32=tf32,
         fp8=fp8,
@@ -869,6 +877,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  prefetch_factor: 2\n"
         "  use_packing: true\n"
         "  use_static_inp_size: true\n"
+        "  use_compile_max_autotune: false  # pure_torch only: may improve throughput, but causes long compile/autotune time at run start\n"
         "  bf16: true\n"
         "  tf32: true\n"
         "  fp8: false\n"

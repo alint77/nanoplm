@@ -842,8 +842,21 @@ def run_pure_pretraining(
 
     # Keep orig_model reference for checkpointing/eval (eval changes shapes → recompilation)
     orig_model = model
-    model = torch.compile(model, dynamic=compile_dynamic)
-    logger.info(f"Model compiled with torch.compile(dynamic={compile_dynamic})")
+    compile_mode = (
+        "max-autotune-no-cudagraphs"
+        if getattr(pretrain_config, "use_compile_max_autotune", False)
+        else None
+    )
+    if compile_mode is None:
+        model = torch.compile(model, dynamic=compile_dynamic)
+        logger.info(f"Model compiled with torch.compile(dynamic={compile_dynamic})")
+    else:
+        model = torch.compile(model, dynamic=compile_dynamic, mode=compile_mode)
+        logger.info(
+            "Model compiled with torch.compile(dynamic=%s, mode=%s)",
+            compile_dynamic,
+            compile_mode,
+        )
 
     # ---- DataLoaders ----
     eval_collator = ProtDataCollatorForLM(
