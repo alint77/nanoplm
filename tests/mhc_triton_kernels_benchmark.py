@@ -89,22 +89,6 @@ def _bytes_model(T: int, n: int, C: int, D_out: int) -> dict[str, int]:
         + b(T * n * n, fp32)
         + b(T * n, fp32)
         + b(T * n * C, bf16),
-        "_fused_post_res_bwd_xlo_kernel_n4": b(T * n * n, fp32)
-        + b(T * n, fp32)
-        + b(T * n * C, bf16)
-        + b(T * C, bf16)
-        + b(T * n * C, bf16)
-        + b(T * C, bf16),
-        "_fused_post_res_bwd_Hhp_kernel": b(T * n * C, bf16)
-        + b(T * C, bf16)
-        + b(T * n * C, bf16)
-        + b(T * n * n, fp32)
-        + b(T * n, fp32),
-        "_fused_post_res_bwd_Hhp_kernel_tile": b(T * n * C, bf16)
-        + b(T * C, bf16)
-        + b(T * n * C, bf16)
-        + b(T * n * n, fp32)
-        + b(T * n, fp32),
         # Fused xlo+Hhp: grad_out read once (not twice), all other tensors same
         "_fused_post_res_bwd_fused_kernel_n4": b(T * n * C, bf16)  # grad_out (read once)
         + b(T * n * C, bf16)  # x_streams
@@ -350,92 +334,6 @@ def main() -> None:
     times = _time_cuda(run_k4_fwd, iters=args.iters, warmup=args.warmup)
     results.append(_summarize("_fused_post_res_fwd_kernel_n4", times, bytes_model["_fused_post_res_fwd_kernel_n4"], peak_gbps))
 
-    # ---- K4 bwd_xlo ----
-    grad_x = torch.empty_like(x_streams)
-    grad_lo = torch.empty((T, C), device=device, dtype=torch.bfloat16)
-
-    def run_k4_bwd_xlo():
-        k._fused_post_res_bwd_xlo_kernel_n4[grid_sms](
-            H,
-            h_post,
-            grad_out_post,
-            layer_output,
-            grad_x,
-            grad_lo,
-            T,
-            C,
-            n,
-            BLOCK_T=BLOCK_T4,
-            BLOCK_C=BLOCK_C4,
-            NUM_SMS=NUM_SMS,
-            num_warps=nw4,
-            num_stages=ns,
-        )
-
-    times = _time_cuda(run_k4_bwd_xlo, iters=args.iters, warmup=args.warmup)
-    results.append(_summarize("_fused_post_res_bwd_xlo_kernel_n4", times, bytes_model["_fused_post_res_bwd_xlo_kernel_n4"], peak_gbps))
-
-    # ---- K4 bwd_Hhp (persistent) ----
-    grad_H = torch.empty((T, n, n), device=device, dtype=torch.float32)
-    grad_hp = torch.empty((T, n), device=device, dtype=torch.float32)
-    BLOCK_TB = 64
-    if cc_major == 9:
-        BLOCK_CB = 128
-        ns_hhp = 2
-    else:
-        BLOCK_CB = min(256, _next_pow2(C))
-        ns_hhp = ns
-
-    def run_k4_bwd_hhp_persistent():
-        k._fused_post_res_bwd_Hhp_kernel[grid_sms](
-            x_streams,
-            layer_output,
-            grad_out_post,
-            grad_H,
-            grad_hp,
-            T,
-            C,
-            n,
-            BLOCK_T=BLOCK_TB,
-            BLOCK_C=BLOCK_CB,
-            NUM_SMS=NUM_SMS,
-            num_warps=nw_default,
-            num_stages=ns_hhp,
-        )
-
-    times = _time_cuda(run_k4_bwd_hhp_persistent, iters=args.iters, warmup=args.warmup)
-    results.append(_summarize("_fused_post_res_bwd_Hhp_kernel", times, bytes_model["_fused_post_res_bwd_Hhp_kernel"], peak_gbps))
-
-    # ---- K4 bwd_Hhp (tile) ----
-    if hasattr(k, "_fused_post_res_bwd_Hhp_kernel_tile"):
-        grid_tile = (triton.cdiv(T, BLOCK_TB),)
-
-        def run_k4_bwd_hhp_tile():
-            k._fused_post_res_bwd_Hhp_kernel_tile[grid_tile](
-                x_streams,
-                layer_output,
-                grad_out_post,
-                grad_H,
-                grad_hp,
-                T,
-                C,
-                n,
-                BLOCK_T=BLOCK_TB,
-                BLOCK_C=128,
-                num_warps=4,
-                num_stages=ns,
-            )
-
-        times = _time_cuda(run_k4_bwd_hhp_tile, iters=args.iters, warmup=args.warmup)
-        results.append(
-            _summarize(
-                "_fused_post_res_bwd_Hhp_kernel_tile",
-                times,
-                bytes_model["_fused_post_res_bwd_Hhp_kernel_tile"],
-                peak_gbps,
-            )
-        )
-
     # ---- K4 bwd_fused (xlo+Hhp combined) ----
     grad_x_fused = torch.empty_like(x_streams)
     grad_lo_fused = torch.empty((T, C), device=device, dtype=torch.bfloat16)
@@ -509,4 +407,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

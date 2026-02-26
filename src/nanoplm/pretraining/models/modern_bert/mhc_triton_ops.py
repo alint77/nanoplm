@@ -182,12 +182,16 @@ def _fused_pre_map_cuda(x_streams: torch.Tensor, h_pre: torch.Tensor):
     NUM_SMS, nw, ns = k._get_hw_config()
     cc_major, _ = torch.cuda.get_device_capability()
     if cc_major == 9:
+        # Tuned on H100 for shape T=65536, C=1024, n=4.
+        BLOCK_T = 128
         BLOCK_C = 128
-        ns_pre = 3
+        nw = 8
+        ns_pre = 4
     else:
+        # Original heuristic path for non-SM90 devices.
+        BLOCK_T = 64
         BLOCK_C = min(256, k.triton.next_power_of_2(C))
         ns_pre = ns
-    BLOCK_T = 64
     grid = (NUM_SMS,)
     k._fused_pre_map_fwd_kernel[grid](
         x_streams,
@@ -388,4 +392,3 @@ torch.library.register_autograd(
     _fused_post_res_backward,
     setup_context=_setup_save_inputs_outputs,
 )
-
