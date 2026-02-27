@@ -12,7 +12,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 import math
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -29,7 +29,7 @@ _FLASH_HAS_DROPOUT = False
 USE_ACTIVATION_CHECKPOINTING_CANON = True
 # mHC-lite selective recompute (paper-inspired):
 # checkpoint only mHC pre/post kernels, keep heavy layer function outside.
-USE_ACTIVATION_CHECKPOINTING_MHC = False
+USE_ACTIVATION_CHECKPOINTING_MHC = True
 
 if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
     try:
@@ -150,6 +150,7 @@ class ModernBertConfig:
     use_mhc_lite: bool = False
     mhc_n_streams: int = 4
     mhc_triton_fused: bool = False
+    mhc_lite_wrapping_level: Literal["layer", "sublayers"] = "layer"
 
     head_dim: int = field(init=False)
     sliding_window: int = field(init=False)
@@ -157,10 +158,21 @@ class ModernBertConfig:
     canon_layer_set: frozenset[str] = field(init=False)
 
     def __post_init__(self) -> None:
+        self.mhc_lite_wrapping_level = str(self.mhc_lite_wrapping_level).strip().lower()  # type: ignore[assignment]
         if self.hidden_size % self.num_attention_heads != 0:
             raise ValueError(
                 "hidden_size must be divisible by num_attention_heads: "
                 f"{self.hidden_size} vs {self.num_attention_heads}"
+            )
+        if self.mhc_lite_wrapping_level not in {"layer", "sublayers"}:
+            raise ValueError(
+                "mhc_lite_wrapping_level must be one of {'layer', 'sublayers'}, "
+                f"got {self.mhc_lite_wrapping_level!r}"
+            )
+        if not self.use_mhc_lite and self.mhc_lite_wrapping_level != "layer":
+            raise ValueError(
+                "mhc_lite_wrapping_level != 'layer' requires use_mhc_lite=true "
+                "(to avoid a silent no-op configuration)."
             )
         if self.use_mhc_lite and self.use_resid_lambdas:
             raise ValueError(
@@ -438,7 +450,6 @@ class ModernBertCanonLayer(nn.Module):
             seq_id = torch.searchsorted(cu_seqlens[1:], positions, right=True)
         weight = self.conv.weight[:, 0, :]
         bias = self.conv.bias
-
         mixed = _varlen_canon_inner(x, seq_id, weight, bias, self.radius)
         return x + mixed
 
@@ -946,6 +957,89 @@ class ModernBertEncoderLayer(nn.Module):
         return x
 
 
+class ModernBertAttnResidual(nn.Module):
+    """Attention residual branch: x -> x + attn(attn_norm(x))."""
+
+    def __init__(self, encoder: ModernBertEncoderLayer):
+        super().__init__()
+        # Store encoder without registering as a submodule (MHCLiteSublayersLayer owns it).
+        self.__dict__["_encoder"] = encoder
+        self.attention_type = encoder.attention_type
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        window_size: Optional[tuple[int, int]] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None,
+        repo_active: bool = False,
+        **_kwargs,
+    ) -> torch.Tensor:
+        enc: ModernBertEncoderLayer = self.__dict__["_encoder"]
+        attn_in = enc.attn_norm(x)
+        if enc.canon_a is not None:
+            attn_in = enc.canon_a(
+                attn_in,
+                position_ids=position_ids,
+                cu_seqlens=cu_seqlens,
+                attention_mask=token_mask,
+            )
+        return x + enc.attn(
+            attn_in,
+            cos_sin=cos_sin,
+            attn_mask=attn_mask,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            window_size=window_size,
+            position_ids=position_ids,
+            token_mask=token_mask,
+            repo_active=repo_active,
+        )
+
+
+class ModernBertMLPResidual(nn.Module):
+    """MLP residual branch: x -> x + mlp(mlp_norm(x))."""
+
+    def __init__(self, encoder: ModernBertEncoderLayer):
+        super().__init__()
+        # Store encoder without registering as a submodule (MHCLiteSublayersLayer owns it).
+        self.__dict__["_encoder"] = encoder
+        self.attention_type = encoder.attention_type
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        window_size: Optional[tuple[int, int]] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None,
+        repo_active: bool = False,
+        **_kwargs,
+    ) -> torch.Tensor:
+        enc: ModernBertEncoderLayer = self.__dict__["_encoder"]
+        mlp_in = enc.mlp_norm(x)
+        if enc.canon_c is not None:
+            mlp_in = enc.canon_c(
+                mlp_in,
+                position_ids=position_ids,
+                cu_seqlens=cu_seqlens,
+                attention_mask=token_mask,
+            )
+        return x + enc.mlp(
+            mlp_in,
+            position_ids=position_ids,
+            cu_seqlens=cu_seqlens,
+            attention_mask=token_mask,
+        )
+
+
 def _build_permutation_matrices(n: int) -> tuple[torch.Tensor, int]:
     """Pre-compute all n! permutation matrices (flattened) and identity index."""
     from itertools import permutations
@@ -1179,18 +1273,57 @@ class MHCLiteBlock(nn.Module):
         return self._forward_pytorch(x_streams, **kwargs)
 
 
+class MHCLiteSublayersLayer(nn.Module):
+    """Transformer layer with mHC-lite applied to attention and MLP sublayers separately."""
+
+    def __init__(self, config: ModernBertConfig, layer_idx: int):
+        super().__init__()
+        self.enc = ModernBertEncoderLayer(config, layer_idx)
+        self.mhc_attn = MHCLiteBlock(
+            config.mhc_n_streams,
+            config.hidden_size,
+            ModernBertAttnResidual(self.enc),
+            triton_fused=config.mhc_triton_fused,
+        )
+        self.mhc_mlp = MHCLiteBlock(
+            config.mhc_n_streams,
+            config.hidden_size,
+            ModernBertMLPResidual(self.enc),
+            triton_fused=config.mhc_triton_fused,
+        )
+
+    @property
+    def attention_type(self):
+        return self.enc.attention_type
+
+    def forward(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
+        x_streams = self.mhc_attn(x_streams, **kwargs)
+        x_streams = self.mhc_mlp(x_streams, **kwargs)
+        return x_streams
+
+
 class ModernBertModel(nn.Module):
     def __init__(self, config: ModernBertConfig):
         super().__init__()
         self.config = config
         self.embeddings = ModernBertEmbeddings(config)
         if config.use_mhc_lite:
-            self.layers = nn.ModuleList([
-                MHCLiteBlock(config.mhc_n_streams, config.hidden_size,
-                             ModernBertEncoderLayer(config, i),
-                             triton_fused=config.mhc_triton_fused)
-                for i in range(config.num_hidden_layers)
-            ])
+            if config.mhc_lite_wrapping_level == "layer":
+                self.layers = nn.ModuleList(
+                    [
+                        MHCLiteBlock(
+                            config.mhc_n_streams,
+                            config.hidden_size,
+                            ModernBertEncoderLayer(config, i),
+                            triton_fused=config.mhc_triton_fused,
+                        )
+                        for i in range(config.num_hidden_layers)
+                    ]
+                )
+            else:
+                self.layers = nn.ModuleList(
+                    [MHCLiteSublayersLayer(config, i) for i in range(config.num_hidden_layers)]
+                )
         else:
             self.layers = nn.ModuleList(
                 [ModernBertEncoderLayer(config, i) for i in range(config.num_hidden_layers)]
@@ -1395,7 +1528,15 @@ class ModernBertForMaskedLM(nn.Module):
                     nn.init.zeros_(module.bias)
 
         for layer in self.model.layers:
-            enc = layer.layer if isinstance(layer, MHCLiteBlock) else layer
+            if isinstance(layer, MHCLiteBlock):
+                enc = layer.layer
+                mhc_blocks = [layer]
+            elif isinstance(layer, MHCLiteSublayersLayer):
+                enc = layer.enc
+                mhc_blocks = [layer.mhc_attn, layer.mhc_mlp]
+            else:
+                enc = layer
+                mhc_blocks = []
             nn.init.uniform_(enc.attn.Wqkv.weight, -bound, bound)
             nn.init.zeros_(enc.attn.Wo.weight)
             nn.init.uniform_(enc.mlp.Wi.weight, -bound, bound)
@@ -1422,11 +1563,10 @@ class ModernBertForMaskedLM(nn.Module):
                 nn.init.zeros_(enc.attn.repo.W_z.weight)
 
             # mHC-lite: zero-init fused projection, set biases for identity behavior
-            if isinstance(layer, MHCLiteBlock):
-                nn.init.zeros_(layer.W_all.weight)
-                n_s = layer.n
-                n_f = layer.n_fact
-                bias = layer.W_all.bias.data
+            def _init_mhc_block(block: MHCLiteBlock) -> None:
+                nn.init.zeros_(block.W_all.weight)
+                n_s = block.n
+                bias = block.W_all.bias.data
                 # pre bias: first n values
                 bias[:n_s].fill_(-1.0)
                 bias[0] = 1.0
@@ -1435,10 +1575,13 @@ class ModernBertForMaskedLM(nn.Module):
                 bias[n_s] = 1.0
                 # res bias: last n! values
                 bias[2 * n_s:].fill_(-8.0)
-                bias[2 * n_s + layer._identity_idx] = 0.0
-                layer.alpha_pre.fill_(0.01)
-                layer.alpha_post.fill_(0.01)
-                layer.alpha_res.fill_(0.01)
+                bias[2 * n_s + block._identity_idx] = 0.0
+                block.alpha_pre.fill_(0.01)
+                block.alpha_post.fill_(0.01)
+                block.alpha_res.fill_(0.01)
+
+            for block in mhc_blocks:
+                _init_mhc_block(block)
 
         nn.init.uniform_(self.head.dense.weight, -bound, bound)
         if self.head.dense.bias is not None:

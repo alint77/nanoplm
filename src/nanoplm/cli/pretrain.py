@@ -465,6 +465,14 @@ def pretrain():
     help="Number of residual streams for mHC-lite (uses n! permutation matrices)",
 )
 @click.option(
+    "--mhc-lite-wrapping-level",
+    type=click.Choice(["layer", "sublayers"], case_sensitive=False),
+    default="layer",
+    show_default=True,
+    help="mHC-lite wrapping level (pure-torch only): 'layer' wraps the full transformer layer; "
+         "'sublayers' wraps attention and MLP residual branches separately.",
+)
+@click.option(
     "--use-compile-max-autotune/--no-use-compile-max-autotune",
     default=False,
     help="Pure-torch only: compile with torch.compile(mode='max-autotune-no-cudagraphs'). "
@@ -549,6 +557,7 @@ def run(
     repo_after_n_layers: int,
     use_mhc_lite: bool,
     mhc_n_streams: int,
+    mhc_lite_wrapping_level: str,
     pure_torch: bool,
     pure_te: bool,
 ):
@@ -607,6 +616,11 @@ def run(
             "use_canon_layers requires --pure-torch. "
             "Canon layers are not implemented in HF/TE paths."
         )
+    if (use_mhc_lite or mhc_lite_wrapping_level.lower() != "layer") and not pure_torch:
+        raise click.ClickException(
+            "mHC-lite is only supported in the pure-torch pipeline. "
+            "Set --pure-torch (or disable mHC-lite settings)."
+        )
     if use_mhc_lite and use_resid_lambdas:
         raise click.ClickException(
             "use_mhc_lite and use_resid_lambdas are mutually exclusive. "
@@ -638,6 +652,7 @@ def run(
         repo_after_n_layers=repo_after_n_layers,
         use_mhc_lite=use_mhc_lite,
         mhc_n_streams=mhc_n_streams,
+        mhc_lite_wrapping_level=mhc_lite_wrapping_level.lower(),
     )
 
     _set_seed_for_init(seed)
@@ -729,6 +744,15 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
         raise click.ClickException(
             "model.use_canon_layers=true requires pure_torch: true (or --pure-torch). "
             "Canon layers are not implemented in HF/TE paths."
+        )
+    if (
+        model_config.use_mhc_lite
+        or str(getattr(model_config, "mhc_lite_wrapping_level", "layer")).lower() != "layer"
+    ) and not pure_torch:
+        raise click.ClickException(
+            "model.use_mhc_lite=true (or model.mhc_lite_wrapping_level != 'layer') "
+            "requires pure_torch: true (or --pure-torch). "
+            "mHC-lite is not implemented in HF/TE paths."
         )
     if model_config.use_mhc_lite and model_config.use_resid_lambdas:
         raise click.ClickException(
@@ -828,7 +852,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  attention_bias: false\n"
         "  attention_dropout: 0.0\n"
         "  classifier_activation: \"gelu\"\n"
-        "  # The options below only work on pure-torch and TE pipelines\n"
+        "  # The options below only work on pure-torch and TE pipelines unless noted\n"
         "  use_resid_lambdas: false  # scales residual stream per layer (not compatible with use_mhc_lite)\n"
         "  use_x0_lambdas: false  # blends initial embedding x0 per layer\n"
         "  use_qk_norm: false  # applies RMS norm to Q/K in attention\n"
@@ -839,6 +863,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  repo_after_n_layers: 3  # first N layers keep standard RoPE, layers after use RePO\n"
         "  use_mhc_lite: false  # mHC-lite: multi-stream residual with doubly stochastic mixing (pure_torch only)\n"
         "  mhc_n_streams: 4  # number of residual streams for mHC-lite (n! permutation matrices)\n"
+        "  mhc_lite_wrapping_level: \"layer\"  # mHC-lite wrapping: 'layer' or 'sublayers' (pure_torch only)\n"
         "  mhc_triton_fused: true  # use fused Triton kernels for mHC-lite stream ops; first run will start slow due to Triton autotune\n"
         "\n"
         "pretraining:\n"

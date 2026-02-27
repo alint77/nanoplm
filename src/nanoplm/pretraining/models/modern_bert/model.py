@@ -52,6 +52,7 @@ class ProtModernBertMLMConfig:
     use_mhc_lite: bool = False
     mhc_n_streams: int = 4
     mhc_triton_fused: bool = False
+    mhc_lite_wrapping_level: str = "layer"
 
 
 class ProtModernBertMLM(ModernBertForMaskedLM):

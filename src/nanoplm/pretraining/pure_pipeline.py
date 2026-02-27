@@ -321,7 +321,41 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
             # after first MLP projection, C = 2*ff (gated MLPs only)
             canon_flops += n_layers * 2 * K * 2 * ff
 
-    forward_flops = attn_proj_flops + attn_flops + mlp_flops + head_flops + pred_head_flops + canon_flops
+    # -- mHC-lite FLOPs (multi-stream residual wrapper) --
+    # MHCLiteBlock does *not* run attention/MLP per stream; it merges streams into a
+    # single layer_input, runs the wrapped submodule once, then mixes streams.
+    #
+    # We count the dominant matmuls per MHCLiteBlock:
+    #  - fused coefficient projection: (n*h) -> (2n + n!)  => 2 * (n*h) * (2n + n!)
+    #  - permutation mix: (n!) @ (n*n)                    => 2 * (n!) * n * n
+    #  - pre-map: (1,n) @ (n,h)                           => 2 * n * h
+    #  - post-res: (n,n) @ (n,h)                          => 2 * n * n * h
+    # Elementwise ops (sigmoid/softmax, H_merged arithmetic, h_post scaling) are
+    # ignored elsewhere in this estimator, so we ignore them here too.
+    mhc_flops = 0
+    if getattr(config, "use_mhc_lite", False):
+        n = int(getattr(config, "mhc_n_streams", 4))
+        level = str(getattr(config, "mhc_lite_wrapping_level", "layer")).strip().lower()
+        blocks_per_layer = 2 if level == "sublayers" else 1
+        n_fact = math.factorial(n)
+        total_out = 2 * n + n_fact
+        proj_flops = 2 * (n * h) * total_out
+        perm_mix_flops = 2 * n_fact * n * n
+        pre_map_flops = 2 * n * h
+        post_res_flops = 2 * n * n * h
+        mhc_flops = n_layers * blocks_per_layer * (
+            proj_flops + perm_mix_flops + pre_map_flops + post_res_flops
+        )
+
+    forward_flops = (
+        attn_proj_flops
+        + attn_flops
+        + mlp_flops
+        + head_flops
+        + pred_head_flops
+        + canon_flops
+        + mhc_flops
+    )
     return 3 * forward_flops
 
 

@@ -70,6 +70,7 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             use_mhc_lite=config.use_mhc_lite,
             mhc_n_streams=config.mhc_n_streams,
             mhc_triton_fused=config.mhc_triton_fused,
+            mhc_lite_wrapping_level=str(config.mhc_lite_wrapping_level).strip().lower(),
         )
 
         super().__init__(mb_config)
@@ -119,6 +120,7 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             use_mhc_lite=config.use_mhc_lite,
             mhc_n_streams=config.mhc_n_streams,
             mhc_triton_fused=config.mhc_triton_fused,
+            mhc_lite_wrapping_level=str(config.mhc_lite_wrapping_level).strip().lower(),
         )
 
         super().__init__(mb_config)
