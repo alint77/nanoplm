@@ -106,9 +106,17 @@ def _fused_rmsnorm_project_cuda(x_flat: torch.Tensor, W: torch.Tensor):
     out = torch.empty((T, D_out), device=x_flat.device, dtype=x_flat.dtype)
     inv_rms = torch.empty((T,), device=x_flat.device, dtype=torch.float32)
 
-    BLOCK_K = min(128, k.triton.next_power_of_2(nC))
-    BLOCK_T = 128
+    cc_major, _ = torch.cuda.get_device_capability()
     _, nw, ns = k._get_hw_config()
+    if cc_major >= 12:
+        # Tuned on RTX 5090 (SM120), T=65536/C=1024/n=4.
+        BLOCK_T = 128
+        BLOCK_K = 64
+        nw = 4
+        ns = 3
+    else:
+        BLOCK_K = min(128, k.triton.next_power_of_2(nC))
+        BLOCK_T = 128
     grid = (k.triton.cdiv(T, BLOCK_T),)
     k._fused_rmsnorm_project_fwd_kernel[grid](
         x_flat,
@@ -140,15 +148,21 @@ def _fused_rmsnorm_project_bwd_dx_cuda(
     D_out = W.shape[0]
     grad_out = grad_out.contiguous()
 
-    BLOCK_K = min(128, k.triton.next_power_of_2(nC))
     _, nw, ns = k._get_hw_config()
 
     cc_major, _ = torch.cuda.get_device_capability()
-    if cc_major == 9:
+    if cc_major >= 12:
         BLOCK_T = 64
+        BLOCK_K = 128
+        nw = 8
+        ns_bwd = 3
+    elif cc_major == 9:
+        BLOCK_T = 64
+        BLOCK_K = min(128, k.triton.next_power_of_2(nC))
         ns_bwd = ns
     else:
         BLOCK_T = 128
+        BLOCK_K = min(128, k.triton.next_power_of_2(nC))
         ns_bwd = ns
 
     grad_x = torch.empty_like(x_flat)
@@ -181,7 +195,13 @@ def _fused_pre_map_cuda(x_streams: torch.Tensor, h_pre: torch.Tensor):
     out = torch.empty((T, C), device=x_streams.device, dtype=x_streams.dtype)
     NUM_SMS, nw, ns = k._get_hw_config()
     cc_major, _ = torch.cuda.get_device_capability()
-    if cc_major == 9:
+    if cc_major >= 12:
+        # Tuned on RTX 5090 (SM120), T=65536/C=1024/n=4.
+        BLOCK_T = 128
+        BLOCK_C = 64
+        nw = 4
+        ns_pre = 2
+    elif cc_major == 9:
         # Tuned on H100 for shape T=65536, C=1024, n=4.
         BLOCK_T = 128
         BLOCK_C = 128
@@ -220,8 +240,26 @@ def _fused_pre_map_backward_cuda(
         raise ValueError("nanoplm_mhc::fused_pre_map_backward supports n=4 only")
     grad_out = grad_out.contiguous()
     NUM_SMS, nw, ns = k._get_hw_config()
-    BLOCK_T = 64
-    BLOCK_C = min(256, k.triton.next_power_of_2(C))
+    cc_major, _ = torch.cuda.get_device_capability()
+    if cc_major >= 12:
+        # Tuned on RTX 5090 (SM120), T=65536/C=1024/n=4.
+        BLOCK_T_DX = 64
+        BLOCK_C_DX = 256
+        nw_dx = 4
+        ns_dx = 4
+        BLOCK_T_HPRE = 32
+        BLOCK_C_HPRE = 128
+        nw_hpre = 8
+        ns_hpre = 4
+    else:
+        BLOCK_T_DX = 64
+        BLOCK_C_DX = min(256, k.triton.next_power_of_2(C))
+        nw_dx = nw
+        ns_dx = ns
+        BLOCK_T_HPRE = BLOCK_T_DX
+        BLOCK_C_HPRE = BLOCK_C_DX
+        nw_hpre = nw
+        ns_hpre = ns
     grid = (NUM_SMS,)
 
     grad_x = torch.empty_like(x_streams)
@@ -232,11 +270,11 @@ def _fused_pre_map_backward_cuda(
         T,
         C,
         n,
-        BLOCK_T=BLOCK_T,
-        BLOCK_C=BLOCK_C,
+        BLOCK_T=BLOCK_T_DX,
+        BLOCK_C=BLOCK_C_DX,
         NUM_SMS=NUM_SMS,
-        num_warps=nw,
-        num_stages=ns,
+        num_warps=nw_dx,
+        num_stages=ns_dx,
     )
 
     grad_h_pre = torch.empty((T, n), device=x_streams.device, dtype=torch.float32)
@@ -247,11 +285,11 @@ def _fused_pre_map_backward_cuda(
         T,
         C,
         n,
-        BLOCK_T=BLOCK_T,
-        BLOCK_C=BLOCK_C,
+        BLOCK_T=BLOCK_T_HPRE,
+        BLOCK_C=BLOCK_C_HPRE,
         NUM_SMS=NUM_SMS,
-        num_warps=nw,
-        num_stages=ns,
+        num_warps=nw_hpre,
+        num_stages=ns_hpre,
     )
     return grad_x, grad_h_pre
 
@@ -271,9 +309,16 @@ def _fused_post_res_cuda(
     out = torch.empty_like(x_streams)
     NUM_SMS, nw_default, ns = k._get_hw_config()
     cc_major, _ = torch.cuda.get_device_capability()
-    BLOCK_T = 64 if cc_major >= 9 else 32
-    BLOCK_C = 128 if C >= 128 else k.triton.next_power_of_2(C)
-    nw = 8 if cc_major >= 9 else nw_default
+    if cc_major >= 12:
+        # Tuned on RTX 5090 (SM120), T=65536/C=1024/n=4.
+        BLOCK_T = 32
+        BLOCK_C = 128
+        nw = 8
+        ns = 3
+    else:
+        BLOCK_T = 64 if cc_major >= 9 else 32
+        BLOCK_C = 128 if C >= 128 else k.triton.next_power_of_2(C)
+        nw = 8 if cc_major >= 9 else nw_default
     grid = (NUM_SMS,)
     k._fused_post_res_fwd_kernel_n4[grid](
         x_streams,
@@ -316,13 +361,21 @@ def _fused_post_res_backward_cuda(
     grad_H = torch.empty((T, n, n), device=x_streams.device, dtype=torch.float32)
     grad_hp = torch.empty((T, n), device=x_streams.device, dtype=torch.float32)
 
-    if cc_major == 9:
+    if cc_major >= 12:
+        # Tuned on RTX 5090 (SM120), T=65536/C=1024/n=4.
+        BLOCK_T_F = 16
+        BLOCK_C_F = 256
+        nw_fused = 8
+        ns_fused = 4
+    elif cc_major == 9:
         BLOCK_T_F = 32
         BLOCK_C_F = 128
+        nw_fused = nw_default
         ns_fused = 2
     else:
         BLOCK_T_F = 32
         BLOCK_C_F = min(256, k.triton.next_power_of_2(C))
+        nw_fused = nw_default
         ns_fused = ns
     k._fused_post_res_bwd_fused_kernel_n4[grid](
         x_streams,
@@ -340,7 +393,7 @@ def _fused_post_res_backward_cuda(
         BLOCK_T=BLOCK_T_F,
         BLOCK_C=BLOCK_C_F,
         NUM_SMS=NUM_SMS,
-        num_warps=nw_default,
+        num_warps=nw_fused,
         num_stages=ns_fused,
     )
 
