@@ -105,6 +105,27 @@ Intended usage:
 2. Copy best configs into launcher logic in `mhc_triton_ops.py`.
 3. Keep runtime path simple (no online autotune during training).
 
+## Runtime Triton autotune (capped search space)
+
+The runtime mHC custom-op path now supports Triton autotune launch wrappers for:
+- K1 fwd / K1 bwd_dx
+- K3 fwd / K3 bwd_dx / K3 bwd_hpre
+- K4 fwd / K4 bwd_fused
+
+Each kernel's autotune candidate set is capped at **32 configs max** to keep first-run tuning latency bounded.
+
+Behavior:
+- Default: autotune enabled (`NANOPLM_MHC_TRITON_AUTOTUNE=1`)
+- Fallback to legacy hardcoded launch params: `NANOPLM_MHC_TRITON_AUTOTUNE=0`
+- Runtime autotune wrappers enable Triton disk caching (`cache_results=True`), so first-run tuning is reused on later runs for matching keys.
+- Cache location follows Triton defaults (`TRITON_CACHE_DIR`, usually `~/.triton/cache`).
+- Runtime prints one-time status lines for new shape keys so first-run autotune does not look like a hang (`NANOPLM_MHC_TRITON_AUTOTUNE_STATUS=1`, set to `0` to silence).
+- During `model.eval()`, mHC Triton path temporarily disables autotune to avoid eval-time warmup/tuning latency.
+
+Implementation:
+- Autotuned wrappers: `src/nanoplm/pretraining/models/modern_bert/mhc_triton_kernels.py`
+- Runtime dispatch toggle: `src/nanoplm/pretraining/models/modern_bert/mhc_triton_ops.py`
+
 ## Benchmarking before/after hardcoding
 
 Microbenchmark script:

@@ -9,6 +9,7 @@ The model is intentionally small and readable:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import math
 from dataclasses import dataclass, field
 from typing import Optional
@@ -25,7 +26,10 @@ from . import mhc_triton_ops as _mhc_triton_ops  # noqa: F401
 _HAS_FLASH_VARLEN = False
 _flash_varlen_fn = None
 _FLASH_HAS_DROPOUT = False
-USE_ACTIVATION_CHECKPOINTING_CANON = False
+USE_ACTIVATION_CHECKPOINTING_CANON = True
+# mHC-lite selective recompute (paper-inspired):
+# checkpoint only mHC pre/post kernels, keep heavy layer function outside.
+USE_ACTIVATION_CHECKPOINTING_MHC = False
 
 if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
     try:
@@ -993,8 +997,10 @@ class MHCLiteBlock(nn.Module):
     def attention_type(self):
         return self.layer.attention_type
 
-    def _forward_pytorch(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
-        """Pure PyTorch forward path (always correct, works everywhere)."""
+    def _mhc_coeffs_pytorch(
+        self, x_streams: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute h_pre/h_post/H_merged (PyTorch path)."""
         n = self.n
         dt = x_streams.dtype
 
@@ -1017,27 +1023,66 @@ class MHCLiteBlock(nn.Module):
 
         H_res = torch.matmul(a_res, self.perm_mat.to(dt)).unflatten(-1, (n, n))
         H_merged = H_res - h_post.unsqueeze(-1) * h_pre.unsqueeze(-2)
+        return h_pre, h_post, H_merged
 
+    def _mhc_pre_map_pytorch(
+        self, x_streams: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pre-map bundle: layer_input + coefficients for post-res."""
+        h_pre, h_post, H_merged = self._mhc_coeffs_pytorch(x_streams)
         layer_input = torch.matmul(h_pre.unsqueeze(-2), x_streams).squeeze(-2)
-        layer_output = self.layer(layer_input, **kwargs)
+        return layer_input, H_merged, h_post
 
+    def _mhc_post_res_pytorch(
+        self,
+        x_streams: torch.Tensor,
+        layer_output: torch.Tensor,
+        H_merged: torch.Tensor,
+        h_post: torch.Tensor,
+    ) -> torch.Tensor:
         return (
             torch.matmul(H_merged, x_streams)
             + h_post.unsqueeze(-1) * layer_output.unsqueeze(-2)
         )
 
-    def _forward_triton(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
-        """Triton-fused forward path. Requires (T, n, C) bf16 on CUDA.
+    def _forward_pytorch(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
+        """Pure PyTorch forward path (always correct, works everywhere)."""
+        use_ckpt = (
+            USE_ACTIVATION_CHECKPOINTING_MHC
+            and self.training
+            and torch.is_grad_enabled()
+            and x_streams.requires_grad
+        )
 
-        Uses Triton for the memory-heavy stream operations (K3: pre-map,
-        K4: post-res) and PyTorch for the coefficient computation (tiny ops).
-        """
+        if use_ckpt:
+            layer_input, H_merged, h_post = _checkpoint(
+                lambda x_: self._mhc_pre_map_pytorch(x_),
+                x_streams,
+                use_reentrant=False,
+            )
+        else:
+            layer_input, H_merged, h_post = self._mhc_pre_map_pytorch(x_streams)
+        layer_output = self.layer(layer_input, **kwargs)
+
+        if use_ckpt:
+            return _checkpoint(
+                lambda x_, lo_, H_, hp_: self._mhc_post_res_pytorch(x_, lo_, H_, hp_),
+                x_streams,
+                layer_output,
+                H_merged,
+                h_post,
+                use_reentrant=False,
+            )
+        return self._mhc_post_res_pytorch(x_streams, layer_output, H_merged, h_post)
+
+    def _mhc_coeffs_triton(
+        self, x_streams: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute h_pre/h_post/H_merged using fused K1 + PyTorch tiny ops."""
         n = self.n
         T = x_streams.shape[0]
         dt = x_streams.dtype
 
-        # K1: Fused RMSNorm + projection
-        # This replaces: x_norm = F.rms_norm(x_flat); all_proj = F.linear(x_norm, W_all)
         x_flat = x_streams.reshape(T, self.nC)
         all_proj, _inv_rms = torch.ops.nanoplm_mhc.fused_rmsnorm_project(
             x_flat, self.W_all.weight.to(dt)
@@ -1054,17 +1099,70 @@ class MHCLiteBlock(nn.Module):
 
         H_res = torch.matmul(a_res, self.perm_mat.to(dt)).unflatten(-1, (n, n))
         H_merged = H_res - h_post.unsqueeze(-1) * h_pre.unsqueeze(-2)
+        return h_pre, h_post, H_merged
 
-        # K3: Triton fused pre-map (weighted stream aggregation)
+    def _mhc_pre_map_triton(
+        self, x_streams: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pre-map bundle for Triton path: layer_input + post-res coefficients."""
+        h_pre, h_post, H_merged = self._mhc_coeffs_triton(x_streams)
         layer_input = torch.ops.nanoplm_mhc.fused_pre_map(x_streams, h_pre.float())
+        return layer_input, H_merged.float(), h_post.float()
 
-        # Transformer layer
-        layer_output = self.layer(layer_input, **kwargs)
-
-        # K4: Triton fused post-res (H_merged @ x + h_post * layer_output)
+    def _mhc_post_res_triton(
+        self,
+        x_streams: torch.Tensor,
+        layer_output: torch.Tensor,
+        H_merged: torch.Tensor,
+        h_post: torch.Tensor,
+    ) -> torch.Tensor:
         return torch.ops.nanoplm_mhc.fused_post_res(
-            x_streams, layer_output, H_merged.float(), h_post.float()
+            x_streams, layer_output, H_merged, h_post
         )
+
+    def _forward_triton(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
+        """Triton-fused forward path. Requires (T, n, C) bf16 on CUDA.
+
+        Uses Triton for the memory-heavy stream operations (K3: pre-map,
+        K4: post-res) and PyTorch for the coefficient computation (tiny ops).
+        """
+        use_ckpt = (
+            USE_ACTIVATION_CHECKPOINTING_MHC
+            and self.training
+            and torch.is_grad_enabled()
+            and x_streams.requires_grad
+        )
+        # Eval/inference should avoid autotune warmup latency.
+        autotune_ctx = (
+            nullcontext()
+            if self.training
+            else _mhc_triton_ops.disable_autotune_temporarily()
+        )
+
+        with autotune_ctx:
+            if use_ckpt:
+                layer_input, H_merged, h_post = _checkpoint(
+                    lambda x_: self._mhc_pre_map_triton(x_),
+                    x_streams,
+                    use_reentrant=False,
+                )
+            else:
+                layer_input, H_merged, h_post = self._mhc_pre_map_triton(x_streams)
+
+            # Transformer layer
+            layer_output = self.layer(layer_input, **kwargs)
+
+            # K4: Triton fused post-res (H_merged @ x + h_post * layer_output)
+            if use_ckpt:
+                return _checkpoint(
+                    lambda x_, lo_, H_, hp_: self._mhc_post_res_triton(x_, lo_, H_, hp_),
+                    x_streams,
+                    layer_output,
+                    H_merged,
+                    h_post,
+                    use_reentrant=False,
+                )
+            return self._mhc_post_res_triton(x_streams, layer_output, H_merged, h_post)
 
     def forward(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
         """x_streams: (..., n, C).  Returns (..., n, C)."""

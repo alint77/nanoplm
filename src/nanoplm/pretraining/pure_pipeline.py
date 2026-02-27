@@ -67,7 +67,7 @@ torch.backends.cudnn.allow_tf32 = True
 H100_PEAK_TFLOPS = 989.4
 
 # https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html#forward-backward-with-prefetching
-N_PREFETCH_LAYERS_FSDP2 = 1
+N_PREFETCH_LAYERS_FSDP2 = 2
 
 
 # ---------------------------------------------------------------------------

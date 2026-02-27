@@ -839,7 +839,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  repo_after_n_layers: 3  # first N layers keep standard RoPE, layers after use RePO\n"
         "  use_mhc_lite: false  # mHC-lite: multi-stream residual with doubly stochastic mixing (pure_torch only)\n"
         "  mhc_n_streams: 4  # number of residual streams for mHC-lite (n! permutation matrices)\n"
-        "  mhc_triton_fused: true  # use fused Triton kernels for mHC-lite stream operations\n"
+        "  mhc_triton_fused: true  # use fused Triton kernels for mHC-lite stream ops; first run will start slow due to Triton autotune\n"
         "\n"
         "pretraining:\n"
         "  dataset_dir: \"output/data/pretrain_data\"\n"
