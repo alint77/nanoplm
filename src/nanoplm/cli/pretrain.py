@@ -392,6 +392,11 @@ def pretrain():
     help="Use MLP bias"
 )
 @click.option(
+    "--no-mlp-on-first-layer/--mlp-on-first-layer",
+    default=True,
+    help="Disable the MLP branch in encoder layer 0",
+)
+@click.option(
     "--attention-bias",
     is_flag=True,
     default=False,
@@ -544,6 +549,7 @@ def run(
     mlp_activation: str,
     mlp_dropout: float,
     mlp_bias: bool,
+    no_mlp_on_first_layer: bool,
     attention_bias: bool,
     attention_dropout: float,
     classifier_activation: str,
@@ -639,6 +645,7 @@ def run(
         mlp_activation=mlp_activation,
         mlp_dropout=mlp_dropout,
         mlp_bias=mlp_bias,
+        no_mlp_on_first_layer=no_mlp_on_first_layer,
         attention_bias=attention_bias,
         attention_dropout=attention_dropout,
         classifier_activation=classifier_activation,
@@ -849,6 +856,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  mlp_activation: \"swiglu\"\n"
         "  mlp_dropout: 0.0\n"
         "  mlp_bias: false\n"
+        "  no_mlp_on_first_layer: true\n"
         "  attention_bias: false\n"
         "  attention_dropout: 0.0\n"
         "  classifier_activation: \"gelu\"\n"

@@ -26,6 +26,12 @@ class ModernBertMLPSwiGLU(nn.Module):
         x, gate = self.Wi(hidden_states).chunk(2, dim=-1)
         return self.Wo(self.drop(self.act(x, gate)))
 
+
+class ModernBertNoOpMLP(nn.Module):
+    def forward(self, hidden_states):
+        return hidden_states.new_zeros(hidden_states.shape)
+
+
 @dataclass
 class ProtModernBertMLMConfig:
     hidden_size: int
@@ -36,6 +42,7 @@ class ProtModernBertMLMConfig:
     mlp_activation: str = "swiglu"
     mlp_dropout: float = 0.0
     mlp_bias: bool = False
+    no_mlp_on_first_layer: bool = True
     attention_bias: bool = False
     attention_dropout: float = 0.0
     classifier_activation: str = "gelu"
@@ -103,3 +110,8 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
         if config.mlp_activation.lower() == "swiglu":
             for layer in self.model.layers:
                 layer.mlp = ModernBertMLPSwiGLU(self.config)
+        if config.no_mlp_on_first_layer and len(self.model.layers) > 0:
+            first_layer = self.model.layers[0]
+            if hasattr(first_layer, "mlp_norm"):
+                first_layer.mlp_norm = nn.Identity()
+            first_layer.mlp = ModernBertNoOpMLP()

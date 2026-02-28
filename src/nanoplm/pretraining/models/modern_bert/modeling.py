@@ -22,14 +22,13 @@ from torch.utils.checkpoint import checkpoint as _checkpoint
 # Registers torch.ops.nanoplm_mhc::* used by MHCLiteBlock's Triton path.
 from . import mhc_triton_ops as _mhc_triton_ops  # noqa: F401
 
-
 _HAS_FLASH_VARLEN = False
 _flash_varlen_fn = None
 _FLASH_HAS_DROPOUT = False
 USE_ACTIVATION_CHECKPOINTING_CANON = True
 # mHC-lite selective recompute (paper-inspired):
 # checkpoint only mHC pre/post kernels, keep heavy layer function outside.
-USE_ACTIVATION_CHECKPOINTING_MHC = True
+USE_ACTIVATION_CHECKPOINTING_MHC = False
 
 if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
     try:
@@ -129,6 +128,7 @@ class ModernBertConfig:
     embedding_dropout: float = 0.0
     mlp_bias: bool = False
     mlp_dropout: float = 0.0
+    no_mlp_on_first_layer: bool = True
     decoder_bias: bool = True
     classifier_bias: bool = False
     classifier_activation: str = "gelu"
@@ -885,6 +885,7 @@ class ModernBertEncoderLayer(nn.Module):
     def __init__(self, config: ModernBertConfig, layer_idx: int):
         super().__init__()
         self.attention_type = config.layer_types[layer_idx]
+        self.has_mlp = (layer_idx != 0) or (not config.no_mlp_on_first_layer)
         self.attn_norm = (
             nn.Identity()
             if layer_idx == 0
@@ -896,18 +897,23 @@ class ModernBertEncoderLayer(nn.Module):
             else None
         )
         self.attn = ModernBertAttention(config, layer_idx=layer_idx)
-        self.mlp_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
-        self.canon_c = (
-            _make_canon_layer(config.hidden_size, config)
-            if "c" in config.canon_layer_set
-            else None
-        )
-        if config.mlp_activation == "srelu":
-            self.mlp = ModernBertSReluMLP(config)
-        elif config.mlp_activation == "swiglu":
-            self.mlp = ModernBertSwiGLUMLP(config)
+        if self.has_mlp:
+            self.mlp_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+            self.canon_c = (
+                _make_canon_layer(config.hidden_size, config)
+                if "c" in config.canon_layer_set
+                else None
+            )
+            if config.mlp_activation == "srelu":
+                self.mlp = ModernBertSReluMLP(config)
+            elif config.mlp_activation == "swiglu":
+                self.mlp = ModernBertSwiGLUMLP(config)
+            else:
+                self.mlp = ModernBertMLP(config)
         else:
-            self.mlp = ModernBertMLP(config)
+            self.mlp_norm = nn.Identity()
+            self.canon_c = None
+            self.mlp = None
 
     def forward(
         self,
@@ -940,20 +946,21 @@ class ModernBertEncoderLayer(nn.Module):
             token_mask=token_mask,
             repo_active=repo_active,
         )
-        mlp_in = self.mlp_norm(x)
-        if self.canon_c is not None:
-            mlp_in = self.canon_c(
+        if self.mlp is not None:
+            mlp_in = self.mlp_norm(x)
+            if self.canon_c is not None:
+                mlp_in = self.canon_c(
+                    mlp_in,
+                    position_ids=position_ids,
+                    cu_seqlens=cu_seqlens,
+                    attention_mask=token_mask,
+                )
+            x = x + self.mlp(
                 mlp_in,
                 position_ids=position_ids,
                 cu_seqlens=cu_seqlens,
                 attention_mask=token_mask,
             )
-        x = x + self.mlp(
-            mlp_in,
-            position_ids=position_ids,
-            cu_seqlens=cu_seqlens,
-            attention_mask=token_mask,
-        )
         return x
 
 
@@ -1024,6 +1031,8 @@ class ModernBertMLPResidual(nn.Module):
         **_kwargs,
     ) -> torch.Tensor:
         enc: ModernBertEncoderLayer = self.__dict__["_encoder"]
+        if enc.mlp is None:
+            return x
         mlp_in = enc.mlp_norm(x)
         if enc.canon_c is not None:
             mlp_in = enc.canon_c(
@@ -1285,11 +1294,15 @@ class MHCLiteSublayersLayer(nn.Module):
             ModernBertAttnResidual(self.enc),
             triton_fused=config.mhc_triton_fused,
         )
-        self.mhc_mlp = MHCLiteBlock(
-            config.mhc_n_streams,
-            config.hidden_size,
-            ModernBertMLPResidual(self.enc),
-            triton_fused=config.mhc_triton_fused,
+        self.mhc_mlp = (
+            MHCLiteBlock(
+                config.mhc_n_streams,
+                config.hidden_size,
+                ModernBertMLPResidual(self.enc),
+                triton_fused=config.mhc_triton_fused,
+            )
+            if self.enc.mlp is not None
+            else None
         )
 
     @property
@@ -1298,7 +1311,8 @@ class MHCLiteSublayersLayer(nn.Module):
 
     def forward(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
         x_streams = self.mhc_attn(x_streams, **kwargs)
-        x_streams = self.mhc_mlp(x_streams, **kwargs)
+        if self.mhc_mlp is not None:
+            x_streams = self.mhc_mlp(x_streams, **kwargs)
         return x_streams
 
 
@@ -1533,29 +1547,31 @@ class ModernBertForMaskedLM(nn.Module):
                 mhc_blocks = [layer]
             elif isinstance(layer, MHCLiteSublayersLayer):
                 enc = layer.enc
-                mhc_blocks = [layer.mhc_attn, layer.mhc_mlp]
+                mhc_blocks = [b for b in (layer.mhc_attn, layer.mhc_mlp) if b is not None]
             else:
                 enc = layer
                 mhc_blocks = []
             nn.init.uniform_(enc.attn.Wqkv.weight, -bound, bound)
             nn.init.zeros_(enc.attn.Wo.weight)
-            nn.init.uniform_(enc.mlp.Wi.weight, -bound, bound)
-            if hasattr(enc.mlp, "Wo"):
-                nn.init.zeros_(enc.mlp.Wo.weight)
-            else:
-                nn.init.zeros_(enc.mlp.Wo_weight)
+            if enc.mlp is not None:
+                nn.init.uniform_(enc.mlp.Wi.weight, -bound, bound)
+                if hasattr(enc.mlp, "Wo"):
+                    nn.init.zeros_(enc.mlp.Wo.weight)
+                else:
+                    nn.init.zeros_(enc.mlp.Wo_weight)
 
             if enc.attn.Wqkv.bias is not None:
                 nn.init.zeros_(enc.attn.Wqkv.bias)
             if enc.attn.Wo.bias is not None:
                 nn.init.zeros_(enc.attn.Wo.bias)
-            if enc.mlp.Wi.bias is not None:
-                nn.init.zeros_(enc.mlp.Wi.bias)
-            if hasattr(enc.mlp, "Wo"):
-                if enc.mlp.Wo.bias is not None:
-                    nn.init.zeros_(enc.mlp.Wo.bias)
-            elif enc.mlp.Wo_bias is not None:
-                nn.init.zeros_(enc.mlp.Wo_bias)
+            if enc.mlp is not None:
+                if enc.mlp.Wi.bias is not None:
+                    nn.init.zeros_(enc.mlp.Wi.bias)
+                if hasattr(enc.mlp, "Wo"):
+                    if enc.mlp.Wo.bias is not None:
+                        nn.init.zeros_(enc.mlp.Wo.bias)
+                elif enc.mlp.Wo_bias is not None:
+                    nn.init.zeros_(enc.mlp.Wo_bias)
 
             # RePO: zero-init W_z so positions start at zero (NoPE-like).
             # W_g and W_c keep default Kaiming uniform init.
