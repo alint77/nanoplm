@@ -28,7 +28,7 @@ _FLASH_HAS_DROPOUT = False
 USE_ACTIVATION_CHECKPOINTING_CANON = True
 # mHC-lite selective recompute (paper-inspired):
 # checkpoint only mHC pre/post kernels, keep heavy layer function outside.
-USE_ACTIVATION_CHECKPOINTING_MHC = False
+USE_ACTIVATION_CHECKPOINTING_MHC = True
 
 if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
     try:

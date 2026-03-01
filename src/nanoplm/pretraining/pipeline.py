@@ -13,6 +13,7 @@ from pathlib import Path
 
 from transformers import (
     Trainer,
+    TrainerCallback,
     TrainingArguments,
 )
 
@@ -26,6 +27,7 @@ from nanoplm.pretraining.optim import build_optimizer
 from nanoplm.data.validation import validate_pretrain_dataset
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs
+from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
 
 
 def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -197,6 +199,14 @@ class TokenTrackingTrainer(Trainer):
         logs["tokens_per_sec"] = self._last_tokens_per_sec
         logs["raw_tokens_per_sec"] = self._last_raw_tokens_per_sec
         super().log(logs, start_time=start_time, **kwargs)
+
+
+class WandbSourceSnapshotCallback(TrainerCallback):
+    """Upload run source snapshot once W&B is active."""
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        upload_run_source_snapshot()
+        return control
 
 
 @dataclass
@@ -664,6 +674,7 @@ def run_pretraining(
         eval_dataset=val_ds,
         processing_class=tokenizer,
         optimizers=(optimizer, scheduler),
+        callbacks=[WandbSourceSnapshotCallback()],
     )
 
     logger.info("Starting Trainer")

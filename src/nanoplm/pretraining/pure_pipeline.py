@@ -62,6 +62,7 @@ from nanoplm.pretraining.pipeline import (
 )
 from nanoplm.utils.common import create_dirs, get_device
 from nanoplm.utils.logger import logger
+from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
 
 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
@@ -992,6 +993,7 @@ def run_pure_pretraining(
                 wandb.define_metric("time_elapsed_sec", step_metric="train/global_step", step_sync=True)
                 wandb.define_metric("train/time_elapsed_sec", step_metric="train/global_step", step_sync=True)
                 wandb.define_metric("*", step_metric="train/global_step", step_sync=True)
+                upload_run_source_snapshot()
         except Exception as exc:
             logger.warning(f"W&B init failed, continuing without logging. Error: {exc}")
 
