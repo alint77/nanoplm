@@ -9,9 +9,18 @@ import math
 import os
 from dataclasses import MISSING, fields
 import numpy as np
-import torch
 from typing import Optional, Dict, Any, Union
 from pathlib import Path
+
+# Inductor Triton compile workers (used by torch.compile) inherit settings from
+# environment variables at process start. Default to safer settings to avoid
+# "No valid triton configs / out of resource" from mix-order persistent
+# reduction kernels at larger hidden sizes. Users can override by exporting
+# these env vars before launching.
+os.environ.setdefault("TORCHINDUCTOR_PERSISTENT_REDUCTIONS", "0")
+os.environ.setdefault("TORCHINDUCTOR_MIX_ORDER_REDUCTION", "0")
+
+import torch
 
 from nanoplm.pretraining.pipeline import (
     PretrainingConfig,
@@ -484,6 +493,20 @@ def pretrain():
          "May improve throughput, but increases compile time significantly at run start.",
 )
 @click.option(
+    "--compile-triton-persistent-reductions/--no-compile-triton-persistent-reductions",
+    default=False,
+    help="Pure-torch only: TorchInductor Triton setting. Disable to avoid shared-memory "
+         "resource errors in some fused reduction kernels (e.g. LayerNorm backward at large hidden dims) "
+         "while keeping torch.compile enabled.",
+)
+@click.option(
+    "--compile-triton-mix-order-reduction/--no-compile-triton-mix-order-reduction",
+    default=False,
+    help="Pure-torch only: TorchInductor Triton setting. Mix-order reductions can generate "
+         "persistent reduction kernels that exceed shared memory limits on some shapes. "
+         "Disable to prefer legacy reductions while keeping torch.compile enabled.",
+)
+@click.option(
     "--pure-torch",
     is_flag=True,
     default=False,
@@ -534,6 +557,8 @@ def run(
     use_packing: bool,
     use_static_inp_size: bool,
     use_compile_max_autotune: bool,
+    compile_triton_persistent_reductions: bool,
+    compile_triton_mix_order_reduction: bool,
     bf16: bool,
     tf32: bool,
     fp8: bool,
@@ -607,6 +632,8 @@ def run(
         use_packing=use_packing,
         use_static_inp_size=use_static_inp_size,
         use_compile_max_autotune=use_compile_max_autotune,
+        compile_triton_persistent_reductions=compile_triton_persistent_reductions,
+        compile_triton_mix_order_reduction=compile_triton_mix_order_reduction,
         bf16=bf16,
         tf32=tf32,
         fp8=fp8,
@@ -911,6 +938,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  use_packing: true\n"
         "  use_static_inp_size: true\n"
         "  use_compile_max_autotune: false  # pure_torch only: may improve throughput, but causes long compile/autotune time at run start\n"
+        "  compile_triton_persistent_reductions: false  # pure_torch only: set true if it works on your shapes/GPU and you want the faster persistent reductions\n"
+        "  compile_triton_mix_order_reduction: false  # pure_torch only: set true to enable mix-order reductions (may be faster, but can hit shared-mem limits)\n"
         "  bf16: true\n"
         "  tf32: true\n"
         "  fp8: false\n"

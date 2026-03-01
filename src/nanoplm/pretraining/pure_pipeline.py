@@ -10,6 +10,11 @@ import math
 import os
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+# Default to safer Inductor reduction codegen. Inductor's async compile uses
+# subprocess workers that read these env vars at process start, so setting them
+# here helps ensure stable defaults even when invoked via torchrun.
+os.environ.setdefault("TORCHINDUCTOR_PERSISTENT_REDUCTIONS", "0")
+os.environ.setdefault("TORCHINDUCTOR_MIX_ORDER_REDUCTION", "0")
 
 
 import random
@@ -881,6 +886,40 @@ def run_pure_pretraining(
         if getattr(pretrain_config, "use_compile_max_autotune", False)
         else None
     )
+
+    # ---- TorchInductor knobs (must be set before torch.compile) ----
+    if device.type == "cuda":
+        try:
+            import torch._inductor.config as inductor_config
+
+            # NOTE: Inductor codecache compilation runs in subprocess workers by
+            # default. Those workers read config from environment variables at
+            # import time, so set the env var as well as the in-process config.
+            persistent_reductions = bool(
+                getattr(pretrain_config, "compile_triton_persistent_reductions", False)
+            )
+            mix_order_reduction = bool(
+                getattr(pretrain_config, "compile_triton_mix_order_reduction", False)
+            )
+            os.environ["TORCHINDUCTOR_PERSISTENT_REDUCTIONS"] = (
+                "1" if persistent_reductions else "0"
+            )
+            os.environ["TORCHINDUCTOR_MIX_ORDER_REDUCTION"] = (
+                "1" if mix_order_reduction else "0"
+            )
+            inductor_config.triton.persistent_reductions = persistent_reductions
+            inductor_config.triton.mix_order_reduction = mix_order_reduction
+            logger.info(
+                "TorchInductor: triton.persistent_reductions=%s (env TORCHINDUCTOR_PERSISTENT_REDUCTIONS=%s); "
+                "triton.mix_order_reduction=%s (env TORCHINDUCTOR_MIX_ORDER_REDUCTION=%s)",
+                persistent_reductions,
+                os.environ.get("TORCHINDUCTOR_PERSISTENT_REDUCTIONS"),
+                mix_order_reduction,
+                os.environ.get("TORCHINDUCTOR_MIX_ORDER_REDUCTION"),
+            )
+        except Exception:
+            logger.exception("Failed to apply TorchInductor config overrides; continuing.")
+
     if compile_mode is None:
         model = torch.compile(model, dynamic=compile_dynamic)
         logger.info(f"Model compiled with torch.compile(dynamic={compile_dynamic})")

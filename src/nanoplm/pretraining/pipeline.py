@@ -272,6 +272,16 @@ class PretrainingConfig:
     # This may improve steady-state performance, but increases compile/autotune time
     # noticeably at the start of a run.
     use_compile_max_autotune: bool = False
+    # TorchInductor Triton setting. Persistent reductions can exceed per-block shared
+    # memory limits for some fused kernels (e.g. LayerNorm backward at hidden >= 1536),
+    # causing "No valid triton configs / out of resource". Set to False to force
+    # non-persistent reduction kernels while keeping torch.compile enabled.
+    compile_triton_persistent_reductions: bool = False
+    # TorchInductor Triton setting. Mix-order reductions can generate persistent
+    # reduction kernels that exceed shared memory limits on some shapes (notably
+    # layernorm backward fusions at larger hidden sizes). Disable to prefer the
+    # legacy reduction codegen while keeping torch.compile enabled.
+    compile_triton_mix_order_reduction: bool = False
 
     # Profiling (pure_torch / pure_te pipelines). When enabled on rank 0:
     # - If running under nsys: uses CUDA Profiler API (start/stop at steps) for .nsys-rep traces.
