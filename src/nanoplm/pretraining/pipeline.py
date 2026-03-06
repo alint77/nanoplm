@@ -300,6 +300,16 @@ class PretrainingConfig:
     profiler_start_step: int = 10
     profiler_end_step: int = 15
 
+    # Debug window for numerical issues in the pure-torch path. The step numbers
+    # refer to upcoming optimizer steps/log lines (1-based).
+    debug_start_step: Optional[int] = None
+    debug_end_step: Optional[int] = None
+    debug_dump_dir: Optional[str] = None
+    debug_detect_anomaly: bool = False
+    debug_dump_batches: bool = True
+    debug_dump_snapshot_at_start: bool = True
+    debug_abort_on_nonfinite: bool = True
+
     # Distributed training
     multi_gpu: bool = True
     world_size: Union[int, str] = "auto"
