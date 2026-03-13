@@ -41,7 +41,6 @@ def linear_relu_square_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
     NUM_SMS: tl.constexpr,
     FORWARD: tl.constexpr,
 ):
@@ -51,9 +50,6 @@ def linear_relu_square_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
     num_tiles = num_pid_m * num_pid_n
-
-    tile_id_c = start_pid - NUM_SMS
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
         pid_m = tile_id // num_pid_n
@@ -68,39 +64,33 @@ def linear_relu_square_kernel(
             b = b_desc.load([offs_bn, offs_k])
             accumulator = tl.dot(a, b.T, accumulator)
 
-        tile_id_c += NUM_SMS
-        pid_m = tile_id // num_pid_n
-        pid_n = tile_id % num_pid_n
-        offs_am_c = pid_m * BLOCK_SIZE_M
-        offs_bn_c = pid_n * BLOCK_SIZE_N
-
         acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
         acc = tl.permute(acc, (0, 2, 1))
         acc0, acc1 = tl.split(acc)
 
         c0 = acc0.to(dtype)
         if not FORWARD:
-            c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
+            c0_pre = aux_desc.load([offs_am, offs_bn])
             c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
 
-        c_desc.store([offs_am_c, offs_bn_c], c0)
+        c_desc.store([offs_am, offs_bn], c0)
 
         if FORWARD:
             c0_post = tl.maximum(c0, 0)
             c0_post = c0_post * c0_post
-            aux_desc.store([offs_am_c, offs_bn_c], c0_post)
+            aux_desc.store([offs_am, offs_bn], c0_post)
 
         c1 = acc1.to(dtype)
         if not FORWARD:
-            c1_pre = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
+            c1_pre = aux_desc.load([offs_am, offs_bn + BLOCK_SIZE_N // 2])
             c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
 
-        c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
+        c_desc.store([offs_am, offs_bn + BLOCK_SIZE_N // 2], c1)
 
         if FORWARD:
             c1_post = tl.maximum(c1, 0)
             c1_post = c1_post * c1_post
-            aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
+            aux_desc.store([offs_am, offs_bn + BLOCK_SIZE_N // 2], c1_post)
 
 
 def linear_relu_square(a, b, aux=None):
@@ -130,7 +120,7 @@ def linear_relu_square(a, b, aux=None):
         a_desc, b_desc, c_desc, aux_desc,
         M, N, K,
         BLOCK_SIZE_M=BM, BLOCK_SIZE_N=BN, BLOCK_SIZE_K=BK,
-        GROUP_SIZE_M=1, NUM_SMS=NUM_SMS, FORWARD=FORWARD,
+        NUM_SMS=NUM_SMS, FORWARD=FORWARD,
         num_stages=num_stages, num_warps=nw,
     )
 
