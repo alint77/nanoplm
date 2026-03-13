@@ -2230,6 +2230,20 @@ def run_pure_pretraining(
                             out = model(**fwd_kwargs)
 
                         loss = out["loss"] if isinstance(out, dict) else out.loss
+                        if not torch.isfinite(loss.detach()).all():
+                            rank = dist.get_rank() if distributed and dist.is_initialized() else 0
+                            logger.error(
+                                "Skipping optimizer step %d due to non-finite loss on rank %d "
+                                "(epoch=%d micro_step=%d sub_batch=%d).",
+                                upcoming_step, rank, epoch, micro_step, sub_batch_idx,
+                            )
+                            optimizer.zero_grad(set_to_none=True)
+                            accum_loss.zero_()
+                            if at_accum_boundary:
+                                accum_micro_count = 0
+                            else:
+                                discard_accumulation = True
+                            continue
                         loss = loss / effective_grad_accum
 
                         if scaler is not None and scaler.is_enabled():
