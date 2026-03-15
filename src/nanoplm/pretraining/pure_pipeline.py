@@ -492,6 +492,7 @@ def _fully_shard_encoder_sublayers(
     *,
     mesh,
     fsdp_kwargs: dict,
+    reshard_after_forward: bool,
     shard_parent: bool = True,
     sublayer: bool = False,
 ) -> None:
@@ -503,11 +504,11 @@ def _fully_shard_encoder_sublayers(
     less CPU dispatch overhead — better on fast interconnects like NVLink).
     """
     if sublayer:
-        fully_shard(enc.attn, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+        fully_shard(enc.attn, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
         if enc.mlp is not None:
-            fully_shard(enc.mlp, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+            fully_shard(enc.mlp, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
     if shard_parent:
-        fully_shard(enc, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+        fully_shard(enc, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
 
 
 def _fully_shard_transformer_layer(
@@ -515,6 +516,7 @@ def _fully_shard_transformer_layer(
     *,
     mesh,
     fsdp_kwargs: dict,
+    reshard_after_forward: bool,
     sublayer: bool = False,
 ) -> None:
     """Shard one logical transformer layer bottom-up for better overlap."""
@@ -523,24 +525,32 @@ def _fully_shard_transformer_layer(
             layer,
             mesh=mesh,
             fsdp_kwargs=fsdp_kwargs,
+            reshard_after_forward=reshard_after_forward,
             shard_parent=False,
             sublayer=sublayer,
         )
     elif isinstance(layer, MHCLiteBlock):
-        _fully_shard_encoder_sublayers(layer.layer, mesh=mesh, fsdp_kwargs=fsdp_kwargs, sublayer=sublayer)
+        _fully_shard_encoder_sublayers(
+            layer.layer,
+            mesh=mesh,
+            fsdp_kwargs=fsdp_kwargs,
+            reshard_after_forward=reshard_after_forward,
+            sublayer=sublayer,
+        )
     elif isinstance(layer, MHCLiteSublayersLayer):
         _fully_shard_encoder_sublayers(
             layer.enc,
             mesh=mesh,
             fsdp_kwargs=fsdp_kwargs,
+            reshard_after_forward=reshard_after_forward,
             shard_parent=False,
             sublayer=sublayer,
         )
         if sublayer:
-            fully_shard(layer.mhc_attn, mesh=mesh, reshard_after_forward=True, **fsdp_kwargs)
+            fully_shard(layer.mhc_attn, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
             if layer.mhc_mlp is not None:
-                fully_shard(layer.mhc_mlp, mesh=mesh, reshard_after_forward=True, **fsdp_kwargs)
-    fully_shard(layer, mesh=mesh, reshard_after_forward=True, **fsdp_kwargs)
+                fully_shard(layer.mhc_mlp, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+    fully_shard(layer, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
 
 
 def _fully_shard_root_groups(
@@ -548,6 +558,7 @@ def _fully_shard_root_groups(
     *,
     mesh,
     fsdp_kwargs: dict,
+    reshard_after_forward: bool,
 ) -> None:
     """Split root-only params into separate groups to avoid a serialized root tail."""
     tied_embeddings = model.decoder.weight is model.model.embeddings.tok_embeddings.weight
@@ -556,14 +567,14 @@ def _fully_shard_root_groups(
         fully_shard(
             [model.model.embeddings, model.decoder],
             mesh=mesh,
-            reshard_after_forward=True,
+            reshard_after_forward=reshard_after_forward,
             **fsdp_kwargs,
         )
     else:
-        fully_shard(model.model.embeddings, mesh=mesh, reshard_after_forward=True, **fsdp_kwargs)
-        fully_shard(model.decoder, mesh=mesh, reshard_after_forward=True, **fsdp_kwargs)
-    fully_shard(model.model.final_norm, mesh=mesh, reshard_after_forward=True, **fsdp_kwargs)
-    fully_shard(model.head, mesh=mesh, reshard_after_forward=True, **fsdp_kwargs)
+        fully_shard(model.model.embeddings, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+        fully_shard(model.decoder, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+    fully_shard(model.model.final_norm, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+    fully_shard(model.head, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
 
 
 def _has_nonfinite_tensors(tensors: list[torch.Tensor]) -> bool:
@@ -1758,10 +1769,22 @@ def run_pure_pretraining(
             fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
         fsdp_mesh = init_device_mesh("cuda", (effective_world_size,))
         fsdp_sublayer = getattr(pretrain_config, "fsdp_shard_granularity", "layer") == "sublayer"
+        fsdp_reshard_after_forward = bool(getattr(pretrain_config, "fsdp_reshard_after_forward", False))
         for layer in base_model.model.layers:
-            _fully_shard_transformer_layer(layer, mesh=fsdp_mesh, fsdp_kwargs=fsdp_kwargs, sublayer=fsdp_sublayer)
-        _fully_shard_root_groups(base_model, mesh=fsdp_mesh, fsdp_kwargs=fsdp_kwargs)
-        fully_shard(base_model, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_kwargs)
+            _fully_shard_transformer_layer(
+                layer,
+                mesh=fsdp_mesh,
+                fsdp_kwargs=fsdp_kwargs,
+                reshard_after_forward=fsdp_reshard_after_forward,
+                sublayer=fsdp_sublayer,
+            )
+        _fully_shard_root_groups(
+            base_model,
+            mesh=fsdp_mesh,
+            fsdp_kwargs=fsdp_kwargs,
+            reshard_after_forward=fsdp_reshard_after_forward,
+        )
+        fully_shard(base_model, mesh=fsdp_mesh, reshard_after_forward=fsdp_reshard_after_forward, **fsdp_kwargs)
         optimizer_dist = fsdp_mesh
 
         # Explicit prefetching for FSDP2

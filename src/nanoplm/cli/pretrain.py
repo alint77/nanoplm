@@ -126,6 +126,10 @@ def _validate_distributed_mode(
         return
     if cfg.distributed_mode == "ddp" and not cfg.multi_gpu:
         raise click.ClickException("distributed_mode=ddp requires multi_gpu=true.")
+    if cfg.distributed_mode != "fsdp" and cfg.fsdp_reshard_after_forward:
+        raise click.ClickException(
+            "fsdp_reshard_after_forward applies only when distributed_mode=fsdp."
+        )
     if cfg.distributed_mode != "ddp" and cfg.ddp_bucket_cap_mb != 25:
         raise click.ClickException(
             "ddp_bucket_cap_mb applies only when distributed_mode=ddp."
@@ -405,6 +409,12 @@ def pretrain():
     show_default=True,
     help="FSDP2 wrapping granularity. 'layer' = whole transformer blocks (fewer boundaries, "
          "best for NVLink/SXM). 'sublayer' = attn & mlp separately (finer overlap, best for PCIe).",
+)
+@click.option(
+    "--fsdp-reshard-after-forward/--no-fsdp-reshard-after-forward",
+    default=False,
+    show_default=True,
+    help="Universal FSDP2 reshard_after_forward setting for all fully_shard groups in pure-torch / pure-te.",
 )
 @click.option(
     "--world-size",
@@ -744,6 +754,7 @@ def run(
     multi_gpu: bool,
     distributed_mode: str,
     fsdp_shard_granularity: str,
+    fsdp_reshard_after_forward: bool,
     world_size: str,
     ddp_bucket_cap_mb: int,
     project_name: str,
@@ -843,6 +854,7 @@ def run(
         multi_gpu=multi_gpu,
         distributed_mode=distributed_mode,
         fsdp_shard_granularity=fsdp_shard_granularity,
+        fsdp_reshard_after_forward=fsdp_reshard_after_forward,
         world_size=world_size,
         ddp_bucket_cap_mb=ddp_bucket_cap_mb,
         project_name=project_name,
@@ -1285,6 +1297,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  multi_gpu: true\n"
         "  distributed_mode: \"fsdp\"  # fsdp | ddp (pure_torch/pure_te honor this; HF path ignores it)\n"
         "  fsdp_shard_granularity: \"layer\"  # layer (fewer boundaries, NVLink/SXM) | sublayer (finer overlap, PCIe)\n"
+        "  fsdp_reshard_after_forward: false  # universal FSDP2 reshard_after_forward setting for pure_torch/pure_te\n"
         "  world_size: 'auto'\n"
         "  ddp_bucket_cap_mb: 25  # only used when distributed_mode: ddp in pure_torch/pure_te; HF path ignores it\n"
         "  project_name: \"nanoplm-pretraining\"\n"
