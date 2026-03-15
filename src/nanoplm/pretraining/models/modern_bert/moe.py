@@ -16,6 +16,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .moe_triton_ops import moe_permute, moe_unpermute
+
 
 class Router(nn.Module):
     """Sigmoid top-k router with optional routing-bias correction."""
@@ -157,10 +159,66 @@ class MoELayer(nn.Module):
         self.aux_loss_coef: float = float(config.moe_aux_loss_coef)
         self.z_loss_coef: float = float(config.moe_z_loss_coef)
         self.routed_scaling_factor: float = float(config.moe_routed_scaling_factor)
+        self._reuse_dispatch_workspaces = not bool(
+            getattr(config, "activation_checkpointing", False)
+        )
+
+        # Reuse small dispatch metadata buffers across steps to reduce allocator
+        # churn in the static packed MoE path. Keep this off under activation
+        # checkpointing so recompute cannot clobber buffers still needed later.
+        self.register_buffer(
+            "_dispatch_sort_values",
+            torch.empty(0, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_dispatch_sorted_idx",
+            torch.empty(0, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_dispatch_count_ones",
+            torch.empty(0, dtype=torch.int32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_dispatch_counts",
+            torch.empty(self.num_experts, dtype=torch.int32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_dispatch_offs",
+            torch.empty(self.num_experts, dtype=torch.int32),
+            persistent=False,
+        )
 
         # Bookkeeping set during forward for external consumption.
         self.last_expert_counts: Optional[torch.Tensor] = None
         self.last_aux_loss: Optional[torch.Tensor] = None
+
+    def _ensure_dispatch_buffers(
+        self,
+        num_assignments: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._dispatch_sort_values.device != device:
+            self._dispatch_sort_values = self._dispatch_sort_values.to(device=device)
+            self._dispatch_sorted_idx = self._dispatch_sorted_idx.to(device=device)
+            self._dispatch_count_ones = self._dispatch_count_ones.to(device=device)
+            self._dispatch_counts = self._dispatch_counts.to(device=device)
+            self._dispatch_offs = self._dispatch_offs.to(device=device)
+        if self._dispatch_sort_values.numel() < num_assignments:
+            self._dispatch_sort_values.resize_(num_assignments)
+            self._dispatch_sorted_idx.resize_(num_assignments)
+            self._dispatch_count_ones.resize_(num_assignments)
+        self._dispatch_counts.resize_(self.num_experts)
+        self._dispatch_offs.resize_(self.num_experts)
+        return (
+            self._dispatch_sort_values[:num_assignments],
+            self._dispatch_sorted_idx[:num_assignments],
+            self._dispatch_count_ones[:num_assignments],
+            self._dispatch_counts,
+        )
 
     def forward(
         self,
@@ -188,15 +246,27 @@ class MoELayer(nn.Module):
 
         # --- dispatch: expand, sort by expert, compute offs ---
         x_expanded = x.repeat_interleave(self.top_k, dim=0)  # (T*top_k, H)
-        expert_flat = indices.flatten()  # (T*top_k,)
-        sorted_idx = expert_flat.argsort(stable=True)
-        x_sorted = x_expanded[sorted_idx]  # (T*top_k, H)
-
-        counts = expert_flat.bincount(minlength=self.num_experts)
-        offs = counts.cumsum(0).to(torch.int32)  # (num_experts,)
+        expert_flat = indices.reshape(-1)  # (T*top_k,)
+        if self._reuse_dispatch_workspaces:
+            num_assignments = expert_flat.numel()
+            sort_vals, sorted_idx, count_ones, counts = self._ensure_dispatch_buffers(
+                num_assignments,
+                expert_flat.device,
+            )
+            torch.sort(expert_flat, stable=True, out=(sort_vals, sorted_idx))
+            count_ones.fill_(1)
+            counts.zero_()
+            counts.scatter_add_(0, expert_flat, count_ones)
+            offs = self._dispatch_offs
+            torch.cumsum(counts, dim=0, out=offs)
+        else:
+            sorted_idx = expert_flat.argsort(stable=True)
+            counts = expert_flat.bincount(minlength=self.num_experts).to(torch.int32)
+            offs = counts.cumsum(0)
+        x_sorted = moe_permute(x_expanded, sorted_idx)  # (T*top_k, H)
 
         # Store for external bias-update logic.
-        self.last_expert_counts = counts.detach()
+        self.last_expert_counts = counts.detach().clone()
 
         # --- expert SwiGLU via grouped_mm ---
         wi = F.grouped_mm(x_sorted, self.Wi, offs=offs)  # (T*top_k, 2*inter)
@@ -207,8 +277,7 @@ class MoELayer(nn.Module):
         )  # (T*top_k, H)
 
         # --- combine: unsort + weighted sum ---
-        expert_out = torch.empty_like(expert_out_sorted)
-        expert_out[sorted_idx] = expert_out_sorted
+        expert_out = moe_unpermute(expert_out_sorted, sorted_idx)
         expert_out = expert_out.view(T, self.top_k, H)
         expert_out = (
             expert_out * weights.unsqueeze(-1) * self.routed_scaling_factor
