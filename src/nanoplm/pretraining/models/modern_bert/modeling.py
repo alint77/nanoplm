@@ -166,7 +166,7 @@ class ModernBertConfig:
     moe_scoring_func: str = "sigmoid"
     moe_use_bias_correction: bool = True
     moe_aux_loss_coef: float = 0.0
-    moe_layer_pattern: Optional[str] = None  # e.g. "DM" for alternating dense/moe
+    moe_leading_dense_layers: int = 0  # first N layers are always dense (DeepSeek uses 1)
 
     head_dim: int = field(init=False)
     sliding_window: int = field(init=False)
@@ -265,22 +265,10 @@ class ModernBertConfig:
             )
         # MoE layer flags.
         if self.use_moe:
-            if self.moe_layer_pattern is not None:
-                pat = self.moe_layer_pattern.upper().strip()
-                if not pat:
-                    raise ValueError("moe_layer_pattern must not be empty when provided.")
-                _moe_map = {"M": True, "D": False}
-                for ch in pat:
-                    if ch not in _moe_map:
-                        raise ValueError(
-                            f"Invalid character '{ch}' in moe_layer_pattern. "
-                            "Use 'M' for MoE and 'D' for dense."
-                        )
-                self.moe_layer_flags = [
-                    _moe_map[pat[i % len(pat)]] for i in range(self.num_hidden_layers)
-                ]
-            else:
-                self.moe_layer_flags = [True] * self.num_hidden_layers
+            self.moe_layer_flags = [True] * self.num_hidden_layers
+            # Force first N layers to dense.
+            for i in range(min(self.moe_leading_dense_layers, self.num_hidden_layers)):
+                self.moe_layer_flags[i] = False
             if (
                 self.activation_checkpointing
                 and self.activation_checkpointing_mode == "attn+mlp"

@@ -75,7 +75,7 @@ class ProtModernBertMLMConfig:
     moe_scoring_func: str = "sigmoid"
     moe_use_bias_correction: bool = True
     moe_aux_loss_coef: float = 0.0
-    moe_layer_pattern: Optional[str] = None
+    moe_leading_dense_layers: int = 0
 
 
 class ProtModernBertMLM(ModernBertForMaskedLM):

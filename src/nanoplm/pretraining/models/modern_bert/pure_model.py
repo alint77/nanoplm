@@ -88,7 +88,7 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             moe_scoring_func=config.moe_scoring_func,
             moe_use_bias_correction=config.moe_use_bias_correction,
             moe_aux_loss_coef=config.moe_aux_loss_coef,
-            moe_layer_pattern=config.moe_layer_pattern,
+            moe_leading_dense_layers=config.moe_leading_dense_layers,
         )
 
         super().__init__(mb_config)
