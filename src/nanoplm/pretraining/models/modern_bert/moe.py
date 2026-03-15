@@ -26,10 +26,18 @@ class Router(nn.Module):
         num_experts: int,
         top_k: int,
         bias_correction: bool = True,
+        n_group: int = 1,
+        topk_group: int = 1,
     ):
         super().__init__()
         self.gate = nn.Linear(hidden_size, num_experts, bias=False)
         self.top_k = top_k
+        self.n_group = n_group
+        self.topk_group = topk_group
+        if n_group > 1:
+            assert num_experts % n_group == 0, (
+                f"num_experts ({num_experts}) must be divisible by n_group ({n_group})"
+            )
         if bias_correction:
             # Correction bias: added to logits for expert *selection* only,
             # NOT included in the combine weights.  Updated externally based
@@ -42,7 +50,7 @@ class Router(nn.Module):
 
     def forward(
         self, x: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Route tokens to experts.
 
         Args:
@@ -52,8 +60,16 @@ class Router(nn.Module):
             weights: ``(total_tokens, top_k)`` — combine weights (from raw
                      sigmoid scores, bias-free, renormalized).
             indices: ``(total_tokens, top_k)`` — selected expert indices.
+            z_loss:  scalar — mean squared pre-sigmoid logit (prevents
+                     sigmoid saturation / vanishing router gradients).
         """
-        logits = self.gate(x).sigmoid()  # (T, E)
+        # Router runs in fp32 for stability (Ling-V2 / DeepSeek-V3 style).
+        raw_logits = self.gate(x).float()  # (T, E) — cast to fp32 after projection
+        logits = raw_logits.sigmoid()  # (T, E)
+
+        # Z-loss: penalise large pre-sigmoid logits to keep sigmoid in its
+        # sensitive region (DeepSeek-V3 style).
+        z_loss = raw_logits.float().square().mean()
 
         if self.correction_bias is not None:
             # Use biased logits for selection, raw logits for combine weights.
@@ -61,16 +77,41 @@ class Router(nn.Module):
         else:
             selection_logits = logits
 
+        # Group-limited routing (Ling-V2 / DeepSeek-V3 style):
+        # partition experts into groups, score groups by top-2 expert scores,
+        # keep only topk_group groups, mask out the rest before final top-k.
+        if self.n_group > 1:
+            T = x.shape[0]
+            epg = self.gate.out_features // self.n_group  # experts per group
+            grouped = selection_logits.view(T, self.n_group, epg)
+            # Score each group by sum of its top-2 expert scores.
+            group_scores = grouped.topk(2, dim=-1).values.sum(dim=-1)  # (T, n_group)
+            # Keep top topk_group groups.
+            top_groups = group_scores.topk(self.topk_group, dim=-1).indices  # (T, topk_group)
+            # Build per-expert mask: 1 for experts in selected groups, 0 otherwise.
+            group_mask = torch.zeros(
+                T, self.n_group, device=x.device, dtype=selection_logits.dtype,
+            )
+            group_mask.scatter_(1, top_groups, 1.0)
+            expert_mask = group_mask.unsqueeze(-1).expand(-1, -1, epg).reshape(T, -1)
+            # Mask out non-selected experts so top-k ignores them.
+            selection_logits = selection_logits.masked_fill(
+                expert_mask == 0, torch.finfo(selection_logits.dtype).min,
+            )
+
         weights, indices = torch.topk(selection_logits, self.top_k, dim=-1)
 
         # Combine weights come from the *unbiased* sigmoid scores.
         if self.correction_bias is not None:
             weights = logits.gather(dim=-1, index=indices)
 
-        # Renormalize so combine weights sum to 1 per token.
-        weights = weights / weights.sum(dim=-1, keepdim=True)
+        # Renormalize so combine weights sum to 1 per token. Clamp the
+        # denominator to keep backward stable when selected sigmoid scores are
+        # extremely small early in training.
+        denom = weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        weights = weights / denom
 
-        return weights, indices
+        return weights, indices, z_loss, logits
 
 
 class MoELayer(nn.Module):
@@ -95,6 +136,8 @@ class MoELayer(nn.Module):
             self.num_experts,
             self.top_k,
             bias_correction=config.moe_use_bias_correction,
+            n_group=config.moe_n_group,
+            topk_group=config.moe_topk_group,
         )
 
         # Routed expert weights — stacked for grouped_mm.
@@ -110,6 +153,10 @@ class MoELayer(nn.Module):
 
         # Shared expert — a normal MLP that processes all tokens.
         self.shared_expert = ModernBertSwiGLUMLP(config)
+
+        self.aux_loss_coef: float = float(config.moe_aux_loss_coef)
+        self.z_loss_coef: float = float(config.moe_z_loss_coef)
+        self.routed_scaling_factor: float = float(config.moe_routed_scaling_factor)
 
         # Bookkeeping set during forward for external consumption.
         self.last_expert_counts: Optional[torch.Tensor] = None
@@ -137,7 +184,7 @@ class MoELayer(nn.Module):
         )
 
         # --- routing ---
-        weights, indices = self.router(x)  # (T, top_k), (T, top_k)
+        weights, indices, z_loss, router_scores = self.router(x)  # (T, top_k), (T, top_k), scalar, (T, E)
 
         # --- dispatch: expand, sort by expert, compute offs ---
         x_expanded = x.repeat_interleave(self.top_k, dim=0)  # (T*top_k, H)
@@ -163,12 +210,24 @@ class MoELayer(nn.Module):
         expert_out = torch.empty_like(expert_out_sorted)
         expert_out[sorted_idx] = expert_out_sorted
         expert_out = expert_out.view(T, self.top_k, H)
-        expert_out = (expert_out * weights.unsqueeze(-1)).sum(dim=1)  # (T, H)
+        expert_out = (
+            expert_out * weights.unsqueeze(-1) * self.routed_scaling_factor
+        ).sum(dim=1)  # (T, H)
 
-        # --- optional aux loss (sequence-level balance regularizer) ---
-        frac = counts.float() / counts.sum()
-        target = torch.ones_like(frac) / self.num_experts
-        self.last_aux_loss = ((frac - target) ** 2).sum() * self.num_experts
+        # --- auxiliary losses ---
+        aux = torch.zeros(1, device=x.device, dtype=torch.float32)
+        # Differentiable balance regularizer over normalized router mass.
+        # The previous bincount-based aux loss used hard top-k indices and did
+        # not produce useful router gradients.
+        if self.aux_loss_coef > 0:
+            router_mass = router_scores / router_scores.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            mean_mass = router_mass.mean(dim=0)
+            target = torch.ones_like(mean_mass) / self.num_experts
+            aux = aux + self.aux_loss_coef * ((mean_mass - target) ** 2).sum() * self.num_experts
+        # Z-loss: prevents sigmoid saturation in the router.
+        if self.z_loss_coef > 0:
+            aux = aux + self.z_loss_coef * z_loss
+        self.last_aux_loss = aux.squeeze()
 
         out = expert_out + shared_out
         if len(orig_shape) == 3:

@@ -166,10 +166,13 @@ class ModernBertConfig:
     use_moe: bool = False
     moe_num_experts: int = 8
     moe_top_k: int = 2
-    moe_num_shared_experts: int = 1
-    moe_scoring_func: str = "sigmoid"
     moe_use_bias_correction: bool = True
-    moe_aux_loss_coef: float = 0.0
+    moe_aux_loss_coef: float = 0.01
+    moe_z_loss_coef: float = 5e-5  # prevents sigmoid saturation in router (DeepSeek-V3 style)
+    moe_routed_scaling_factor: float = 1.0
+    moe_n_group: int = 1
+    moe_topk_group: int = 1
+    moe_bias_update_rate: float = 1e-3
     moe_leading_dense_layers: int = 0  # first N layers are always dense (DeepSeek uses 1)
 
     head_dim: int = field(init=False)
@@ -177,6 +180,7 @@ class ModernBertConfig:
     layer_types: list[str] = field(init=False)
     canon_layer_set: frozenset[str] = field(init=False)
     moe_layer_flags: list[bool] = field(init=False)
+    moe_dense_intermediate_size: int = field(init=False)
 
     def __post_init__(self) -> None:
         self.mhc_lite_wrapping_level = str(self.mhc_lite_wrapping_level).strip().lower()  # type: ignore[assignment]
@@ -269,6 +273,23 @@ class ModernBertConfig:
             )
         # MoE layer flags.
         if self.use_moe:
+            if self.moe_n_group < 1:
+                raise ValueError(f"moe_n_group must be >= 1, got {self.moe_n_group}")
+            if self.moe_topk_group < 1:
+                raise ValueError(f"moe_topk_group must be >= 1, got {self.moe_topk_group}")
+            if self.moe_n_group > 1:
+                if self.moe_num_experts % self.moe_n_group != 0:
+                    raise ValueError(
+                        "moe_num_experts must be divisible by moe_n_group: "
+                        f"{self.moe_num_experts} % {self.moe_n_group} != 0"
+                    )
+                if self.moe_topk_group > self.moe_n_group:
+                    raise ValueError(
+                        "moe_topk_group must be <= moe_n_group: "
+                        f"{self.moe_topk_group} > {self.moe_n_group}"
+                    )
+            else:
+                self.moe_topk_group = 1
             self.moe_layer_flags = [True] * self.num_hidden_layers
             # Force first N layers to dense.
             for i in range(min(self.moe_leading_dense_layers, self.num_hidden_layers)):
@@ -282,8 +303,14 @@ class ModernBertConfig:
                     "MoE is not compatible with activation_checkpointing_mode='attn+mlp'. "
                     "Use 'attn' or 'layer' mode instead."
                 )
+            # Dense layers in MoE mode use the full active intermediate size
+            # so they match the per-token compute of MoE layers.
+            self.moe_dense_intermediate_size = (
+                (self.moe_top_k + 1) * self.intermediate_size
+            )
         else:
             self.moe_layer_flags = [False] * self.num_hidden_layers
+            self.moe_dense_intermediate_size = self.intermediate_size
 
 
 def _get_activation(name: str):
@@ -1138,12 +1165,20 @@ class ModernBertEncoderLayer(nn.Module):
             if config.use_moe and config.moe_layer_flags[layer_idx]:
                 from .moe import MoELayer
                 self.mlp = MoELayer(config)
-            elif config.mlp_activation == "srelu":
-                self.mlp = ModernBertSReluMLP(config)
-            elif config.mlp_activation == "swiglu":
-                self.mlp = ModernBertSwiGLUMLP(config)
             else:
-                self.mlp = ModernBertMLP(config)
+                # For dense layers in MoE mode, use the full active intermediate
+                # size so per-token capacity matches the MoE layers.
+                mlp_config = config
+                if config.use_moe and not config.moe_layer_flags[layer_idx]:
+                    import copy
+                    mlp_config = copy.copy(config)
+                    mlp_config.intermediate_size = config.moe_dense_intermediate_size
+                if mlp_config.mlp_activation == "srelu":
+                    self.mlp = ModernBertSReluMLP(mlp_config)
+                elif mlp_config.mlp_activation == "swiglu":
+                    self.mlp = ModernBertSwiGLUMLP(mlp_config)
+                else:
+                    self.mlp = ModernBertMLP(mlp_config)
         else:
             self.mlp_norm = nn.Identity()
             self.canon_c = None
@@ -2164,8 +2199,8 @@ class ModernBertForMaskedLM(nn.Module):
                     labels,
                     ignore_index=self.sparse_pred_ignore_index,
                 )
-                # MoE auxiliary loss.
-                if self.config.use_moe and self.config.moe_aux_loss_coef > 0:
+                # MoE auxiliary losses (balance + z-loss, coefficients baked in).
+                if self.config.use_moe:
                     from .moe import MoELayer as _MoELayer
                     aux_losses = [
                         layer.mlp.last_aux_loss
@@ -2175,9 +2210,7 @@ class ModernBertForMaskedLM(nn.Module):
                         ) and layer.mlp.last_aux_loss is not None
                     ]
                     if aux_losses:
-                        loss = loss + self.config.moe_aux_loss_coef * (
-                            sum(aux_losses) / len(aux_losses)
-                        )
+                        loss = loss + sum(aux_losses) / len(aux_losses)
             else:
                 logits = self.decoder(self.head(x))
                 loss = None

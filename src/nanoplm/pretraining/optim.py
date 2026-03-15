@@ -102,6 +102,16 @@ def _is_zero_init_fragile_param(name: str) -> bool:
     return False
 
 
+def _is_router_param(name: str) -> bool:
+    parts = name.split(".")
+    return len(parts) >= 3 and parts[-3:] == ["router", "gate", "weight"]
+
+
+def _is_moe_routed_expert_param(name: str) -> bool:
+    parts = name.split(".")
+    return len(parts) >= 2 and parts[-2:] in (["mlp", "Wi"], ["mlp", "Wo"])
+
+
 def build_muon_optimizer(
     model: torch.nn.Module,
     pretrain_config: PretrainingConfig,
@@ -128,10 +138,15 @@ def build_muon_optimizer(
         elif param.ndim == 1 or _is_embedding_or_unembedding_param(name):
             adamw_params.append(param)
         elif param.ndim == 2:
-            if _is_zero_init_fragile_param(name):
+            if _is_zero_init_fragile_param(name) or _is_router_param(name):
                 adamw_params.append(param)
             else:
                 muon_params.append(param)
+        elif param.ndim == 3 and _is_moe_routed_expert_param(name):
+            # MoE routed experts are stored as stacked 3D tensors for grouped_mm.
+            # NorMuon supports batched 2D updates, so keep these on the Muon side
+            # instead of falling back to AdamW just because of the storage layout.
+            muon_params.append(param)
         else:
             adamw_params.append(param)
 
@@ -140,11 +155,17 @@ def build_muon_optimizer(
             "No eligible matrix parameters found for Muon (expected 2D hidden-layer weights)."
         )
 
+    muon_numel = sum(p.numel() for p in muon_params)
+    adamw_numel = sum(p.numel() for p in adamw_params)
+    resid_numel = sum(p.numel() for p in resid_params)
+    x0_numel = sum(p.numel() for p in x0_params)
     logger.info(
         f"Muon grouping: muon_params={len(muon_params)} tensors, "
         f"adamw_params={len(adamw_params)} tensors, "
         f"resid_scalar_params={len(resid_params)} tensors, "
-        f"x0_scalar_params={len(x0_params)} tensors"
+        f"x0_scalar_params={len(x0_params)} tensors; "
+        f"muon_numel={muon_numel:,}, adamw_numel={adamw_numel:,}, "
+        f"resid_numel={resid_numel:,}, x0_numel={x0_numel:,}"
     )
 
     return build_optimizer(

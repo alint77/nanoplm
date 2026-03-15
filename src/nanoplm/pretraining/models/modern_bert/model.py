@@ -71,10 +71,13 @@ class ProtModernBertMLMConfig:
     use_moe: bool = False
     moe_num_experts: int = 8
     moe_top_k: int = 2
-    moe_num_shared_experts: int = 1
-    moe_scoring_func: str = "sigmoid"
     moe_use_bias_correction: bool = True
-    moe_aux_loss_coef: float = 0.0
+    moe_aux_loss_coef: float = 0.01
+    moe_z_loss_coef: float = 5e-5
+    moe_routed_scaling_factor: float = 1.0
+    moe_n_group: int = 1  # group-limited routing: number of expert groups (1 = flat top-k)
+    moe_topk_group: int = 1  # group-limited routing: number of groups kept per token
+    moe_bias_update_rate: float = 1e-3  # Ling-style expert-bias update rate
     moe_leading_dense_layers: int = 0
 
 

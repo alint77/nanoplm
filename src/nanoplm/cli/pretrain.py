@@ -1219,10 +1219,14 @@ def get_yaml(output: Optional[str], force: bool):
         "  use_moe: false\n"
         "  moe_num_experts: 8              # number of routed experts\n"
         "  moe_top_k: 2                    # experts activated per token\n"
-        "  moe_num_shared_experts: 1       # shared expert processing all tokens\n"
-        "  moe_scoring_func: \"sigmoid\"     # router scoring function\n"
-        "  moe_use_bias_correction: true   # DeepSeek-V3 style routing bias correction\n"
-        "  moe_aux_loss_coef: 0.0          # sequence-level balance regularizer (0 = off)\n"
+        "  # one shared expert is always enabled; routing is always sigmoid\n"
+        "  moe_use_bias_correction: true   # expert-bias load balancing (selection-only)\n"
+        "  moe_aux_loss_coef: 0.01         # differentiable balance regularizer over router mass\n"
+        "  moe_z_loss_coef: 5e-5           # router z-loss for small-model MoE stability\n"
+        "  moe_routed_scaling_factor: 1.0  # routed branch output scale; start conservative\n"
+        "  moe_n_group: 1                  # group-limited routing: 1 disables, >1 partitions experts into groups\n"
+        "  moe_topk_group: 1               # with moe_n_group > 1, keep top K groups per token\n"
+        "  moe_bias_update_rate: 1e-3      # expert-bias correction step size\n"
         "  moe_leading_dense_layers: 1     # first N layers are always dense (DeepSeek uses 1)\n"
         "\n"
         "pretraining:\n"
@@ -1438,6 +1442,8 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
 def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
     if config is None:
         raise ValueError("Model configuration is required but not found in YAML")
+
+    config = dict(config)
 
     model_fields = {f.name: f for f in fields(ProtModernBertMLMConfig)}
     expected_keys = set(model_fields.keys())

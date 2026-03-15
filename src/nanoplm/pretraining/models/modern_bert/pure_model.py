@@ -84,10 +84,13 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             use_moe=config.use_moe,
             moe_num_experts=config.moe_num_experts,
             moe_top_k=config.moe_top_k,
-            moe_num_shared_experts=config.moe_num_shared_experts,
-            moe_scoring_func=config.moe_scoring_func,
             moe_use_bias_correction=config.moe_use_bias_correction,
             moe_aux_loss_coef=config.moe_aux_loss_coef,
+            moe_z_loss_coef=config.moe_z_loss_coef,
+            moe_routed_scaling_factor=config.moe_routed_scaling_factor,
+            moe_n_group=config.moe_n_group,
+            moe_topk_group=config.moe_topk_group,
+            moe_bias_update_rate=config.moe_bias_update_rate,
             moe_leading_dense_layers=config.moe_leading_dense_layers,
         )
 
