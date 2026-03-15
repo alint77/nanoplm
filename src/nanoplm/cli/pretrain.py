@@ -933,9 +933,17 @@ def run(
     else:
         model = ProtModernBertMLM(model_cfg)
 
-    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+    model_parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
     total_params = sum(p.numel() for p in model_parameters)
     logger.info(f"Total Trainable Parameters: {total_params}")
+    if getattr(model_cfg, "use_moe", False):
+        from nanoplm.pretraining.models.modern_bert.moe import MoELayer as _MoELayer
+        inactive = 0
+        for m in model.modules():
+            if isinstance(m, _MoELayer):
+                inactive += (m.num_experts - m.top_k) * m.Wi.shape[1] * m.Wi.shape[2]
+                inactive += (m.num_experts - m.top_k) * m.Wo.shape[1] * m.Wo.shape[2]
+        logger.info(f"Active Parameters (per token): {total_params - inactive}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
     resume_cfg = ResumeConfig(
@@ -1097,9 +1105,17 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
     else:
         model = ProtModernBertMLM(config=model_config)
 
-    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+    model_parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
     total_params = sum(p.numel() for p in model_parameters)
     logger.info(f"Total Trainable Parameters: {total_params}")
+    if getattr(model_config, "use_moe", False):
+        from nanoplm.pretraining.models.modern_bert.moe import MoELayer as _MoELayer
+        inactive = 0
+        for m in model.modules():
+            if isinstance(m, _MoELayer):
+                inactive += (m.num_experts - m.top_k) * m.Wi.shape[1] * m.Wi.shape[2]
+                inactive += (m.num_experts - m.top_k) * m.Wo.shape[1] * m.Wo.shape[2]
+        logger.info(f"Active Parameters (per token): {total_params - inactive}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
     if pure_te:

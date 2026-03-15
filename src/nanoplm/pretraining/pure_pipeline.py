@@ -783,10 +783,34 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
     # swiglu/glu: Wi is h -> 2*ff, Wo is ff -> h => 2*h*2*ff + 2*ff*h = 6*h*ff
     # srelu:      Wi is h -> ff,   Wo is ff -> h => 2*h*ff   + 2*ff*h = 4*h*ff
     if config.mlp_activation == "srelu":
-        mlp_flops_per_layer = 4 * h * ff
+        dense_mlp_flops = 4 * h * ff
     else:
-        mlp_flops_per_layer = 6 * h * ff
-    mlp_flops = n_layers * mlp_flops_per_layer
+        dense_mlp_flops = 6 * h * ff
+
+    no_mlp_first = getattr(config, "no_mlp_on_first_layer", False)
+    use_moe = getattr(config, "use_moe", False)
+    if use_moe:
+        # MoE active FLOPs per token per MoE layer:
+        #  - Router gate: h -> num_experts (2 * h * E)
+        #  - Routed experts: top_k experts, each SwiGLU with ff intermediate
+        #      Wi: h -> 2*ff, Wo: ff -> h => top_k * 6 * h * ff
+        #  - Shared expert: same as one dense MLP => 6 * h * ff (or 4 for srelu)
+        moe_top_k = config.moe_top_k
+        moe_E = config.moe_num_experts
+        router_flops = 2 * h * moe_E
+        routed_flops = moe_top_k * dense_mlp_flops
+        shared_flops = dense_mlp_flops
+        moe_mlp_flops = router_flops + routed_flops + shared_flops
+
+        moe_flags = config.moe_layer_flags
+        mlp_flops = sum(
+            0 if (no_mlp_first and i == 0) else
+            (moe_mlp_flops if moe_flags[i] else dense_mlp_flops)
+            for i in range(n_layers)
+        )
+    else:
+        n_mlp_layers = (n_layers - 1) if no_mlp_first else n_layers
+        mlp_flops = n_mlp_layers * dense_mlp_flops
 
     # -- LM head (decoder): h -> V --
     # Not counted when tied (it's the same weight as embedding), but the matmul
@@ -1558,6 +1582,13 @@ def run_pure_pretraining(
     use_packing = bool(pretrain_config.use_packing)
     use_static_inp_size = bool(pretrain_config.use_static_inp_size and use_packing)
 
+    # MoE guard rails.
+    if getattr(model.config, "use_moe", False):
+        if not use_packing:
+            raise ValueError("MoE requires use_packing=True")
+        if not use_static_inp_size:
+            raise ValueError("MoE requires use_static_inp_size=True")
+
     # ---- Batch sizing ----
     create_dirs(pretrain_config.ckp_dir)
     effective_world_size = _resolve_world_size(pretrain_config)
@@ -2048,6 +2079,23 @@ def run_pure_pretraining(
     pending_compile_rebuild = False
     pending_compile_target_divisor = mbs_divisor
     accum_loss = torch.zeros((), device=device)
+    # MoE routing bias update state.
+    _moe_layers: list = []
+    _moe_bias_lr = 0.01  # bias correction step size
+    if getattr(orig_model.config, "use_moe", False) and getattr(orig_model.config, "moe_use_bias_correction", False):
+        from nanoplm.pretraining.models.modern_bert.moe import MoELayer as _MoELayer
+        _moe_layers = [
+            m for m in orig_model.modules() if isinstance(m, _MoELayer)
+        ]
+        if _moe_layers:
+            _moe_num_experts = _moe_layers[0].num_experts
+            _moe_count_accum = torch.zeros(
+                len(_moe_layers), _moe_num_experts, device=device,
+            )
+            logger.info(
+                f"MoE routing bias correction enabled: "
+                f"{len(_moe_layers)} MoE layers, {_moe_num_experts} experts"
+            )
     window_loss = torch.zeros((), device=device)
     window_steps = 0
     discard_accumulation = False
@@ -2253,6 +2301,12 @@ def run_pure_pretraining(
 
                     accum_loss = accum_loss + loss.detach()
 
+                    # Accumulate MoE expert counts for routing bias update.
+                    if _moe_layers:
+                        for j, moe_layer in enumerate(_moe_layers):
+                            if moe_layer.last_expert_counts is not None:
+                                _moe_count_accum[j] += moe_layer.last_expert_counts.float()
+
                     if not at_accum_boundary:
                         continue
 
@@ -2303,6 +2357,26 @@ def run_pure_pretraining(
                     if not step_skipped:
                         scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+
+                    # MoE routing bias correction: update after each optimizer step.
+                    if _moe_layers and not step_skipped:
+                        with torch.no_grad():
+                            # All-reduce counts across ranks for global view.
+                            if distributed and dist.is_initialized():
+                                dist.all_reduce(_moe_count_accum, op=dist.ReduceOp.SUM)
+                            for j, moe_layer in enumerate(_moe_layers):
+                                counts_j = _moe_count_accum[j]
+                                total = counts_j.sum()
+                                if total > 0:
+                                    target = total / _moe_num_experts
+                                    # Nudge bias: positive for underused, negative for overused.
+                                    # correction_bias is a registered buffer (not a
+                                    # parameter), so FSDP won't shard it.
+                                    delta = _moe_bias_lr * (target - counts_j) / target
+                                    moe_layer.router.correction_bias.add_(
+                                        delta.to(moe_layer.router.correction_bias.device)
+                                    )
+                            _moe_count_accum.zero_()
 
                     global_step += 1
                     profiler_step_cb(global_step)

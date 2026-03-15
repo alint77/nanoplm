@@ -162,11 +162,21 @@ class ModernBertConfig:
     mhc_lite_wrapping_level: Literal["layer", "sublayers"] = "layer"
     use_diff_attn_v2: bool = False
     attn_layer_pattern: Optional[str] = None
+    # MoE (Mixture-of-Experts)
+    use_moe: bool = False
+    moe_num_experts: int = 8
+    moe_top_k: int = 2
+    moe_num_shared_experts: int = 1
+    moe_scoring_func: str = "sigmoid"
+    moe_use_bias_correction: bool = True
+    moe_aux_loss_coef: float = 0.0
+    moe_layer_pattern: Optional[str] = None  # e.g. "DM" for alternating dense/moe
 
     head_dim: int = field(init=False)
     sliding_window: int = field(init=False)
     layer_types: list[str] = field(init=False)
     canon_layer_set: frozenset[str] = field(init=False)
+    moe_layer_flags: list[bool] = field(init=False)
 
     def __post_init__(self) -> None:
         self.mhc_lite_wrapping_level = str(self.mhc_lite_wrapping_level).strip().lower()  # type: ignore[assignment]
@@ -257,6 +267,35 @@ class ModernBertConfig:
                 "RePO predicts per-head positions for Q and K jointly, which requires "
                 "equal Q/K head counts."
             )
+        # MoE layer flags.
+        if self.use_moe:
+            if self.moe_layer_pattern is not None:
+                pat = self.moe_layer_pattern.upper().strip()
+                if not pat:
+                    raise ValueError("moe_layer_pattern must not be empty when provided.")
+                _moe_map = {"M": True, "D": False}
+                for ch in pat:
+                    if ch not in _moe_map:
+                        raise ValueError(
+                            f"Invalid character '{ch}' in moe_layer_pattern. "
+                            "Use 'M' for MoE and 'D' for dense."
+                        )
+                self.moe_layer_flags = [
+                    _moe_map[pat[i % len(pat)]] for i in range(self.num_hidden_layers)
+                ]
+            else:
+                self.moe_layer_flags = [True] * self.num_hidden_layers
+            if (
+                self.activation_checkpointing
+                and self.activation_checkpointing_mode == "attn+mlp"
+                and any(self.moe_layer_flags)
+            ):
+                raise ValueError(
+                    "MoE is not compatible with activation_checkpointing_mode='attn+mlp'. "
+                    "Use 'attn' or 'layer' mode instead."
+                )
+        else:
+            self.moe_layer_flags = [False] * self.num_hidden_layers
 
 
 def _get_activation(name: str):
@@ -1108,7 +1147,10 @@ class ModernBertEncoderLayer(nn.Module):
                 if "c" in config.canon_layer_set
                 else None
             )
-            if config.mlp_activation == "srelu":
+            if config.use_moe and config.moe_layer_flags[layer_idx]:
+                from .moe import MoELayer
+                self.mlp = MoELayer(config)
+            elif config.mlp_activation == "srelu":
                 self.mlp = ModernBertSReluMLP(config)
             elif config.mlp_activation == "swiglu":
                 self.mlp = ModernBertSwiGLUMLP(config)
@@ -2017,17 +2059,32 @@ class ModernBertForMaskedLM(nn.Module):
             nn.init.uniform_(enc.attn.Wqkv.weight, -bound, bound)
             nn.init.zeros_(enc.attn.Wo.weight)
             if enc.mlp is not None:
-                nn.init.uniform_(enc.mlp.Wi.weight, -bound, bound)
-                if hasattr(enc.mlp, "Wo"):
-                    nn.init.zeros_(enc.mlp.Wo.weight)
+                from .moe import MoELayer as _MoELayer
+                if isinstance(enc.mlp, _MoELayer):
+                    # Routed expert stacked weights (nn.Parameter, not nn.Linear).
+                    nn.init.uniform_(enc.mlp.Wi, -bound, bound)
+                    nn.init.zeros_(enc.mlp.Wo)
+                    # Router gate.
+                    nn.init.uniform_(enc.mlp.router.gate.weight, -bound, bound)
+                    # Shared expert (ModernBertSwiGLUMLP).
+                    nn.init.uniform_(enc.mlp.shared_expert.Wi.weight, -bound, bound)
+                    nn.init.zeros_(enc.mlp.shared_expert.Wo.weight)
+                    if enc.mlp.shared_expert.Wi.bias is not None:
+                        nn.init.zeros_(enc.mlp.shared_expert.Wi.bias)
+                    if enc.mlp.shared_expert.Wo.bias is not None:
+                        nn.init.zeros_(enc.mlp.shared_expert.Wo.bias)
                 else:
-                    nn.init.zeros_(enc.mlp.Wo_weight)
+                    nn.init.uniform_(enc.mlp.Wi.weight, -bound, bound)
+                    if hasattr(enc.mlp, "Wo"):
+                        nn.init.zeros_(enc.mlp.Wo.weight)
+                    else:
+                        nn.init.zeros_(enc.mlp.Wo_weight)
 
             if enc.attn.Wqkv.bias is not None:
                 nn.init.zeros_(enc.attn.Wqkv.bias)
             if enc.attn.Wo.bias is not None:
                 nn.init.zeros_(enc.attn.Wo.bias)
-            if enc.mlp is not None:
+            if enc.mlp is not None and not isinstance(enc.mlp, _MoELayer):
                 if enc.mlp.Wi.bias is not None:
                     nn.init.zeros_(enc.mlp.Wi.bias)
                 if hasattr(enc.mlp, "Wo"):
@@ -2119,6 +2176,20 @@ class ModernBertForMaskedLM(nn.Module):
                     labels,
                     ignore_index=self.sparse_pred_ignore_index,
                 )
+                # MoE auxiliary loss.
+                if self.config.use_moe and self.config.moe_aux_loss_coef > 0:
+                    from .moe import MoELayer as _MoELayer
+                    aux_losses = [
+                        layer.mlp.last_aux_loss
+                        for layer in self.model.layers
+                        if hasattr(layer, "mlp") and isinstance(
+                            getattr(layer, "mlp", None), _MoELayer,
+                        ) and layer.mlp.last_aux_loss is not None
+                    ]
+                    if aux_losses:
+                        loss = loss + self.config.moe_aux_loss_coef * (
+                            sum(aux_losses) / len(aux_losses)
+                        )
             else:
                 logits = self.decoder(self.head(x))
                 loss = None

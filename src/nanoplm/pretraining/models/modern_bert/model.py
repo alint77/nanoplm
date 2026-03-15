@@ -67,6 +67,15 @@ class ProtModernBertMLMConfig:
     mhc_lite_wrapping_level: str = "layer"
     use_diff_attn_v2: bool = False
     attn_layer_pattern: Optional[str] = None
+    # MoE
+    use_moe: bool = False
+    moe_num_experts: int = 8
+    moe_top_k: int = 2
+    moe_num_shared_experts: int = 1
+    moe_scoring_func: str = "sigmoid"
+    moe_use_bias_correction: bool = True
+    moe_aux_loss_coef: float = 0.0
+    moe_layer_pattern: Optional[str] = None
 
 
 class ProtModernBertMLM(ModernBertForMaskedLM):
@@ -75,6 +84,11 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
         self,
         config: ProtModernBertMLMConfig
     ):
+        if config.use_moe:
+            raise ValueError(
+                "MoE is implemented only in the pure-torch path. "
+                "Use --pure-torch with use_moe=true."
+            )
         if config.use_canon_layers:
             raise ValueError(
                 "Canon layers are currently implemented only in the pure-torch path. "
