@@ -1,249 +1,541 @@
-# Mixture-of-Experts Implementation
+# Mixture-of-Experts: Research, Design, and Implementation
 
-## Overview
+## Purpose
 
-nanoPLM supports Mixture-of-Experts (MoE) as a drop-in replacement for the dense MLP in any encoder layer. The implementation uses `torch.nn.functional.grouped_mm` — a CUTLASS-backed grouped GEMM — as the core compute primitive. No token dropping, no capacity factor, no padding waste.
+This document is the single source of truth for nanoPLM's MoE work.
 
-Pure-torch pipeline only. No Transformer Engine, no FP8.
+It does three jobs:
 
-## Architecture
+1. Summarizes the research path across public MoE models.
+2. Explains why Ling-mini-2.0 / Ling-V2 became the main inspiration point.
+3. Documents the current nanoPLM implementation and the reasons behind its design choices.
 
-Each MoE layer replaces a single dense MLP with:
+This replaces the older split between "implementation notes" and the separate Ling research report.
 
-- **N routed experts** — stacked weight tensors processed via `grouped_mm`
-- **1 shared expert** — a standard `ModernBertSwiGLUMLP` that processes all tokens
-- **1 sigmoid top-k router** — selects which routed experts each token uses
+## Scope
 
-Per-token forward: the router picks `top_k` experts. Those experts process the token via SwiGLU. Their outputs are combined using renormalized sigmoid weights. The shared expert output is added on top.
+nanoPLM's MoE exists only in the pure-torch path.
 
+Requirements:
+
+- `use_moe: true`
+- `use_packing: true`
+- `use_static_inp_size: true`
+
+Not supported:
+
+- HF ModernBERT path
+- Transformer Engine path
+- capacity-limited / token-dropping MoE
+- expert parallel / all-to-all dispatch
+
+The implementation is intentionally "single-program, dropless, grouped-GEMM MoE", not a distributed expert-parallel MoE system.
+
+## Research Path
+
+The original goal was not just "add top-k experts". The goal was to understand what modern strong MoEs are actually doing, especially in routing, load balancing, and small-scale stability.
+
+The main public references examined were:
+
+- DeepSeek-V3
+- Qwen3-MoE
+- Qwen3-Next
+- Qwen3.5
+- GLM-4.5
+- GLM-5
+- Ling-mini-2.0 / Ling-V2
+
+### What the research consistently showed
+
+Across the strongest recent MoEs, the design center has shifted away from old Switch-style recipes.
+
+The recurring frontier pattern is:
+
+- dropless routing
+- top-k expert selection
+- one shared expert or a shared dense path
+- bias-corrected routing or another explicit load-balancing mechanism
+- strong router stabilization
+- communication-aware routing restrictions at large expert count
+
+The most important architectural lesson was that modern good MoEs are not just "dense FFN, but sparse". They are routing systems first and MLP systems second.
+
+### DeepSeek / GLM family
+
+DeepSeek-V3 and the GLM-4.5 / GLM-5 family are especially important because they expose a coherent routing style:
+
+- `sigmoid` routing rather than softmax
+- top-k selection
+- one shared expert
+- expert-selection bias correction
+- no token dropping
+- z-loss or equivalent router stabilization
+
+This family treats load balancing as a routing-control problem rather than as a pure auxiliary-loss problem.
+
+That was the biggest conceptual shift that influenced nanoPLM.
+
+### Qwen family
+
+Qwen3-MoE, Qwen3-Next, and Qwen3.5 were useful mainly as a contrast class.
+
+Their public implementations emphasize:
+
+- `softmax` top-k routing
+- more explicit auxiliary balancing
+- in Qwen3-Next / Qwen3.5, a gated shared-expert branch
+
+They are strong references, but less attractive as a direct blueprint for nanoPLM because the public code centers less on bias-corrected sigmoid routing and more on the Qwen-specific hybrid backbone / softmax router family.
+
+### Why Ling mattered more than the others
+
+Ling-mini-2.0 ended up being the most relevant reference for nanoPLM, not because it is the biggest or most famous MoE, but because it is the best public example of a **serious small-activation MoE**.
+
+That matters for nanoPLM because we care much more about the small-to-mid model regime than about 200B-plus frontier cluster designs.
+
+Ling is unusually valuable because it combines:
+
+- a scaling-law paper focused on MoE architecture choice
+- a released checkpoint/config in a relatively modest size regime
+- public model code
+- public training patches and scripts
+
+That combination is rare.
+
+## Why Ling Became the Anchor Reference
+
+Ling-mini-2.0 is compelling for nanoPLM for four reasons.
+
+### 1. It lives in a transferable size regime
+
+Most public MoE systems are so large that many of their choices only make sense because the cluster budget is enormous.
+
+Ling is different. It demonstrates a sparse MoE recipe at a scale where:
+
+- routing instability still matters
+- hidden size is not massive
+- expert count still changes behavior materially
+- systems constraints still look somewhat like an advanced single-node project
+
+That makes Ling far more transferable to nanoPLM than a giant model whose stability comes partly from sheer scale.
+
+### 2. The paper is about architecture choice, not only a checkpoint
+
+The Ling scaling-law paper's main message is that:
+
+- expert activation ratio is the dominant MoE efficiency lever
+- expert granularity has an optimum rather than "bigger is always better"
+- shared-expert ratio and leading dense layers matter, but as secondary knobs
+
+That framing is exactly what a project like nanoPLM needs.
+
+It helps answer:
+
+- how many experts should a small model try?
+- how small should each expert be?
+- how much dense path should remain?
+
+### 3. The code reveals real training handling
+
+Ling's open training stack shows details many releases hide:
+
+- router kept in fp32
+- expert-bias updates
+- zero-mean bias update variant
+- group-limited routing
+- small z-loss
+
+Those are not cosmetic details. They are exactly the kind of decisions that determine whether a small MoE trains cleanly or collapses.
+
+### 4. It is close to the DeepSeek-style routing family
+
+Ling is not a copy of DeepSeek-V3, but it is clearly in the same design neighborhood:
+
+- sigmoid router
+- selection-only bias correction
+- shared expert
+- group-limited routing
+- router stabilization
+
+That gave nanoPLM a much clearer path than the Qwen-style softmax route.
+
+## What nanoPLM took from the research
+
+The current nanoPLM MoE is best understood as:
+
+- structurally inspired by DeepSeek / GLM / Ling
+- scoped down to a single-node pure-torch implementation
+- adapted for small-model experimentation
+
+The key design decisions that came directly out of the research are:
+
+- **Sigmoid top-k routing**
+  Ling, DeepSeek, and GLM all reinforced that sigmoid routing is a good fit for sparse expert selection.
+
+- **One always-on shared expert**
+  This preserves a dense path for token-generic processing and reduces the brittleness of fully routed sparse MLPs.
+
+- **Bias-corrected routing**
+  Expert usage is nudged through a selection-only bias rather than relying only on a classic aux loss.
+
+- **Router kept numerically conservative**
+  Router logits are handled in fp32 and regularized with z-loss.
+
+- **Leading dense layers**
+  The first few layers can remain dense because early token processing is less specialization-heavy.
+
+- **Dropless grouped-GEMM dispatch**
+  `grouped_mm` allows jagged token counts per expert without token dropping or padding to capacity.
+
+- **Optional group-limited routing**
+  This gives a path toward higher expert counts without turning routing into a fully unconstrained search.
+
+## Where nanoPLM intentionally differs from Ling
+
+Ling is the main inspiration, not the blueprint.
+
+The current implementation differs in a few deliberate ways:
+
+- **No expert-parallel / DeepEP stack**
+  nanoPLM stays single-program and FSDP-sharded. There is no all-to-all expert dispatch.
+
+- **No separate `moe_intermediate_size` yet**
+  The routed experts currently reuse `intermediate_size`. Ling uses a dedicated expert width.
+
+- **No Ling-style giant expert counts by default**
+  nanoPLM keeps the config scalable, but current runs often use far fewer experts than Ling's `256`.
+
+- **A real differentiable aux loss is still present**
+  Ling belongs to the bias-corrected near-noaux family. nanoPLM currently keeps a differentiable router-mass balance term as a second stabilizer.
+
+- **Routed scaling is conservative**
+  Ling uses a larger routed scaling factor. nanoPLM currently defaults to `1.0` for stability in the small-model regime.
+
+So the current design is "Ling-style routing logic with a simpler local systems stack and more conservative stabilization defaults."
+
+## Current nanoPLM Architecture
+
+Each MoE layer replaces a dense SwiGLU MLP with:
+
+- `N` routed experts stored as stacked tensors
+- `1` fixed shared expert implemented as a normal `ModernBertSwiGLUMLP`
+- `1` sigmoid top-k router
+
+Per-token flow:
+
+```text
+shared_out = shared_expert(x)
+weights, indices = router(x)
+dispatch tokens to experts
+run routed expert MLPs with grouped_mm
+combine routed outputs with normalized weights
+add shared_out
 ```
+
+More explicitly:
+
+```text
 MoELayer.forward(x):
-  shared_out = shared_expert(x)              # all tokens, one MLP
-  weights, indices = router(x)               # sigmoid top-k selection
-  dispatched = sort_by_expert(x, indices)    # sorted permutation
-  expert_out = grouped_swiglu(dispatched)    # grouped_mm through SwiGLU
-  combined = unsort_and_combine(expert_out, weights)
-  return combined + shared_out
+  shared_out = shared_expert(x)
+  weights, indices, z_loss, router_scores = router(x)
+  x_expanded = repeat_interleave(x, top_k)
+  sort expanded tokens by expert id
+  grouped_mm through expert Wi
+  SwiGLU
+  grouped_mm through expert Wo
+  unsort back to token order
+  routed_out = weighted_sum(expert_out, weights) * routed_scaling_factor
+  aux = balance_loss(router_scores) + z_loss
+  return routed_out + shared_out
 ```
 
-### Why grouped_mm over bmm
+## Why `grouped_mm` is the core primitive
 
-The previous design considered `torch.bmm` with fixed-capacity padding. That approach requires a `capacity_factor` hyperparameter, drops tokens that overflow capacity, needs overflow mask bookkeeping to avoid gradient corruption, and wastes compute on padding.
+Earlier MoE designs often rely on fixed capacity per expert:
 
-`grouped_mm` handles jagged per-expert token counts natively. No capacity factor, no dropping, no padding. It is the correct primitive for dropless MoE.
+- choose a capacity factor
+- pad each expert to capacity
+- drop overflow tokens
+- track masks carefully
 
-Verified properties (A100 SM80, PyTorch 2.10, BF16):
+That is not attractive for nanoPLM.
 
-| Property | Result |
-|---|---|
-| Natively autograd differentiable | yes — no custom `autograd.Function` needed |
-| `torch.compile(dynamic=False)` with varying `offs` | works, zero recompilations |
-| Weight layout | `(num_experts, in_features, out_features)` |
+`torch.nn.functional.grouped_mm` is a better match because it:
 
-Note: `grouped_mm` backward has a stride bug with `tensor.sum()` gradients (expanded stride `(0, 0)`). This does not affect real training — `cross_entropy`, `mean()`, and all practical loss functions produce proper gradients.
+- natively handles jagged per-expert token counts
+- avoids capacity hyperparameters
+- avoids overflow token dropping
+- avoids wasted compute on padded expert slots
 
-### What doesn't exist / wasn't used
+That is why routed experts are stored as stacked expert tensors instead of as separate `nn.Linear` modules.
 
-- `torch._grouped_linear` — does not exist in PyTorch 2.10
-- `torch.nn.functional.scaled_grouped_mm` — requires SM89+ (H100/Ada), unavailable on A100
-- `torchtune.modules.moe.GroupedExperts` — gates `grouped_mm` behind SM>=90, falls back to a Python for-loop on SM80
+## Router Design
 
-## Routing and Load Balancing
+### Sigmoid top-k
 
-### Sigmoid top-k router
+The router in [moe.py](/workspace/nanoplm/src/nanoplm/pretraining/models/modern_bert/moe.py) projects hidden states to expert logits, casts them to fp32, applies sigmoid, and selects `top_k` experts.
 
-The router projects hidden states to `(num_experts,)` logits, applies sigmoid, then selects `top_k` experts per token. Unlike softmax routing, sigmoid allows each expert's score to be independent — the router can express "these two experts are both highly relevant" without forcing one down to make the other go up.
+Why sigmoid:
 
-### Routing bias correction (DeepSeek-V3 style)
+- expert scores remain independent before top-k
+- multiple experts can all look strongly relevant
+- this matches the DeepSeek / GLM / Ling family more closely than softmax routing
 
-The primary load balancing mechanism. A `(num_experts,)` bias vector is added to router logits **before** top-k selection but is **not** included in the combine weights. This means the bias steers which experts get selected without distorting how their outputs are weighted.
+### FP32 router
 
-The bias is updated once per optimizer step based on global expert load statistics:
+The router gate output is cast to fp32 before routing math:
 
-1. Each forward pass records per-expert token counts
-2. Counts are accumulated across gradient accumulation micro-steps
-3. At the optimizer step boundary, counts are `all_reduce`d across ranks
-4. The bias is nudged: overused experts get negative bias, underused get positive
-5. Accumulators are reset
+- small score differences determine winner selection
+- bf16 noise can corrupt rankings
+- Ling explicitly keeps router state in fp32
 
-This is one `all_reduce` on a tiny `(num_experts,)` tensor per optimizer step — essentially free. The bias is stored as a registered buffer (not a parameter) so FSDP doesn't shard it.
+This was adopted directly because small-model MoEs are extremely sensitive to router instability.
 
-**Why global/batch-level and not micro-batch:** Qwen's research shows that micro-batches tend to be domain-homogeneous. Forcing uniform expert usage per micro-batch fights natural specialization. Balancing over the full optimization step (across all micro-steps and all ranks) allows natural within-batch imbalance while preventing long-term expert collapse.
+### Group-limited routing
 
-### Auxiliary loss (optional safety valve)
+When `moe_n_group > 1`, routing is constrained in two stages:
 
-A sequence-level balance regularizer, off by default (`moe_aux_loss_coef: 0.0`). Measures squared deviation from uniform expert usage per forward pass. Only turn it on if expert collapse is observed despite bias correction.
+1. experts are partitioned into equal groups
+2. groups are scored by the sum of their top-2 expert scores
+3. only the best `moe_topk_group` groups survive
+4. final top-k routing happens inside the surviving groups
 
-This matches the frontier pattern: DeepSeek-V3, GLM-5, and MiniMax-M2 all use routing bias correction as the primary mechanism, with aux loss as a secondary/optional complement.
+This is lifted directly from the Ling / DeepSeek-style communication-aware routing idea, even though nanoPLM itself does not use expert parallelism yet.
 
-## Research Context
+Set `moe_n_group: 1` to disable it.
 
-The design follows the consensus of modern MoE architectures:
+## Load Balancing and Router Stabilization
 
-| Model | Experts | Top-k | Shared | Routing | Bias correction | Aux loss |
-|---|---|---|---|---|---|---|
-| DeepSeek-V3 | 256 | 8 | 1 | sigmoid | yes | tiny, secondary |
-| GLM-5 | 256 | 8 | 1 | sigmoid | yes | noaux_tc |
-| MiniMax-M2 | 256 | 8 | 0 | sigmoid | yes | 0.001 |
-| Qwen3-Next | 512 | 10 | 1 | — | — | 0.001 |
-| **nanoPLM** | configurable | configurable | 1 | sigmoid | yes | 0.0 (off) |
+### Selection-only routing bias
 
-The practical frontier is: shared expert + sigmoid routing + global bias correction + dropless dispatch. Not: micro-batch auxiliary balancing with capacity-limited dropping.
+If `moe_use_bias_correction` is enabled, the router keeps a persistent `correction_bias` buffer.
 
-## Implementation Details
+This bias:
 
-### File structure
+- is added only for expert selection
+- is **not** used in the final combine weights
 
-All MoE logic lives in one file:
+That distinction is important. It lets nanoPLM steer expert usage without corrupting the semantic weighting of the selected experts.
 
-```
-src/nanoplm/pretraining/models/modern_bert/moe.py    (~175 lines)
-  - Router        — sigmoid top-k with bias correction
-  - MoELayer      — dispatch, grouped_mm SwiGLU, combine
-```
+### Global bias update
 
-Modified files:
-- `modeling.py` — config fields, MLP selection, weight init, aux loss collection
-- `pure_pipeline.py` — guard rails, routing bias update hook, FLOP calculation
-- `pretrain.py` — active vs total parameter logging
+The bias update lives in [pure_pipeline.py](/workspace/nanoplm/src/nanoplm/pretraining/pure_pipeline.py).
 
-### Weight storage
+The update flow is:
 
-Routed experts use stacked weight tensors for `grouped_mm`:
+1. each MoE forward stores per-expert token counts
+2. counts are accumulated across gradient accumulation microsteps
+3. counts are `all_reduce`d across ranks at the optimizer boundary
+4. overused experts get negative bias, underused experts get positive bias
+5. the delta is zero-mean centered before applying
+
+That zero-mean centering is directly inspired by Ling's `bias-zero-mean-update`.
+
+### Z-loss
+
+The router also returns a z-loss:
+
+- mean squared pre-sigmoid logits
+- discourages logit explosion
+- keeps sigmoid in its useful gradient regime
+
+This matches the general router-stabilization strategy seen in Ling and the DeepSeek family.
+
+### Auxiliary loss
+
+nanoPLM currently still keeps a differentiable auxiliary balance loss:
+
+- router scores are normalized per token
+- mean expert mass is measured across the batch
+- deviation from uniform usage is penalized
+
+This is not the main balancing mechanism. The main mechanism is still bias correction.
+
+The aux loss stays because in the small-model regime it is a cheap extra stabilizer, especially before expert specialization settles down.
+
+## Expert Computation and Weight Layout
+
+The routed experts are stored as stacked tensors:
 
 ```python
 Wi = nn.Parameter(torch.empty(num_experts, hidden_size, 2 * intermediate_size))
 Wo = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
 ```
 
-This is `(G, in, out)` layout — transposed relative to `nn.Linear`'s `(out, in)`. Cannot reuse `nn.Linear` modules for routed experts.
+This layout is:
 
-The shared expert is a normal `ModernBertSwiGLUMLP` instance.
+- `(num_experts, in, out)`
+- intentionally chosen for `grouped_mm`
+- not the same as `nn.Linear`'s `(out, in)`
 
-### Dispatch flow
+The shared expert is a normal dense MLP module.
 
-```python
-# 1. Expand tokens by top_k
-x_expanded = x.repeat_interleave(top_k, dim=0)     # (T*top_k, H)
-expert_flat = indices.flatten()                      # (T*top_k,)
+Dispatch flow:
 
-# 2. Sort by expert assignment → contiguous slabs per expert
-sorted_idx = expert_flat.argsort(stable=True)
-x_sorted = x_expanded[sorted_idx]
+1. expand each token `top_k` times
+2. flatten selected expert ids
+3. stable-sort by expert id
+4. compute expert boundaries with `bincount` + `cumsum`
+5. run grouped expert `Wi`
+6. apply SwiGLU
+7. run grouped expert `Wo`
+8. unsort back to token order
+9. combine selected expert outputs with normalized weights
 
-# 3. Compute offs for grouped_mm
-counts = expert_flat.bincount(minlength=num_experts)
-offs = counts.cumsum(0).to(torch.int32)
+This is the simplest dropless local MoE design that still uses the right primitive.
 
-# 4. Grouped SwiGLU
-wi = F.grouped_mm(x_sorted, self.Wi, offs=offs)
-x_proj, gate = wi.chunk(2, dim=-1)
-activated = F.silu(gate) * x_proj
-expert_out_sorted = F.grouped_mm(activated, self.Wo, offs=offs)
+## Dense-first Layers and Active Compute Matching
 
-# 5. Unsort and weighted combine
-expert_out = torch.empty_like(expert_out_sorted)
-expert_out[sorted_idx] = expert_out_sorted
-expert_out = expert_out.view(T, top_k, H)
-expert_out = (expert_out * weights.unsqueeze(-1)).sum(dim=1)
-```
+The config in [modeling.py](/workspace/nanoplm/src/nanoplm/pretraining/models/modern_bert/modeling.py) computes:
 
-With `use_static_inp_size=True`, `T` is fixed per batch, so `T * top_k` is a compile-time constant. `offs` shape `(num_experts,)` is fixed — only values change per batch. `torch.compile(dynamic=False)` does not recompile when `offs` values change.
+- `moe_layer_flags`
+- `moe_dense_intermediate_size = (moe_top_k + 1) * intermediate_size`
+
+This means:
+
+- the first `moe_leading_dense_layers` can remain dense
+- those dense layers are widened so their active compute matches the sparse MoE layers
+
+That is a very Ling-aligned decision:
+
+- early layers often benefit less from routing
+- but they should still be compute-matched for fair ablations
+
+## FSDP and Optimizer Handling
+
+### FSDP
+
+FSDP sees the routed expert weights as ordinary parameters. There is:
+
+- no expert parallelism
+- no router-specific sharding trick
+- no expert all-to-all
+
+The correction bias is a buffer, so it stays replicated and is updated directly after the global count reduction.
+
+### Optimizer grouping
+
+The optimizer logic in [optim.py](/workspace/nanoplm/src/nanoplm/pretraining/optim.py) is worth calling out because it is MoE-specific.
+
+Originally, the routed expert tensors were falling through to AdamW simply because they are stored as 3D stacks.
+
+That was not desirable.
+
+The current behavior is:
+
+- router gate stays on AdamW
+- 1D / embedding / unembedding params stay on AdamW
+- routed expert stacks `mlp.Wi` and `mlp.Wo` are explicitly kept on Muon / NorMuon
+
+This matters because:
+
+- the routed expert stacks are most of the model's parameter count
+- they are conceptually batches of 2D expert matrices
+- Dion's NorMuon explicitly supports non-flattened 3D tensors as batches of 2D matrices
+
+So the optimizer behavior now matches the MoE storage design instead of accidentally fighting it.
+
+## Operational Constraints
+
+### Packed static-shape training
+
+MoE currently assumes the packed static-token path:
+
+- `use_packing: true`
+- `use_static_inp_size: true`
+
+This keeps:
+
+- `T` fixed per batch
+- `T * top_k` fixed
+- expert-offset tensor shapes fixed
+
+That makes the MoE path friendly to `torch.compile(dynamic=False)`.
+
+### Activation checkpointing
+
+MoE works with:
+
+- `activation_checkpointing_mode: "attn"`
+- `activation_checkpointing_mode: "layer"`
+
+MoE does **not** work with:
+
+- `activation_checkpointing_mode: "attn+mlp"`
+
+That is enforced in config validation.
 
 ### Eval path
 
-The MoE forward handles both packed 2D `(T, H)` training input and padded 3D `(B, S, H)` eval input. For 3D input, it reshapes to `(B*S, H)`, runs the identical routing/dispatch/combine flow, then reshapes back. Eval runs under `@torch.compiler.disable` so no compile concerns.
+Training uses the packed 2D token path. Eval can still accept padded 3D inputs:
 
-### FSDP integration
+- reshape to flat tokens
+- run identical MoE logic
+- reshape back
 
-No special handling. The stacked `Wi`/`Wo` parameters are standard `nn.Parameter` tensors — FSDP shards them normally across devices. The routing bias is a registered buffer, so FSDP leaves it unsharded. No expert parallelism, no all-to-all.
+## Current Config Surface
 
-The bias update writes directly to the buffer with `add_()`. Since every rank computes the same delta (counts are `all_reduce`d first), all ranks stay in sync without additional communication.
-
-### FLOP calculation
-
-Active FLOPs per token per MoE layer:
-- Router gate: `2 * H * num_experts`
-- Routed experts: `top_k * 6 * H * intermediate_size` (SwiGLU)
-- Shared expert: `6 * H * intermediate_size` (SwiGLU)
-
-The FLOP estimator respects `moe_leading_dense_layers` and `no_mlp_on_first_layer`.
-
-### Checkpointing
-
-All MoE state is captured by standard `state_dict()` / `load_state_dict()`:
-- `mlp.Wi`, `mlp.Wo` — routed expert stacked weights
-- `mlp.router.gate.weight` — router projection
-- `mlp.router.correction_bias` — routing bias (persistent buffer)
-- `mlp.shared_expert.*` — shared expert MLP weights
-
-Ephemeral per-forward state (`last_expert_counts`, `last_aux_loss`) is correctly excluded — it's recomputed each forward pass. The pipeline-level `_moe_count_accum` resets to zero on resume, starting a fresh accumulation window.
-
-### Weight initialization
-
-Routed expert weights use the same scheme as the dense MLP:
-- `Wi`: uniform `(-bound, bound)`
-- `Wo`: zeros (GPT-2 style output projection init)
-- Router gate: uniform `(-bound, bound)`
-- Shared expert: standard MLP init path
-
-### Interaction with other features
-
-| Feature | Status |
-|---|---|
-| Activation checkpointing (attn mode) | works — MLP is not checkpointed in attn mode |
-| Activation checkpointing (attn+mlp) | raises error — not compatible with MoE |
-| Canon layers A/C | orthogonal — operate on attention/residual |
-| Canon layer D | not applied inside routed experts |
-| DiffAttn v2 | orthogonal — attention only |
-| ProRes | works — MoELayer returns same shape as dense MLP |
-| MHC-lite | works — MoELayer is just a module inside the encoder layer |
-| Batch-size warmup | works — MoE has static shapes regardless |
-
-## Configuration
+The active MoE knobs are:
 
 ```yaml
 model:
   use_moe: true
-  moe_num_experts: 8               # number of routed experts
-  moe_top_k: 2                     # experts activated per token
-  moe_num_shared_experts: 1        # shared expert (always 1 for now)
-  moe_scoring_func: "sigmoid"      # router scoring function
-  moe_use_bias_correction: true    # DeepSeek-V3 style routing bias
-  moe_aux_loss_coef: 0.0           # sequence-level balance loss (0 = off)
-  moe_leading_dense_layers: 1     # first N layers are always dense (DeepSeek uses 1)
+  moe_num_experts: 8
+  moe_top_k: 2
+  moe_use_bias_correction: true
+  moe_aux_loss_coef: 0.01
+  moe_z_loss_coef: 5e-5
+  moe_routed_scaling_factor: 1.0
+  moe_n_group: 1
+  moe_topk_group: 1
+  moe_bias_update_rate: 1e-3
+  moe_leading_dense_layers: 1
 ```
 
-Requirements: `use_packing: true` and `use_static_inp_size: true`. The pipeline raises if these are not set.
+There is no longer a separate config for:
 
-### Leading dense layers
+- number of shared experts
+- router scoring function
+- a standalone "enable group routing" flag
 
-`moe_leading_dense_layers` forces the first N layers to use a standard dense MLP instead of MoE. DeepSeek-V3 uses 1. The intuition is that early layers learn general token representations that all tokens need — routing at that stage adds overhead without meaningful specialization. With `num_hidden_layers=4` and `moe_leading_dense_layers=1`, layer flags are `[dense, MoE, MoE, MoE]`.
+Those are fixed by design:
 
-### Active parameter matching for ablations
+- one shared expert
+- sigmoid routing
+- group routing inferred from `moe_n_group > 1`
 
-To compare MoE vs dense fairly, match **active** parameters per token. Active params = total params minus inactive routed expert weights.
+## Why this is the current landing point
 
-Each token activates `top_k` routed experts + 1 shared expert = `(top_k + 1)` MLPs. To match a dense model with `intermediate_size = I`:
+The final design choice was not "copy Ling".
 
-```
-moe_intermediate_size = I / (top_k + 1)
-```
+It was:
 
-Example with `hidden_size=1024, intermediate_size=2048` dense baseline (43.0M params):
+- take the **routing philosophy** from DeepSeek / GLM / Ling
+- take the **small-scale relevance** and **training visibility** from Ling
+- keep the **systems scope** modest enough for nanoPLM
 
-| Config | `intermediate_size` | Active params | Total params | Ratio |
-|---|---|---|---|---|
-| Dense | 2048 | 43.0M | 43.0M | 1.0x |
-| top_k=2, E=8 | 683 | 43.1M | 93.4M | 2.2x |
-| top_k=1, E=16 | 1024 | 43.1M | 231.8M | 5.4x |
+That is why the current implementation looks the way it does:
 
-Both MoE configs match the dense baseline's active compute per token within 0.1%.
+- not a toy top-2 MoE
+- not a full expert-parallel megacluster stack
+- but a serious sparse MLP design with modern routing and stabilization choices
+
+In short:
+
+- DeepSeek and GLM clarified the routing family
+- Qwen clarified the alternative softmax family
+- Ling made the small-scale case convincing
+- nanoPLM implemented the subset that is most defensible and most transferable
 
 ## Sources
 
-- [Qwen blog: Global Batch Load Balance](https://qwenlm.github.io/blog/global-load-balance/)
-- [DeepSeek-V3 technical report](https://arxiv.org/html/2412.19437)
-- [GLM-5-FP8 config](https://huggingface.co/zai-org/GLM-5-FP8/blob/main/config.json)
-- [MiniMax-M2 config](https://huggingface.co/MiniMaxAI/MiniMax-M2/blob/main/config.json)
-- [PyTorch grouped_mm docs](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.grouped_mm.html)
+- Qwen global-batch load balancing: [https://qwenlm.github.io/blog/global-load-balance/](https://qwenlm.github.io/blog/global-load-balance/)
+- DeepSeek-V3 report: [https://arxiv.org/html/2412.19437](https://arxiv.org/html/2412.19437)
+- GLM-5 config: [https://huggingface.co/zai-org/GLM-5-FP8/blob/main/config.json](https://huggingface.co/zai-org/GLM-5-FP8/blob/main/config.json)
+- MiniMax-M2 config: [https://huggingface.co/MiniMaxAI/MiniMax-M2/blob/main/config.json](https://huggingface.co/MiniMaxAI/MiniMax-M2/blob/main/config.json)
+- Ling scaling-law paper: [https://arxiv.org/abs/2507.17702](https://arxiv.org/abs/2507.17702)
+- Ling HTML paper: [https://arxiv.org/html/2507.17702](https://arxiv.org/html/2507.17702)
+- Ling-V2 repo: [https://github.com/inclusionAI/Ling-V2](https://github.com/inclusionAI/Ling-V2)
+- Ling-mini-2.0 model card: [https://huggingface.co/inclusionAI/Ling-mini-2.0](https://huggingface.co/inclusionAI/Ling-mini-2.0)
+- Ling-mini-base-2.0 config: [https://huggingface.co/inclusionAI/Ling-mini-base-2.0/blob/main/config.json](https://huggingface.co/inclusionAI/Ling-mini-base-2.0/blob/main/config.json)
+- PyTorch `grouped_mm`: [https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.grouped_mm.html](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.grouped_mm.html)

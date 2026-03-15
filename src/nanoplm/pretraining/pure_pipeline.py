@@ -537,10 +537,10 @@ def _fully_shard_transformer_layer(
             sublayer=sublayer,
         )
         if sublayer:
-            fully_shard(layer.mhc_attn, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+            fully_shard(layer.mhc_attn, mesh=mesh, reshard_after_forward=True, **fsdp_kwargs)
             if layer.mhc_mlp is not None:
-                fully_shard(layer.mhc_mlp, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
-    fully_shard(layer, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+                fully_shard(layer.mhc_mlp, mesh=mesh, reshard_after_forward=True, **fsdp_kwargs)
+    fully_shard(layer, mesh=mesh, reshard_after_forward=True, **fsdp_kwargs)
 
 
 def _fully_shard_root_groups(
@@ -556,14 +556,14 @@ def _fully_shard_root_groups(
         fully_shard(
             [model.model.embeddings, model.decoder],
             mesh=mesh,
-            reshard_after_forward=False,
+            reshard_after_forward=True,
             **fsdp_kwargs,
         )
     else:
-        fully_shard(model.model.embeddings, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
-        fully_shard(model.decoder, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
-    fully_shard(model.model.final_norm, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
-    fully_shard(model.head, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+        fully_shard(model.model.embeddings, mesh=mesh, reshard_after_forward=True, **fsdp_kwargs)
+        fully_shard(model.decoder, mesh=mesh, reshard_after_forward=True, **fsdp_kwargs)
+    fully_shard(model.model.final_norm, mesh=mesh, reshard_after_forward=True, **fsdp_kwargs)
+    fully_shard(model.head, mesh=mesh, reshard_after_forward=True, **fsdp_kwargs)
 
 
 def _has_nonfinite_tensors(tensors: list[torch.Tensor]) -> bool:
@@ -802,10 +802,17 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
         shared_flops = dense_mlp_flops
         moe_mlp_flops = router_flops + routed_flops + shared_flops
 
+        # Dense layers in MoE mode use the full active intermediate size.
+        dense_ff = config.moe_dense_intermediate_size
+        if config.mlp_activation == "srelu":
+            moe_dense_mlp_flops = 4 * h * dense_ff
+        else:
+            moe_dense_mlp_flops = 6 * h * dense_ff
+
         moe_flags = config.moe_layer_flags
         mlp_flops = sum(
             0 if (no_mlp_first and i == 0) else
-            (moe_mlp_flops if moe_flags[i] else dense_mlp_flops)
+            (moe_mlp_flops if moe_flags[i] else moe_dense_mlp_flops)
             for i in range(n_layers)
         )
     else:
@@ -2081,7 +2088,7 @@ def run_pure_pretraining(
     accum_loss = torch.zeros((), device=device)
     # MoE routing bias update state.
     _moe_layers: list = []
-    _moe_bias_lr = 0.01  # bias correction step size
+    _moe_bias_lr = float(orig_model.model_config.moe_bias_update_rate)
     if getattr(orig_model.config, "use_moe", False) and getattr(orig_model.config, "moe_use_bias_correction", False):
         from nanoplm.pretraining.models.modern_bert.moe import MoELayer as _MoELayer
         _moe_layers = [
@@ -2359,6 +2366,8 @@ def run_pure_pretraining(
                                     # correction_bias is a registered buffer (not a
                                     # parameter), so FSDP won't shard it.
                                     delta = _moe_bias_lr * (target - counts_j) / target
+                                    # Zero-mean: keep bias vector centered (Ling-V2 style).
+                                    delta = delta - delta.mean()
                                     moe_layer.router.correction_bias.add_(
                                         delta.to(moe_layer.router.correction_bias.device)
                                     )
