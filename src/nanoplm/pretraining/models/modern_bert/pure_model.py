@@ -81,6 +81,14 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             mhc_lite_wrapping_level=str(config.mhc_lite_wrapping_level).strip().lower(),
             use_diff_attn_v2=config.use_diff_attn_v2,
             attn_layer_pattern=config.attn_layer_pattern,
+            use_moe=config.use_moe,
+            moe_num_experts=config.moe_num_experts,
+            moe_top_k=config.moe_top_k,
+            moe_num_shared_experts=config.moe_num_shared_experts,
+            moe_scoring_func=config.moe_scoring_func,
+            moe_use_bias_correction=config.moe_use_bias_correction,
+            moe_aux_loss_coef=config.moe_aux_loss_coef,
+            moe_layer_pattern=config.moe_layer_pattern,
         )
 
         super().__init__(mb_config)
