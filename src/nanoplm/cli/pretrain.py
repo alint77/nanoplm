@@ -1215,6 +1215,15 @@ def get_yaml(output: Optional[str], force: bool):
         "  attn_layer_pattern: null  # Attention pattern string e.g. 'FSS' (F=full, S=sliding). Tiles to num_layers. Overrides global_attn_every_n_layers.\n"
         "  activation_checkpointing: false  # Enable to reduce VRAM by recomputing activations during backward\n"
         "  activation_checkpointing_mode: \"attn\"  # (layer | attn | attn+mlp), attn mode has highest ROI \n"
+        "  # MoE (Mixture-of-Experts) — pure_torch only, requires use_packing + use_static_inp_size\n"
+        "  use_moe: false\n"
+        "  moe_num_experts: 8              # number of routed experts\n"
+        "  moe_top_k: 2                    # experts activated per token\n"
+        "  moe_num_shared_experts: 1       # shared expert processing all tokens\n"
+        "  moe_scoring_func: \"sigmoid\"     # router scoring function\n"
+        "  moe_use_bias_correction: true   # DeepSeek-V3 style routing bias correction\n"
+        "  moe_aux_loss_coef: 0.0          # sequence-level balance regularizer (0 = off)\n"
+        "  moe_leading_dense_layers: 1     # first N layers are always dense (DeepSeek uses 1)\n"
         "\n"
         "pretraining:\n"
         "  dataset_dir: \"output/data/pretrain_data\"\n"
@@ -1434,32 +1443,11 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
     expected_keys = set(model_fields.keys())
     present_keys = set(config.keys())
 
-    if "canon_layer_type" in present_keys:
-        legacy_canon_layer_type = config.get("canon_layer_type")
-        if legacy_canon_layer_type is not None:
-            legacy_value = str(legacy_canon_layer_type).strip().lower()
-            if legacy_value == "causal":
-                raise ValueError(
-                    "model.canon_layer_type='causal' is no longer supported. "
-                    "Causal Canon layers were removed. Delete model.canon_layer_type "
-                    "and use the symmetric Canon layer (kernel sizes: 3/5/7)."
-                )
-            if legacy_value != "symmetric":
-                raise ValueError(
-                    f"model.canon_layer_type={legacy_canon_layer_type!r} is no longer supported. "
-                    "Delete model.canon_layer_type; Canon layers are now symmetric-only."
-                )
-        logger.warning(
-            "Ignoring deprecated model.canon_layer_type; Canon layers are now symmetric-only."
-        )
-
     extra = []
     kwargs: Dict[str, Any] = {}
 
     # Classify provided keys in one pass
     for key in present_keys:
-        if key == "canon_layer_type":
-            continue
         if key not in expected_keys:
             extra.append(key)
             continue

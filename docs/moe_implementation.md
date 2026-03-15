@@ -167,7 +167,7 @@ Active FLOPs per token per MoE layer:
 - Routed experts: `top_k * 6 * H * intermediate_size` (SwiGLU)
 - Shared expert: `6 * H * intermediate_size` (SwiGLU)
 
-The FLOP estimator respects `moe_layer_pattern` (mixed dense/MoE layers) and `no_mlp_on_first_layer`.
+The FLOP estimator respects `moe_leading_dense_layers` and `no_mlp_on_first_layer`.
 
 ### Checkpointing
 
@@ -211,18 +211,14 @@ model:
   moe_scoring_func: "sigmoid"      # router scoring function
   moe_use_bias_correction: true    # DeepSeek-V3 style routing bias
   moe_aux_loss_coef: 0.0           # sequence-level balance loss (0 = off)
-  moe_layer_pattern: null          # "DM" for every-other-layer MoE, null = all MoE
+  moe_leading_dense_layers: 1     # first N layers are always dense (DeepSeek uses 1)
 ```
 
 Requirements: `use_packing: true` and `use_static_inp_size: true`. The pipeline raises if these are not set.
 
-### Layer patterns
+### Leading dense layers
 
-`moe_layer_pattern` controls which layers are MoE vs dense:
-- `null` or `"M"` — all layers are MoE
-- `"DM"` — alternating dense/MoE (layers 0, 2, 4... are dense; 1, 3, 5... are MoE)
-- `"DDM"` — every third layer is MoE
-- Any combination of `D` (dense) and `M` (MoE), tiled across layers
+`moe_leading_dense_layers` forces the first N layers to use a standard dense MLP instead of MoE. DeepSeek-V3 uses 1. The intuition is that early layers learn general token representations that all tokens need — routing at that stage adds overhead without meaningful specialization. With `num_hidden_layers=4` and `moe_leading_dense_layers=1`, layer flags are `[dense, MoE, MoE, MoE]`.
 
 ### Active parameter matching for ablations
 
