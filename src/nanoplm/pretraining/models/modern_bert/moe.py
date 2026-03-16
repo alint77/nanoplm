@@ -1,8 +1,7 @@
 """Mixture-of-Experts layer for nanoPLM.
 
-Uses ``torch.nn.functional.grouped_mm`` for expert compute — a CUTLASS-backed
-grouped GEMM that handles jagged per-expert token counts natively.  No capacity
-factor, no token dropping, no padding to uniform capacity.
+Uses ``grouped_gemm`` for routed expert compute so per-expert token counts stay
+on GPU and expert GEMMs run as a single grouped kernel instead of a host loop.
 
 Only supports the packed flat-token static-shape forward path
 (``use_packing=True``, ``use_static_inp_size=True``).
@@ -16,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .moe_grouped_gemm_ops import moe_grouped_gemm
 from .moe_triton_ops import moe_permute, moe_unpermute
 
 
@@ -142,7 +142,7 @@ class MoELayer(nn.Module):
             topk_group=config.moe_topk_group,
         )
 
-        # Routed expert weights — stacked for grouped_mm.
+        # Routed expert weights — stacked for grouped_gemm.
         # Layout: (num_experts, in_features, out_features).
         # This is transposed relative to nn.Linear's (out, in).
         self.Wi = nn.Parameter(
@@ -178,17 +178,12 @@ class MoELayer(nn.Module):
         )
         self.register_buffer(
             "_dispatch_count_ones",
-            torch.empty(0, dtype=torch.int32),
+            torch.empty(0, dtype=torch.int64),
             persistent=False,
         )
         self.register_buffer(
             "_dispatch_counts",
-            torch.empty(self.num_experts, dtype=torch.int32),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_dispatch_offs",
-            torch.empty(self.num_experts, dtype=torch.int32),
+            torch.empty(self.num_experts, dtype=torch.int64),
             persistent=False,
         )
 
@@ -206,13 +201,11 @@ class MoELayer(nn.Module):
             self._dispatch_sorted_idx = self._dispatch_sorted_idx.to(device=device)
             self._dispatch_count_ones = self._dispatch_count_ones.to(device=device)
             self._dispatch_counts = self._dispatch_counts.to(device=device)
-            self._dispatch_offs = self._dispatch_offs.to(device=device)
         if self._dispatch_sort_values.numel() < num_assignments:
             self._dispatch_sort_values.resize_(num_assignments)
             self._dispatch_sorted_idx.resize_(num_assignments)
             self._dispatch_count_ones.resize_(num_assignments)
         self._dispatch_counts.resize_(self.num_experts)
-        self._dispatch_offs.resize_(self.num_experts)
         return (
             self._dispatch_sort_values[:num_assignments],
             self._dispatch_sorted_idx[:num_assignments],
@@ -244,7 +237,7 @@ class MoELayer(nn.Module):
         # --- routing ---
         weights, indices, z_loss, router_scores = self.router(x)  # (T, top_k), (T, top_k), scalar, (T, E)
 
-        # --- dispatch: expand, sort by expert, compute offs ---
+        # --- dispatch: expand, sort by expert, compute per-expert counts ---
         x_expanded = x.repeat_interleave(self.top_k, dim=0)  # (T*top_k, H)
         expert_flat = indices.reshape(-1)  # (T*top_k,)
         if self._reuse_dispatch_workspaces:
@@ -257,23 +250,22 @@ class MoELayer(nn.Module):
             count_ones.fill_(1)
             counts.zero_()
             counts.scatter_add_(0, expert_flat, count_ones)
-            offs = self._dispatch_offs
-            torch.cumsum(counts, dim=0, out=offs)
         else:
             sorted_idx = expert_flat.argsort(stable=True)
-            counts = expert_flat.bincount(minlength=self.num_experts).to(torch.int32)
-            offs = counts.cumsum(0)
+            counts = expert_flat.bincount(minlength=self.num_experts).to(torch.int64)
         x_sorted = moe_permute(x_expanded, sorted_idx)  # (T*top_k, H)
 
         # Store for external bias-update logic.
         self.last_expert_counts = counts.detach().clone()
 
-        # --- expert SwiGLU via grouped_mm ---
-        wi = F.grouped_mm(x_sorted, self.Wi, offs=offs)  # (T*top_k, 2*inter)
+        # --- expert SwiGLU via grouped_gemm ---
+        wi = moe_grouped_gemm(x_sorted, self.Wi, counts)  # (T*top_k, 2*inter)
         x_proj, gate = wi.chunk(2, dim=-1)
         activated = F.silu(gate) * x_proj  # (T*top_k, inter)
-        expert_out_sorted = F.grouped_mm(
-            self.drop(activated), self.Wo, offs=offs,
+        expert_out_sorted = moe_grouped_gemm(
+            self.drop(activated),
+            self.Wo,
+            counts,
         )  # (T*top_k, H)
 
         # --- combine: unsort + weighted sum ---
