@@ -17,7 +17,7 @@ help:
 	@echo "Available targets:"
 	@echo "  help          - Show this help message"
 	@echo "  setup         - Set up virtual environment and install dependencies"
-	@echo "  setup-cuda    - Sync CUDA dependencies with grouped_gemm CUTLASS enabled"
+	@echo "  setup-cuda    - Show the manual CUDA install flow for grouped_gemm"
 	@echo "  test          - Run all tests"
 	@echo "  test-verbose  - Run tests with verbose output"
 	@echo "  test-fast     - Run tests in parallel for faster execution"
@@ -45,9 +45,15 @@ setup:
 
 .PHONY: setup-cuda
 setup-cuda:
-	@echo "Syncing CUDA dependencies..."
-	@./scripts/uv-sync-cuda.sh
-	@echo "CUDA dependency sync complete!"
+	@echo "Install the base project and CUDA extras:"
+	@echo "  uv pip install -e '.[cuda]'"
+	@echo ""
+	@echo "Then install grouped_gemm manually against the active torch:"
+	@echo "  export CUDA_HOME=/usr/local/cuda-12.6"
+	@echo "  export PATH=\"$$CUDA_HOME/bin:$$PATH\""
+	@echo "  export LD_LIBRARY_PATH=\"$$CUDA_HOME/lib64:$${LD_LIBRARY_PATH:-}\""
+	@echo "  export TORCH_CUDA_ARCH_LIST=\"8.0\""
+	@echo "  GROUPED_GEMM_CUTLASS=1 uv pip install --no-build-isolation --no-deps \"grouped-gemm @ git+https://github.com/tgale96/grouped_gemm@f1429a3\""
 
 # Run tests
 .PHONY: test

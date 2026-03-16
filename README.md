@@ -25,20 +25,54 @@
 
 ## 🛠️ Install
 
-Install the package from PyPi
+Install the package from PyPI:
 
 ```bash
 pip install nanoplm
 ```
-Remember for CUDA, you should install some other dependencies as well.
+
+For a local editable install:
+
 ```bash
-./scripts/uv-sync-cuda.sh
+uv pip install -e .
 ```
 
-That helper exports `GROUPED_GEMM_CUTLASS=1` and auto-detects
-`TORCH_CUDA_ARCH_LIST` from the visible GPUs before running `uv sync --extra cuda`.
-If you need to override the detected architectures, set `TORCH_CUDA_ARCH_LIST`
-yourself before invoking it.
+For CUDA training, install the extra runtime dependencies first:
+
+```bash
+uv pip install -e '.[cuda]'
+```
+
+`grouped_gemm` must be installed separately. The pinned `grouped_gemm` source
+build imports your active `torch` during compilation, so install it without
+build isolation and with a CUDA toolkit that matches `torch.version.cuda`.
+
+1. Check your active PyTorch CUDA version:
+
+```bash
+uv run python -c "import torch; print(torch.__version__, torch.version.cuda)"
+```
+
+2. Point `CUDA_HOME` at the matching toolkit and set the architectures you want
+to build for:
+
+```bash
+export CUDA_HOME=/usr/local/cuda-12.6
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+export TORCH_CUDA_ARCH_LIST="8.0"
+```
+
+3. Install `grouped_gemm` from the pinned commit against the active torch:
+
+```bash
+GROUPED_GEMM_CUTLASS=1 \
+uv pip install --no-build-isolation --no-deps \
+  "grouped-gemm @ git+https://github.com/tgale96/grouped_gemm@f1429a3"
+```
+
+If you need different architectures, override `TORCH_CUDA_ARCH_LIST` before
+running the install command.
 ---
 
 ## 🤖 Zero‑to‑model in 4 commands
