@@ -2396,18 +2396,20 @@ def run_pure_pretraining(
                                 dist.all_reduce(_moe_count_accum, op=dist.ReduceOp.SUM)
                             for j, moe_layer in enumerate(_moe_layers):
                                 counts_j = _moe_count_accum[j]
-                                total = counts_j.sum()
-                                if total > 0:
-                                    target = total / _moe_num_experts
-                                    # Nudge bias: positive for underused, negative for overused.
-                                    # correction_bias is a registered buffer (not a
-                                    # parameter), so FSDP won't shard it.
-                                    delta = _moe_bias_lr * (target - counts_j) / target
-                                    # Zero-mean: keep bias vector centered (Ling-V2 style).
-                                    delta = delta - delta.mean()
-                                    moe_layer.router.correction_bias.add_(
-                                        delta.to(moe_layer.router.correction_bias.device)
-                                    )
+                                # Keep the update branchless so we never materialize
+                                # a CUDA scalar on CPU via `if total > 0`.
+                                total = counts_j.sum().clamp_min(1.0)
+                                target = total / _moe_num_experts
+                                # Nudge bias: positive for underused, negative for overused.
+                                # correction_bias is a registered buffer (not a
+                                # parameter), so FSDP won't shard it.
+                                delta = _moe_bias_lr * (target - counts_j) / target
+                                # Zero-mean: keep bias vector centered (Ling-V2 style).
+                                # When counts are all zero, this naturally becomes all-zero.
+                                delta = delta - delta.mean()
+                                moe_layer.router.correction_bias.add_(
+                                    delta.to(moe_layer.router.correction_bias.device)
+                                )
                             _moe_count_accum.zero_()
 
                     global_step += 1

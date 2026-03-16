@@ -34,10 +34,19 @@ Remember for CUDA, you should install dion package (used for muon and normuon op
 ```bash
 pip install git+https://github.com/alint77/dion@dev/megabatching
 ```
+For CUDA with the in-tree CUTLASS grouped GEMM backend:
+```bash
+./scripts/uv-sync-cuda.sh
+```
 For benchmarking you also need Biotrainer.
 ```bash
 pip install git+https://github.com/sacdallago/biotrainer@main
 ```
+
+That helper exports `GROUPED_GEMM_CUTLASS=1` and auto-detects
+`TORCH_CUDA_ARCH_LIST` from the visible GPUs before running `uv sync --extra cuda`.
+If you need to override the detected architectures, set `TORCH_CUDA_ARCH_LIST`
+yourself before invoking it.
 ---
 
 ## 🤖 Zero‑to‑model in 4 commands

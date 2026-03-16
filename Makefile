@@ -17,6 +17,7 @@ help:
 	@echo "Available targets:"
 	@echo "  help          - Show this help message"
 	@echo "  setup         - Set up virtual environment and install dependencies"
+	@echo "  setup-cuda    - Sync CUDA dependencies with grouped_gemm CUTLASS enabled"
 	@echo "  test          - Run all tests"
 	@echo "  test-verbose  - Run tests with verbose output"
 	@echo "  test-fast     - Run tests in parallel for faster execution"
@@ -41,6 +42,12 @@ setup:
 	@$(VENV_ACTIVATE) && $(PIP) install -e .
 	@$(VENV_ACTIVATE) && $(PIP) install -r tests/requirements.txt
 	@echo "Setup complete!"
+
+.PHONY: setup-cuda
+setup-cuda:
+	@echo "Syncing CUDA dependencies..."
+	@./scripts/uv-sync-cuda.sh
+	@echo "CUDA dependency sync complete!"
 
 # Run tests
 .PHONY: test
