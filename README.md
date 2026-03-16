@@ -30,9 +30,13 @@ Install the package from PyPi
 ```bash
 pip install nanoplm
 ```
-Remember for CUDA, you should install some other dependencies as well.
+Remember for CUDA, you should install dion package (used for muon and normuon optimizers) manually.
 ```bash
-pip install "nanoplm[cuda]"
+pip install git+https://github.com/alint77/dion@dev/megabatching
+```
+For benchmarking you also need Biotrainer.
+```bash
+pip install git+https://github.com/sacdallago/biotrainer@main
 ```
 ---
 

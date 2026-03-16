@@ -30,7 +30,6 @@ classifiers = [
 keywords = ["bioinformatics", "protein-language-model", "large-language-models"]
 dependencies = [
     "accelerate>=1.7.0",
-    "biotrainer @git+https://github.com/sacdallago/biotrainer@main",
     "biopython>=1.85",
     "click>=8.1.8",
     "dvc>=3.59.1",
@@ -47,11 +46,6 @@ dependencies = [
     "ipython>=8.3.0",
     "kernels",
     "pytest",
-]
-
-[project.optional-dependencies]
-cuda = [
-    "dion @git+https://github.com/alint77/dion@dev/megabatching",
 ]
 
 [project.scripts]
