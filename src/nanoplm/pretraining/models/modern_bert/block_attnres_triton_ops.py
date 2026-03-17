@@ -43,17 +43,22 @@ def _pick_block_attnres_fwd_meta(
     *,
     default_warps: int,
     default_stages: int,
-) -> tuple[int, int, int]:
-    """Return (BLOCK_T, num_warps, num_stages) for forward.
+) -> tuple[int, int, int, int]:
+    """Return (BLOCK_T, BLOCK_D, num_warps, num_stages) for forward.
 
     A100/SM80 benefits materially from a narrower token tile and higher warp
     count on the large packed-token shapes Block AttnRes uses in training.
     """
     props = torch.cuda.get_device_properties("cuda")
     cc = (props.major, props.minor)
+    block_d = min(256, _next_power_of_2(D))
     if cc == (8, 0) and D >= 256:
-        return 32, 8, 3
-    return 64, default_warps, default_stages
+        return 32, block_d, 8, 3
+    if cc[0] >= 12 and D >= 256:
+        # RTX 5090 / SM120 tuning on the real training shape (T=32768, D=768)
+        # favored a narrower token tile while keeping the wide D tile.
+        return 32, block_d, default_warps, default_stages
+    return 64, block_d, default_warps, default_stages
 
 
 def _pick_block_attnres_bwd_meta(
@@ -68,6 +73,11 @@ def _pick_block_attnres_bwd_meta(
     block_d = min(256, _next_power_of_2(D))
     if cc == (8, 0) and D >= 256:
         return 64, block_d, 8, 3
+    if cc[0] >= 12 and D >= 256:
+        # On SM120 the backward kernel is register-limited at 64x256.
+        # A 32x128 tile reduced weighted runtime the most on the current
+        # packed-token training shape while preserving the generic 4w/2s setup.
+        return 32, min(128, _next_power_of_2(D)), default_warps, default_stages
     return 64, block_d, default_warps, default_stages
 
 
@@ -134,8 +144,7 @@ def _fused_block_attnres_cuda(
     qw = (query.float() * norm_weight.float()).to(stacked.dtype)
 
     NUM_SMS, nw, ns = _get_hw_config()
-    BLOCK_D = min(256, k.triton.next_power_of_2(D))
-    BLOCK_T, nw, ns = _pick_block_attnres_fwd_meta(
+    BLOCK_T, BLOCK_D, nw, ns = _pick_block_attnres_fwd_meta(
         D,
         default_warps=nw,
         default_stages=ns,
@@ -232,8 +241,7 @@ def _fused_block_attnres_state_cuda(
     qw = (query.float() * norm_weight.float()).to(partial.dtype)
 
     NUM_SMS, nw, ns = _get_hw_config()
-    BLOCK_D = min(256, k.triton.next_power_of_2(D))
-    BLOCK_T, nw, ns = _pick_block_attnres_fwd_meta(
+    BLOCK_T, BLOCK_D, nw, ns = _pick_block_attnres_fwd_meta(
         D,
         default_warps=nw,
         default_stages=ns,
