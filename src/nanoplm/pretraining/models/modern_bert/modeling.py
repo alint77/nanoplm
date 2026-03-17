@@ -1220,6 +1220,53 @@ class ModernBertEncoderLayer(nn.Module):
             repo_active=repo_active,
         )
 
+    def _compute_attn_out_full(
+        self,
+        h: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+        cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]],
+        cu_seqlens: Optional[torch.Tensor],
+        max_seqlen: Optional[int],
+        position_ids: Optional[torch.Tensor],
+        token_mask: Optional[torch.Tensor],
+        repo_active: bool,
+    ) -> torch.Tensor:
+        return self._compute_attn_out(
+            h,
+            attn_mask,
+            cos_sin,
+            cu_seqlens,
+            max_seqlen,
+            (-1, -1),
+            position_ids,
+            token_mask,
+            repo_active,
+        )
+
+    def _compute_attn_out_local(
+        self,
+        h: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+        cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]],
+        cu_seqlens: Optional[torch.Tensor],
+        max_seqlen: Optional[int],
+        window_size: Optional[tuple[int, int]],
+        position_ids: Optional[torch.Tensor],
+        token_mask: Optional[torch.Tensor],
+        repo_active: bool,
+    ) -> torch.Tensor:
+        return self._compute_attn_out(
+            h,
+            attn_mask,
+            cos_sin,
+            cu_seqlens,
+            max_seqlen,
+            window_size,
+            position_ids,
+            token_mask,
+            repo_active,
+        )
+
     def _compute_mlp_out(
         self,
         h: torch.Tensor,
@@ -1260,7 +1307,16 @@ class ModernBertEncoderLayer(nn.Module):
     ) -> "torch.Tensor | _BlockAttnResState":
         # ---- Block AttnRes branch ----
         if self.attn_res is not None:
-            return self._forward_block_attnres(
+            if self.attention_type == "full_attention":
+                return self._forward_block_attnres_full(
+                    x, attn_mask=attn_mask, cos_sin=cos_sin,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                    position_ids=position_ids, token_mask=token_mask,
+                    repo_active=repo_active, prores_alpha=prores_alpha,
+                    attn_res_state=attn_res_state,
+                    attn_ends_block=attn_ends_block, mlp_ends_block=mlp_ends_block,
+                )
+            return self._forward_block_attnres_local(
                 x, attn_mask=attn_mask, cos_sin=cos_sin,
                 cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
                 window_size=window_size, position_ids=position_ids,
@@ -1281,7 +1337,6 @@ class ModernBertEncoderLayer(nn.Module):
             _cos_sin = cos_sin
             _cu_seqlens = cu_seqlens
             _max_seqlen = max_seqlen
-            _window_size = window_size
             _position_ids = position_ids
             _token_mask = token_mask
             _repo_active = repo_active
@@ -1337,7 +1392,143 @@ class ModernBertEncoderLayer(nn.Module):
                 x = x + prores_alpha * mlp_out
         return x
 
-    def _forward_block_attnres(
+    def _run_block_attnres_mlp(
+        self,
+        state: "_BlockAttnResState",
+        *,
+        position_ids: Optional[torch.Tensor],
+        cu_seqlens: Optional[torch.Tensor],
+        token_mask: Optional[torch.Tensor],
+        prores_alpha: "torch.Tensor | float",
+        mlp_ends_block: bool,
+    ) -> "_BlockAttnResState":
+        if self.mlp is None:
+            return state
+
+        h = self.mlp_res.forward_state(
+            state.num_completed,
+            state.partial_block,
+            state.completed_refs,
+        )
+
+        do_ckpt_mlp = (
+            self.activation_checkpointing
+            and self.training
+            and self.activation_checkpointing_mode == "attn+mlp"
+        )
+        if do_ckpt_mlp:
+            _position_ids = position_ids
+            _cu_seqlens = cu_seqlens
+            _token_mask = token_mask
+
+            def _mlp_branch(
+                h_in: torch.Tensor,
+                *,
+                _layer: "ModernBertEncoderLayer" = self,
+            ) -> torch.Tensor:
+                return _layer._compute_mlp_out(
+                    h_in, _position_ids, _cu_seqlens, _token_mask,
+                )
+
+            try:
+                mlp_out = _checkpoint(_mlp_branch, h, use_reentrant=False)
+            except TypeError:
+                mlp_out = _checkpoint(_mlp_branch, h)
+        else:
+            mlp_out = self._compute_mlp_out(h, position_ids, cu_seqlens, token_mask)
+
+        state.partial_block = state.partial_block + prores_alpha * mlp_out
+
+        if mlp_ends_block:
+            state.append_partial()
+
+        return state
+
+    def _forward_block_attnres_full(
+        self,
+        x: torch.Tensor,
+        *,
+        attn_mask: Optional[torch.Tensor],
+        cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]],
+        cu_seqlens: Optional[torch.Tensor],
+        max_seqlen: Optional[int],
+        position_ids: Optional[torch.Tensor],
+        token_mask: Optional[torch.Tensor],
+        repo_active: bool,
+        prores_alpha: "torch.Tensor | float",
+        attn_res_state: "_BlockAttnResState | None",
+        attn_ends_block: bool,
+        mlp_ends_block: bool,
+    ) -> "_BlockAttnResState":
+        state = attn_res_state
+        h = self.attn_res.forward_state(
+            state.num_completed,
+            state.partial_block,
+            state.completed_refs,
+        )
+
+        # 2. Attention sub-layer (with optional checkpointing)
+        do_ckpt_attn = (
+            self.activation_checkpointing
+            and self.training
+            and self.activation_checkpointing_mode in {"attn", "attn+mlp"}
+        )
+        if do_ckpt_attn:
+            _attn_mask = attn_mask
+            _cos_sin = cos_sin
+            _cu_seqlens = cu_seqlens
+            _max_seqlen = max_seqlen
+            _position_ids = position_ids
+            _token_mask = token_mask
+            _repo_active = repo_active
+
+            def _attn_branch(
+                h_in: torch.Tensor,
+                *,
+                _layer: "ModernBertEncoderLayer" = self,
+            ) -> torch.Tensor:
+                return _layer._compute_attn_out_full(
+                    h_in,
+                    _attn_mask,
+                    _cos_sin,
+                    _cu_seqlens,
+                    _max_seqlen,
+                    _position_ids,
+                    _token_mask,
+                    _repo_active,
+                )
+
+            try:
+                attn_out = _checkpoint(_attn_branch, h, use_reentrant=False)
+            except TypeError:
+                attn_out = _checkpoint(_attn_branch, h)
+        else:
+            attn_out = self._compute_attn_out_full(
+                h,
+                attn_mask,
+                cos_sin,
+                cu_seqlens,
+                max_seqlen,
+                position_ids,
+                token_mask,
+                repo_active,
+            )
+
+        state.partial_block = state.partial_block + prores_alpha * attn_out
+
+        if attn_ends_block:
+            state.append_partial()
+
+        return self._run_block_attnres_mlp(
+            state,
+            position_ids=position_ids,
+            cu_seqlens=cu_seqlens,
+            token_mask=token_mask,
+            prores_alpha=prores_alpha,
+            mlp_ends_block=mlp_ends_block,
+        )
+
+    def _forward_block_attnres_local(
         self,
         x: torch.Tensor,
         *,
@@ -1355,14 +1546,12 @@ class ModernBertEncoderLayer(nn.Module):
         mlp_ends_block: bool,
     ) -> "_BlockAttnResState":
         state = attn_res_state
-        # 1. Attended aggregate for attention sub-layer
         h = self.attn_res.forward_state(
             state.num_completed,
             state.partial_block,
             state.completed_refs,
         )
 
-        # 2. Attention sub-layer (with optional checkpointing)
         do_ckpt_attn = (
             self.activation_checkpointing
             and self.training
@@ -1383,9 +1572,16 @@ class ModernBertEncoderLayer(nn.Module):
                 *,
                 _layer: "ModernBertEncoderLayer" = self,
             ) -> torch.Tensor:
-                return _layer._compute_attn_out(
-                    h_in, _attn_mask, _cos_sin, _cu_seqlens, _max_seqlen,
-                    _window_size, _position_ids, _token_mask, _repo_active,
+                return _layer._compute_attn_out_local(
+                    h_in,
+                    _attn_mask,
+                    _cos_sin,
+                    _cu_seqlens,
+                    _max_seqlen,
+                    _window_size,
+                    _position_ids,
+                    _token_mask,
+                    _repo_active,
                 )
 
             try:
@@ -1393,58 +1589,31 @@ class ModernBertEncoderLayer(nn.Module):
             except TypeError:
                 attn_out = _checkpoint(_attn_branch, h)
         else:
-            attn_out = self._compute_attn_out(
-                h, attn_mask, cos_sin, cu_seqlens, max_seqlen,
-                window_size, position_ids, token_mask, repo_active,
+            attn_out = self._compute_attn_out_local(
+                h,
+                attn_mask,
+                cos_sin,
+                cu_seqlens,
+                max_seqlen,
+                window_size,
+                position_ids,
+                token_mask,
+                repo_active,
             )
 
-        # 3. Intra-block accumulation
         state.partial_block = state.partial_block + prores_alpha * attn_out
 
-        # 4. Block boundary check for attention
         if attn_ends_block:
             state.append_partial()
 
-        # 5-8. MLP sub-layer (if present)
-        if self.mlp is not None:
-            h = self.mlp_res.forward_state(
-                state.num_completed,
-                state.partial_block,
-                state.completed_refs,
-            )
-
-            do_ckpt_mlp = (
-                self.activation_checkpointing
-                and self.training
-                and self.activation_checkpointing_mode == "attn+mlp"
-            )
-            if do_ckpt_mlp:
-                _position_ids = position_ids
-                _cu_seqlens = cu_seqlens
-                _token_mask = token_mask
-
-                def _mlp_branch(
-                    h_in: torch.Tensor,
-                    *,
-                    _layer: "ModernBertEncoderLayer" = self,
-                ) -> torch.Tensor:
-                    return _layer._compute_mlp_out(
-                        h_in, _position_ids, _cu_seqlens, _token_mask,
-                    )
-
-                try:
-                    mlp_out = _checkpoint(_mlp_branch, h, use_reentrant=False)
-                except TypeError:
-                    mlp_out = _checkpoint(_mlp_branch, h)
-            else:
-                mlp_out = self._compute_mlp_out(h, position_ids, cu_seqlens, token_mask)
-
-            state.partial_block = state.partial_block + prores_alpha * mlp_out
-
-            if mlp_ends_block:
-                state.append_partial()
-
-        return state
+        return self._run_block_attnres_mlp(
+            state,
+            position_ids=position_ids,
+            cu_seqlens=cu_seqlens,
+            token_mask=token_mask,
+            prores_alpha=prores_alpha,
+            mlp_ends_block=mlp_ends_block,
+        )
 
 
 class ModernBertAttnResidual(nn.Module):
