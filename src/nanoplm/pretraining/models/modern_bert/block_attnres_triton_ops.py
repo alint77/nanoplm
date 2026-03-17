@@ -61,13 +61,22 @@ def _pick_block_attnres_bwd_meta(
     *,
     default_warps: int,
     default_stages: int,
-) -> tuple[int, int, int]:
-    """Return (BLOCK_T, num_warps, num_stages) for backward."""
+) -> tuple[int, int, int, int]:
+    """Return (BLOCK_T, BLOCK_D, num_warps, num_stages) for backward."""
     props = torch.cuda.get_device_properties("cuda")
     cc = (props.major, props.minor)
+    block_d = min(256, _next_power_of_2(D))
     if cc == (8, 0) and D >= 256:
-        return 64, 8, 3
-    return 64, default_warps, default_stages
+        return 64, block_d, 8, 3
+    return 64, block_d, default_warps, default_stages
+
+
+def _next_power_of_2(n: int) -> int:
+    """Return the smallest power of 2 >= n."""
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -160,7 +169,6 @@ def _fused_block_attnres_bwd_cuda(
     N, T, D = stacked.shape
     grad_result = grad_result.contiguous()
     grad_stacked = torch.empty_like(stacked)
-    R = torch.zeros((D,), device=stacked.device, dtype=torch.float32)
 
     scratch_f32 = torch.empty((2, N, T), device=stacked.device, dtype=torch.float32)
     grad_alpha_buf = scratch_f32[0]
@@ -169,17 +177,18 @@ def _fused_block_attnres_bwd_cuda(
     qw = (query.float() * norm_weight.float()).to(stacked.dtype)
 
     NUM_SMS, nw, ns = _get_hw_config()
-    BLOCK_D = min(256, k.triton.next_power_of_2(D))
-    BLOCK_T, nw, ns = _pick_block_attnres_bwd_meta(
+    BLOCK_T, BLOCK_D, nw, ns = _pick_block_attnres_bwd_meta(
         D,
         default_warps=nw,
         default_stages=ns,
     )
 
+    R_local = torch.zeros((NUM_SMS, D), device=stacked.device, dtype=torch.float32)
+
     k._block_attnres_bwd_kernel[(NUM_SMS,)](
         grad_result, stacked, qw,
         alpha, inv_rms,
-        grad_stacked, R,
+        grad_stacked, R_local,
         grad_alpha_buf, qw_dot_buf,
         T, D, N,
         BLOCK_T=BLOCK_T,
@@ -188,6 +197,7 @@ def _fused_block_attnres_bwd_cuda(
         num_warps=nw,
         num_stages=ns,
     )
+    R = R_local.sum(dim=0)
     return grad_stacked, R
 
 
@@ -271,7 +281,6 @@ def _fused_block_attnres_state_bwd_cuda(
         dtype=partial.dtype,
     )
     grad_partial = torch.empty_like(partial)
-    R = torch.zeros((D,), device=partial.device, dtype=torch.float32)
 
     scratch_f32 = torch.empty((2, NC + 1, T), device=partial.device, dtype=torch.float32)
     grad_alpha_buf = scratch_f32[0]
@@ -280,12 +289,13 @@ def _fused_block_attnres_state_bwd_cuda(
     qw = (query.float() * norm_weight.float()).to(partial.dtype)
 
     NUM_SMS, nw, ns = _get_hw_config()
-    BLOCK_D = min(256, k.triton.next_power_of_2(D))
-    BLOCK_T, nw, ns = _pick_block_attnres_bwd_meta(
+    BLOCK_T, BLOCK_D, nw, ns = _pick_block_attnres_bwd_meta(
         D,
         default_warps=nw,
         default_stages=ns,
     )
+
+    R_local = torch.zeros((NUM_SMS, D), device=partial.device, dtype=torch.float32)
 
     padded_refs = _pad_completed_refs(completed_refs, partial)
     k._block_attnres_state_bwd_kernel[(NUM_SMS,)](
@@ -297,7 +307,7 @@ def _fused_block_attnres_state_bwd_cuda(
         inv_rms,
         grad_completed,
         grad_partial,
-        R,
+        R_local,
         grad_alpha_buf,
         qw_dot_buf,
         T,
@@ -309,6 +319,7 @@ def _fused_block_attnres_state_bwd_cuda(
         num_warps=nw,
         num_stages=ns,
     )
+    R = R_local.sum(dim=0)
     return grad_completed, grad_partial, R
 
 

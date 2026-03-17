@@ -331,10 +331,8 @@ def _block_attnres_bwd_kernel(
     alpha_ptr,        # (N, T)
     inv_rms_ptr,      # (N, T)
     grad_stacked_ptr, # (N, T, D) output
-    R_ptr,            # (D,) output — atomic accumulator for param grads
-    # scratch buffers reused across passes:
-    #   pass 1: grad_alpha_ptr=grad_alpha, qw_dot_ptr=qw_dot
-    #   pass 2: grad_alpha_ptr=grad_logit, qw_dot_ptr=dot_term
+    R_local_ptr,      # (NUM_SMS, D) output — per-SM buffer for param grads
+    # scratch buffers for softmax backward intermediates:
     grad_alpha_ptr,   # (N, T) scratch
     qw_dot_ptr,       # (N, T) scratch
     T, D: tl.constexpr, N: tl.constexpr,
@@ -345,15 +343,20 @@ def _block_attnres_bwd_kernel(
     num_t_tiles = tl.cdiv(T, BLOCK_T)
     TD = T * D
 
+    # Zero this SM's R_local row once at start
+    for d_start in tl.range(0, D, BLOCK_D):
+        d_offs = d_start + tl.arange(0, BLOCK_D)
+        d_mask = d_offs < D
+        tl.store(R_local_ptr + pid * D + d_offs, tl.zeros((BLOCK_D,), dtype=tl.float32), mask=d_mask)
+
     for tile_id in tl.range(pid, num_t_tiles, NUM_SMS, flatten=True):
         t_start = tile_id * BLOCK_T
         t_offs = t_start + tl.arange(0, BLOCK_T)
         t_mask = t_offs < T
 
         # ── Pass 1: D-reduction per source → grad_alpha, qw_dot ──────
-        # Zero the scratch rows once, then accumulate across D tiles. This
-        # keeps grad_result/qw loads outside the source loop, which matters
-        # much more than the tiny scratch traffic.
+        # D-tile outer loop keeps go_tile/qw_tile loads outside the source
+        # loop — this matters much more than the per-source scratch traffic.
         for j in tl.static_range(N):
             zeros = tl.zeros((BLOCK_T,), dtype=tl.float32)
             tl.store(grad_alpha_ptr + j * T + t_offs, zeros, mask=t_mask)
@@ -476,7 +479,9 @@ def _block_attnres_bwd_kernel(
                 contribution = (grad_logit_j * inv_rms_j)[:, None] * src_tile
                 R_chunk += tl.sum(contribution, axis=0)
 
-            tl.atomic_add(R_ptr + d_offs, R_chunk, mask=d_mask)
+            # Write to this SM's private R_local row — no atomics needed
+            R_prev = tl.load(R_local_ptr + pid * D + d_offs, mask=d_mask, other=0.0)
+            tl.store(R_local_ptr + pid * D + d_offs, R_prev + R_chunk, mask=d_mask)
 
 
 @triton.jit
@@ -496,7 +501,7 @@ def _block_attnres_state_bwd_kernel(
     inv_rms_ptr,        # (NC + 1, T)
     grad_completed_ptr, # (NC, T, D) output
     grad_partial_ptr,   # (T, D) output
-    R_ptr,              # (D,) output — atomic accumulator for param grads
+    R_local_ptr,        # (NUM_SMS, D) output — per-SM buffer for param grads
     grad_alpha_ptr,     # (NC + 1, T) scratch
     qw_dot_ptr,         # (NC + 1, T) scratch
     T, D: tl.constexpr, NC: tl.constexpr,
@@ -508,11 +513,20 @@ def _block_attnres_state_bwd_kernel(
     TD = T * D
     PARTIAL_IDX = NC
 
+    # Zero this SM's R_local row once at start
+    for d_start in tl.range(0, D, BLOCK_D):
+        d_offs = d_start + tl.arange(0, BLOCK_D)
+        d_mask = d_offs < D
+        tl.store(R_local_ptr + pid * D + d_offs, tl.zeros((BLOCK_D,), dtype=tl.float32), mask=d_mask)
+
     for tile_id in tl.range(pid, num_t_tiles, NUM_SMS, flatten=True):
         t_start = tile_id * BLOCK_T
         t_offs = t_start + tl.arange(0, BLOCK_T)
         t_mask = t_offs < T
 
+        # ── Pass 1: D-reduction per source → grad_alpha, qw_dot ──────
+        # D-tile outer loop keeps go_tile/qw_tile loads outside the source
+        # loop — this matters much more than the per-source scratch traffic.
         for j in tl.static_range(NC + 1):
             zeros = tl.zeros((BLOCK_T,), dtype=tl.float32)
             tl.store(grad_alpha_ptr + j * T + t_offs, zeros, mask=t_mask)
@@ -578,6 +592,7 @@ def _block_attnres_state_bwd_kernel(
             tl.store(grad_alpha_ptr + PARTIAL_IDX * T + t_offs, ga_p, mask=t_mask)
             tl.store(qw_dot_ptr + PARTIAL_IDX * T + t_offs, qwd_p, mask=t_mask)
 
+        # ── Softmax backward ─────────────────────────────────────────
         v = tl.zeros((BLOCK_T,), dtype=tl.float32)
         for j in tl.static_range(NC + 1):
             a_j = tl.load(alpha_ptr + j * T + t_offs, mask=t_mask, other=0.0)
@@ -596,6 +611,7 @@ def _block_attnres_state_bwd_kernel(
             tl.store(grad_alpha_ptr + j * T + t_offs, gl_j, mask=t_mask)
             tl.store(qw_dot_ptr + j * T + t_offs, dt_j, mask=t_mask)
 
+        # ── Pass 2: write grad_stacked + accumulate R ─────────────────
         for d_start in tl.range(0, D, BLOCK_D):
             go_block = tl.make_block_ptr(
                 base=grad_result_ptr,
@@ -695,4 +711,7 @@ def _block_attnres_state_bwd_kernel(
 
             contribution_p = (grad_logit_p * inv_rms_p)[:, None] * partial_tile
             R_chunk += tl.sum(contribution_p, axis=0)
-            tl.atomic_add(R_ptr + d_offs, R_chunk, mask=d_mask)
+
+            # Write to this SM's private R_local row — no atomics needed
+            R_prev = tl.load(R_local_ptr + pid * D + d_offs, mask=d_mask, other=0.0)
+            tl.store(R_local_ptr + pid * D + d_offs, R_prev + R_chunk, mask=d_mask)
