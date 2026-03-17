@@ -67,6 +67,8 @@ class ProtModernBertMLMConfig:
     mhc_lite_wrapping_level: str = "layer"
     use_diff_attn_v2: bool = False
     attn_layer_pattern: Optional[str] = None
+    use_block_attnres: bool = False
+    block_attnres_num_blocks: int = 8
 
 
 class ProtModernBertMLM(ModernBertForMaskedLM):
@@ -75,6 +77,11 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
         self,
         config: ProtModernBertMLMConfig
     ):
+        if config.use_block_attnres:
+            raise ValueError(
+                "Block attention residuals are currently implemented only in the pure-torch path. "
+                "Use --pure-torch with use_block_attnres=true."
+            )
         if config.use_canon_layers:
             raise ValueError(
                 "Canon layers are currently implemented only in the pure-torch path. "

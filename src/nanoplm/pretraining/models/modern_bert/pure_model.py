@@ -81,6 +81,8 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             mhc_lite_wrapping_level=str(config.mhc_lite_wrapping_level).strip().lower(),
             use_diff_attn_v2=config.use_diff_attn_v2,
             attn_layer_pattern=config.attn_layer_pattern,
+            use_block_attnres=config.use_block_attnres,
+            block_attnres_num_blocks=config.block_attnres_num_blocks,
         )
 
         super().__init__(mb_config)
@@ -90,6 +92,11 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
     """Transformer-Engine ``ProtModernBertMLM`` wrapper."""
 
     def __init__(self, config: ProtModernBertMLMConfig):
+        if config.use_block_attnres:
+            raise ValueError(
+                "Block attention residuals are currently implemented only in the pure-torch path. "
+                "Disable use_block_attnres or use --pure-torch."
+            )
         if config.use_canon_layers:
             raise ValueError(
                 "Canon layers are currently implemented only in the pure-torch path. "

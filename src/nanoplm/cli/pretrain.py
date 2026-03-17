@@ -636,6 +636,18 @@ def pretrain():
          "subtraction for noise cancellation in attention (pure-torch only).",
 )
 @click.option(
+    "--use-block-attnres/--no-use-block-attnres",
+    default=False,
+    help="Enable Block Attention Residuals: replaces fixed residual connections with "
+         "learned softmax attention over depth (pure-torch only).",
+)
+@click.option(
+    "--block-attnres-num-blocks",
+    type=int,
+    default=8,
+    help="Number of blocks to partition layers into for Block AttnRes.",
+)
+@click.option(
     "--attn-layer-pattern",
     type=str,
     default=None,
@@ -784,6 +796,8 @@ def run(
     activation_checkpointing: bool,
     activation_checkpointing_mode: str,
     use_diff_attn_v2: bool,
+    use_block_attnres: bool,
+    block_attnres_num_blocks: int,
     attn_layer_pattern: Optional[str],
     use_mhc_lite: bool,
     mhc_n_streams: int,
@@ -916,6 +930,8 @@ def run(
         mhc_lite_wrapping_level=mhc_lite_wrapping_level.lower(),
         use_diff_attn_v2=use_diff_attn_v2,
         attn_layer_pattern=attn_layer_pattern,
+        use_block_attnres=use_block_attnres,
+        block_attnres_num_blocks=block_attnres_num_blocks,
     )
 
     _set_seed_for_init(seed)
@@ -923,6 +939,11 @@ def run(
         raise click.ClickException(
             "use_diff_attn_v2 requires --pure-torch. "
             "Differential Attention V2 is not implemented in HF/TE paths."
+        )
+    if use_block_attnres and not pure_torch:
+        raise click.ClickException(
+            "use_block_attnres requires --pure-torch. "
+            "Block Attention Residuals is not implemented in HF/TE paths."
         )
     if pure_te:
         logger.info("Using Transformer Engine model and training loop")
@@ -1066,6 +1087,11 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
             "model.use_diff_attn_v2=true requires pure_torch: true (or --pure-torch). "
             "Differential Attention V2 is not implemented in HF/TE paths."
         )
+    if getattr(model_config, "use_block_attnres", False) and not pure_torch:
+        raise click.ClickException(
+            "model.use_block_attnres=true requires pure_torch: true (or --pure-torch). "
+            "Block Attention Residuals is not implemented in HF/TE paths."
+        )
     if str(getattr(model_config, "classifier_activation", "gelu")).lower() == "srelu" and not (pure_torch or pure_te):
         raise click.ClickException(
             "model.classifier_activation=srelu requires pure_torch: true / --pure-torch or "
@@ -1196,6 +1222,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  mhc_lite_wrapping_level: \"layer\"  # mHC-lite wrapping: 'layer' or 'sublayers' (pure_torch only)\n"
         "  mhc_triton_fused: true  # use fused Triton kernels for mHC-lite stream ops; first run will start slow due to Triton autotune\n"
         "  use_diff_attn_v2: false  # Differential Attention V2: doubles Q heads with differential subtraction (pure_torch only)\n"
+        "  use_block_attnres: false  # Block Attention Residuals: learned softmax attention over depth replacing fixed residual connections (pure_torch only)\n"
+        "  block_attnres_num_blocks: 8  # number of blocks to partition layers into for Block AttnRes\n"
         "  attn_layer_pattern: null  # Attention pattern string e.g. 'FSS' (F=full, S=sliding). Tiles to num_layers. Overrides global_attn_every_n_layers.\n"
         "  activation_checkpointing: false  # Enable to reduce VRAM by recomputing activations during backward\n"
         "  activation_checkpointing_mode: \"attn\"  # (layer | attn | attn+mlp), attn mode has highest ROI \n"
