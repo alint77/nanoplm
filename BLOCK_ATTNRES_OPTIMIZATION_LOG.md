@@ -547,3 +547,291 @@ product of `num_completed × sublayer_idx × ends_block` guard dimensions.
 ### Tests
 
 All 86 tests still pass.
+
+---
+
+## 2026-03-18 Status Update: Integration Recovery, Backward Refactors, and Current Performance
+
+This section supersedes the older "Phase 5 follow-up" notes above for the
+current tree state. The implementation has moved materially since the earlier
+Phase 5 work: the main regressions were not in raw AttnRes Triton math, but in
+runtime integration overhead, FSDP orchestration, and backward epilogue memory
+traffic.
+
+### High-level status
+
+Current state:
+- Phase 1-3 forward batching remains enabled and numerically correct.
+- The main Phase 5 integration regressions have been fixed.
+- FSDP forward-input casting and tiny DTensor gather storms are gone.
+- The best stable profiled run is now `run-18030151` at **528.34 ms/step**
+  over profiler steps 11-14, corresponding to roughly **492k-496k real tok/s**
+  in steady state.
+- The remaining dominant AttnRes cost is still
+  `_block_attnres_state_bwd_kernel` at about **55.6 ms/step**.
+
+Local validation:
+- `tests/test_block_attnres.py`: **94 passed**
+
+### What changed in the implementation
+
+#### 1. Tensor-state refactor for Phase 5
+
+The BlockAttnRes state path was refactored away from mutable Python list/tuple
+state and toward stacked tensor state. In particular:
+
+- `_BlockAttnResState` now carries stacked precompute tensors and stacked
+  completed-reference history.
+- The hot-path state representation no longer depends on
+  `precomputed_sublayer_idx` / `online_running_states` style Python mutation.
+- `batched_completed_wsum()` returns stacked tensors directly instead of
+  reconstructing `list[tuple[...]]` outputs.
+
+This cleaned up the compiler-facing state representation and reduced graph
+fragmentation, but by itself it did not fully recover throughput.
+
+#### 2. FSDP / integration fixes
+
+The biggest non-kernel regressions from the earlier phase5 implementation were
+fixed:
+
+- BlockAttnRes params are kept out of the hot-path DTensor materialization path.
+- `FSDP::cast_forward_inputs` for BlockAttnRes layers was effectively removed as
+  a real cost center.
+- Mixed local/DTensor grad clipping and optimizer handling were updated so the
+  replicated tiny params continue to work with fused optimizers.
+
+Profiler impact versus the broken phase5 trace:
+- tiny `all_gather_into_tensor_coalesced` storm: **eliminated**
+- `FSDP::cast_forward_inputs`: reduced to noise (**~0.19 ms/step** in current
+  bs128 runs)
+
+#### 3. FSDP granularity improvement: remove the extra parent wrapper in split mode
+
+The strongest forward-side CPU win came from simplifying FSDP orchestration:
+
+- In `sublayer` mode, the extra parent transformer-layer wrapper was removed.
+- The model still shards the expensive submodules while avoiding an extra FSDP
+  unit per layer.
+
+This reduced:
+- CPU launch pressure
+- stream-7 idle time
+- uncovered NCCL
+
+and preserved strong comm overlap.
+
+This change was more successful than switching to full `layer` granularity,
+which reduced forward starvation but created a larger non-overlapped
+reduce-scatter tail before `optimizer.step()`.
+
+#### 4. Larger local batch improved FSDP front-end pressure
+
+Increasing local batch size to 128 (`T = 65536` packed tokens per microbatch,
+grad accumulation still 2) gave a real throughput improvement without changing
+the effective step size.
+
+Why it helped:
+- fewer microbatch boundaries per optimizer step
+- fewer FSDP wrapper transitions
+- fewer launches and less CPU orchestration
+- longer compute windows for NCCL overlap
+
+This was a strong confirmation that the remaining bottleneck was not raw AttnRes
+GPU math; it was CPU/runtime pressure and backward epilogue traffic.
+
+#### 5. Backward history refactor: stacked completed-history gradients
+
+The state backward path was first refactored so completed-history gradients were
+returned as a single stacked tensor instead of one gradient tensor per
+`completed_ref`.
+
+That refactor:
+- reduced the number of eager bf16 grad-add kernels substantially
+- reduced launch count
+- cleaned up the autograd boundary
+
+but by itself did **not** improve step time meaningfully, because it mostly
+changed the grouping of memory-bound adds rather than the total number of bytes
+moved.
+
+#### 6. Pairwise completed-history accumulation in backward
+
+The next step was to reduce repeated completed-history gradient accumulation
+across paired sublayers in a block.
+
+First attempt:
+- follower/leader pairing was implemented using Python-side pending tensor state
+  in backward
+- this worked in isolated tests but failed in real compiled training under
+  AOTAutograd / FakeTensor
+
+Failure mode from `pretrain.log`:
+- compiled backward hit `BackendCompilerFailed`
+- root cause was Python-stashed FakeTensor state crossing backward callbacks
+
+Fix:
+- the pairwise combine was moved behind a new opaque dispatcher op,
+  `pairwise_completed_grad_accum`
+- compiled backward now only sees opaque custom ops, not Python-side tensor
+  state transitions
+
+Result:
+- compile stability was restored
+- the post-AttnRes bf16 add storm was cut materially in a real run
+
+### Trace progression
+
+The most relevant recent traces are:
+
+- `run-18030056`: bs128 baseline before pairwise backward combine
+- `run-18030115`: stacked-history refactor
+- `run-18030151`: current best run with opaque pairwise completed-grad combine
+
+#### `run-18030056` baseline
+
+Key metrics:
+- step time: **546.41 ms**
+- launches/step: **1274**
+- host sync ms/step: **303.14**
+- uncovered NCCL: **13.87 ms**
+- stream-22 overlap: **95.8%**
+
+Important direct kernels:
+- `_block_attnres_state_bwd_kernel`: **55.52 ms/step**
+- bf16 eager add kernel: **38.37 ms/step**, **208.5 calls/step**
+- `_block_attnres_batched_completed_wsum_kernel`: **14.23 ms/step**
+- `_block_attnres_merge_partial_kernel`: **14.08 ms/step**
+
+#### `run-18030115` stacked-history refactor
+
+Structural effect:
+- reduced bf16 add calls from **208.5 -> 85.5 calls/step**
+
+But:
+- bf16 add time barely moved: **38.37 -> 38.12 ms/step**
+- step time was effectively flat: **546.41 -> 547.67 ms**
+
+Interpretation:
+- the trace shape became cleaner
+- launch count improved
+- but total HBM traffic for the large grad adds did not drop enough to matter
+
+#### `run-18030151` current best run
+
+Current best trace:
+- step time: **528.34 ms/step**
+- stream7 busy: **499.72 ms**
+- stream7 idle: **28.62 ms**
+- launches/step: **1130**
+- launch CPU time: **8.49 ms/step**
+- host sync: **286.49 ms/step**
+- uncovered NCCL: **12.27 ms**
+- stream-22 overlap: **96.0%**
+
+Key comparison vs `run-18030056`:
+- step time: **546.41 -> 528.34 ms** (`-18.08 ms`)
+- launches/step: **1274 -> 1130**
+- launch CPU ms/step: **9.12 -> 8.49**
+- host sync ms/step: **303.14 -> 286.49**
+- stream7 idle: **30.49 -> 28.62**
+
+Most importantly, the eager bf16 accumulation tail finally dropped in both
+count and total time:
+- bf16 add calls/step: **208.5 -> 61.2**
+- bf16 add time/step: **38.37 -> 21.90 ms**
+
+### What the pairwise backward combine actually improved
+
+The opaque pairwise completed-grad combine did **not** make the core AttnRes
+Triton kernels faster. The main kernels are essentially unchanged:
+
+- `_block_attnres_state_bwd_kernel`: **55.52 -> 55.59 ms/step**
+- `_block_attnres_batched_completed_wsum_kernel`: **14.23 -> 14.19 ms/step**
+- `_block_attnres_merge_partial_kernel`: **14.08 -> 14.00 ms/step**
+- `_block_attnres_batched_completed_dreduction_kernel`: **3.18 -> 3.18 ms/step**
+
+The real win was eliminating extra backward epilogue traffic:
+
+- post-AttnRes bf16 add traffic dropped from about **31.18 GB/step**
+  to **17.89 GB/step**
+- effective bandwidth of that add kernel stayed roughly flat at about
+  **0.81 TB/s**
+
+Interpretation:
+- the add kernel itself did not become more efficient
+- the code simply asked it to move much less data
+
+This is the cleanest evidence so far that the backward epilogue was a real,
+actionable bottleneck.
+
+### Roofline / utilization summary
+
+Using the current machine's RTX 5090-class hardware:
+- peak memory bandwidth: about **1.79 TB/s**
+- peak FP32 throughput: about **104.9 TF/s**
+- balance point: about **58.5 flop/byte**
+
+The important BlockAttnRes kernels are still memory-bound:
+
+| Kernel | Time (ms/step) | Approx regime |
+|---|---:|---|
+| `_block_attnres_state_bwd_kernel` | 55.59 | memory-bound |
+| `_block_attnres_merge_partial_kernel` | 14.00 | memory-bound |
+| `_block_attnres_batched_completed_wsum_kernel` | 14.19 | memory-bound |
+| `_block_attnres_batched_completed_dreduction_kernel` | 3.18 | memory-bound |
+| bf16 eager add kernel | 21.90 | strongly memory-bound |
+
+Profiler metadata for the Triton kernels is consistent across the hot kernels:
+- **1 block / SM**
+- **4 warps / SM**
+- about **8% achieved occupancy**
+- very high register pressure:
+  - state_bwd: typically **166 regs/thread**
+  - merge_partial: **166-168 regs/thread**
+  - dreduction: **168 regs/thread**
+  - state_fwd fallback path: up to **255 regs/thread**
+
+Interpretation:
+- the kernels are register-limited on occupancy
+- but still operate like streaming memory kernels
+- they are nowhere near the compute roof
+- future wins are more likely to come from reducing memory traffic or kernel
+  count than from pure math retuning
+
+### Current bottleneck and next target
+
+Current dominant AttnRes cost:
+- `_block_attnres_state_bwd_kernel` at about **55.6 ms/step**
+
+What has already been squeezed out:
+- tiny FSDP cast overhead
+- tiny DTensor-gather storms
+- a large fraction of backward bf16 add epilogue traffic
+- excess FSDP wrapper overhead from the extra parent split wrapper
+
+What remains:
+- the core state backward kernel still rereads and rewrites a large amount of
+  completed-history state
+- it remains the best remaining target for algorithmic batching / traffic
+  reduction
+
+Most promising next direction:
+- a true block-scoped or batched backward integration that reduces repeated
+  completed-history traffic inside `_block_attnres_state_bwd_kernel` itself,
+  rather than only cleaning up the accumulation after it
+
+### Current assessment
+
+The implementation is now in a much better place than the earlier phase5 state:
+
+- correctness is preserved (`94` BlockAttnRes tests passing)
+- the compile path is stable again after the failed Python-stash attempt
+- throughput is back near and slightly above the earlier post-phase0 class of
+  performance on the current bs128 setup
+- the trace is much cleaner
+- the remaining work is now concentrated in one honest place:
+  **the memory-bound state backward kernel**
+
+That is a much healthier optimization position than the earlier situation where
+performance was being lost across multiple layers of integration overhead.
