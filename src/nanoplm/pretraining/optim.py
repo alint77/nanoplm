@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 
 from nanoplm.utils.logger import logger
 from nanoplm.pretraining.config import PretrainingConfig
@@ -68,6 +69,22 @@ def is_muon_optimizer(optimizer) -> bool:
 
 def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model.module if hasattr(model, "module") else model
+
+
+def extend_homogeneous_param_groups(
+    groups: list[dict],
+    params: list[torch.nn.Parameter],
+    **group_kwargs,
+) -> None:
+    """Append param groups split by Tensor vs DTensor to avoid mixed fused ops."""
+    if not params:
+        return
+    dtensor_params = [param for param in params if isinstance(param, DTensor)]
+    local_params = [param for param in params if not isinstance(param, DTensor)]
+    if dtensor_params:
+        groups.append({"params": dtensor_params, **group_kwargs})
+    if local_params:
+        groups.append({"params": local_params, **group_kwargs})
 
 
 def _is_embedding_or_unembedding_param(name: str) -> bool:
@@ -266,30 +283,30 @@ def build_optimizer(
 
     # -- torch.optim.AdamW(fused=True): adamw / resid / x0 params -------------
     adamw_groups: list[dict] = []
-    if adamw_params:
-        adamw_groups.append(dict(
-            params=adamw_params,
-            lr=float(adamw_learning_rate),
-            weight_decay=float(adamw_weight_decay),
-            betas=adamw_betas,
-            eps=float(adamw_epsilon),
-        ))
-    if resid_params:
-        adamw_groups.append(dict(
-            params=resid_params,
-            lr=NANOCHAT_RESID_LR,
-            weight_decay=0.0,
-            betas=NANOCHAT_RESID_BETAS,
-            eps=NANOCHAT_SCALAR_EPS,
-        ))
-    if x0_params:
-        adamw_groups.append(dict(
-            params=x0_params,
-            lr=NANOCHAT_X0_LR,
-            weight_decay=0.0,
-            betas=NANOCHAT_X0_BETAS,
-            eps=NANOCHAT_SCALAR_EPS,
-        ))
+    extend_homogeneous_param_groups(
+        adamw_groups,
+        adamw_params,
+        lr=float(adamw_learning_rate),
+        weight_decay=float(adamw_weight_decay),
+        betas=adamw_betas,
+        eps=float(adamw_epsilon),
+    )
+    extend_homogeneous_param_groups(
+        adamw_groups,
+        resid_params,
+        lr=NANOCHAT_RESID_LR,
+        weight_decay=0.0,
+        betas=NANOCHAT_RESID_BETAS,
+        eps=NANOCHAT_SCALAR_EPS,
+    )
+    extend_homogeneous_param_groups(
+        adamw_groups,
+        x0_params,
+        lr=NANOCHAT_X0_LR,
+        weight_decay=0.0,
+        betas=NANOCHAT_X0_BETAS,
+        eps=NANOCHAT_SCALAR_EPS,
+    )
 
     adamw_opt = torch.optim.AdamW(adamw_groups, fused=True)
 

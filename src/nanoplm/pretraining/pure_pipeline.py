@@ -11,7 +11,8 @@ import os
 import yaml
 from copy import deepcopy
 from dataclasses import asdict
-from dion import Muon,NorMuon
+from dion import Muon, NorMuon
+
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 # Default to safer Inductor reduction codegen. Inductor's async compile uses
 # subprocess workers that read these env vars at process start, so setting them
@@ -58,12 +59,18 @@ from nanoplm.pretraining.fp8 import (
     convert_to_float8_training,
 )
 from nanoplm.pretraining.models.modern_bert.modeling import (
+    BlockAttnResOp,
     MHCLiteBlock,
     MHCLiteSublayersLayer,
     ModernBertEncoderLayer,
 )
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
-from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer, MuonAdamWGroup
+from nanoplm.pretraining.optim import (
+    build_muon_optimizer,
+    extend_homogeneous_param_groups,
+    is_muon_optimizer,
+    MuonAdamWGroup,
+)
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.utils import (
     compute_batch_setup,
@@ -83,12 +90,13 @@ torch.backends.cudnn.allow_tf32 = True
 H100_PEAK_TFLOPS = 989.4
 
 # https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html#forward-backward-with-prefetching
-N_PREFETCH_LAYERS_FSDP2 = 2
+N_PREFETCH_LAYERS_FSDP2 = 1
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _set_seed(seed: int) -> None:
     random.seed(seed)
@@ -190,9 +198,10 @@ def _split_packed_batch(
     if valid_tokens <= 0:
         return [batch]
 
-    actual_seq_count = int(
-        torch.searchsorted(cu[1:], cu.new_tensor(valid_tokens), right=False).item()
-    ) + 1
+    actual_seq_count = (
+        int(torch.searchsorted(cu[1:], cu.new_tensor(valid_tokens), right=False).item())
+        + 1
+    )
     cu = cu[: actual_seq_count + 1]
     n_seqs = max(0, int(cu.numel() - 1))
     if n_seqs <= 0:
@@ -209,7 +218,9 @@ def _split_packed_batch(
         while end_seq < n_seqs:
             actual = int(cu[end_seq + 1].item() - cu[start_seq].item())
             seqs_left = n_seqs - (end_seq + 1)
-            if actual > effective_tokens_per_split or seqs_left < (remaining_splits - 1):
+            if actual > effective_tokens_per_split or seqs_left < (
+                remaining_splits - 1
+            ):
                 break
             end_seq += 1
 
@@ -252,7 +263,14 @@ def _split_packed_batch(
             sub["position_ids"] = sub_pos
 
         for key, value in batch.items():
-            if key in sub or key in {"input_ids", "labels", "cu_seqlens", "max_seqlen", "position_ids", "num_valid_tokens"}:
+            if key in sub or key in {
+                "input_ids",
+                "labels",
+                "cu_seqlens",
+                "max_seqlen",
+                "position_ids",
+                "num_valid_tokens",
+            }:
                 continue
             sub[key] = deepcopy(value) if not torch.is_tensor(value) else value
 
@@ -272,7 +290,9 @@ def _split_batch(
         return [batch]
     if "cu_seqlens" in batch:
         if effective_tokens_per_split is None:
-            raise ValueError("effective_tokens_per_split is required for packed batch splitting.")
+            raise ValueError(
+                "effective_tokens_per_split is required for packed batch splitting."
+            )
         return _split_packed_batch(
             batch,
             n_splits=n_splits,
@@ -390,23 +410,60 @@ def _locate_resume_position_in_epoch(
     return train_loader_len, 0, mbs_divisor
 
 
-def _maybe_expand_dynamo_cache_for_batch_warmup(batch_size_warmup_steps: int) -> None:
-    """Increase Dynamo cache room when warmup introduces a few extra static shapes."""
-    if int(batch_size_warmup_steps) <= 0:
+def _maybe_expand_dynamo_cache(
+    batch_size_warmup_steps: int,
+    *,
+    use_block_attnres: bool = False,
+    block_attnres_num_blocks: int = 0,
+) -> None:
+    """Increase Dynamo per-function cache limit when the model needs extra graph variants.
+
+    Block AttnRes: Dynamo unrolls the layer loop and specializes on mutable state
+    (``num_completed``, ``precomputed_sublayer_idx``, ``mlp_ends_block``). Each
+    distinct configuration compiles a separate graph. With *B* blocks of *S*
+    sublayers each, functions like ``_run_block_attnres_mlp`` may need up to
+    ``B * S`` cached variants — easily exceeding the default limit of 8.
+
+    Batch-size warmup: introduces a few extra static shapes during the first
+    training steps.
+
+    The limit is raised to ``max(current, needed)`` so both features compose.
+    """
+    needed = 0
+    reasons: list[str] = []
+
+    if int(batch_size_warmup_steps) > 0:
+        needed = max(needed, 16)
+        reasons.append("batch-size warmup")
+
+    if use_block_attnres and block_attnres_num_blocks >= 1:
+        # Each block produces a distinct num_completed value (1..B+1). Within
+        # each block, sublayers have distinct (sublayer_idx, ends_block) combos.
+        # Graph breaks create resume functions that also need cache room.
+        # 4× the block count is a safe empirical bound.
+        bar_needed = max(16, 4 * block_attnres_num_blocks)
+        needed = max(needed, bar_needed)
+        reasons.append(
+            f"block_attnres ({block_attnres_num_blocks} blocks, {bar_needed} variants)"
+        )
+
+    if needed <= 0:
         return
+
     try:
         import torch._dynamo.config as dynamo_config
 
         current_limit = int(getattr(dynamo_config, "cache_size_limit", 8))
-        if current_limit < 16:
-            dynamo_config.cache_size_limit = 16
+        if current_limit < needed:
+            dynamo_config.cache_size_limit = needed
             logger.info(
-                "torch._dynamo.config.cache_size_limit raised from %d to %d for batch-size warmup.",
+                "torch._dynamo.config.cache_size_limit raised from %d to %d (%s).",
                 current_limit,
-                dynamo_config.cache_size_limit,
+                needed,
+                ", ".join(reasons),
             )
     except Exception:
-        logger.exception("Failed to raise Dynamo cache_size_limit for batch-size warmup; continuing.")
+        logger.exception("Failed to raise Dynamo cache_size_limit; continuing.")
 
 
 def _build_compiled_training_model(
@@ -425,7 +482,9 @@ def _build_compiled_training_model(
         compiled_model = torch.compile(base_model, dynamic=compile_dynamic)
         logger.info("Model compiled with torch.compile(dynamic=%s)", compile_dynamic)
     else:
-        compiled_model = torch.compile(base_model, dynamic=compile_dynamic, mode=compile_mode)
+        compiled_model = torch.compile(
+            base_model, dynamic=compile_dynamic, mode=compile_mode
+        )
         logger.info(
             "Model compiled with torch.compile(dynamic=%s, mode=%s)",
             compile_dynamic,
@@ -483,8 +542,159 @@ def _format_vram_for_log(
         f"peak={peak_alloc_mb:,.0f}/{peak_reserved_mb:,.0f}MB"
     )
 
+
 def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor._local_tensor if isinstance(tensor, DTensor) else tensor
+
+
+def _block_attnres_ignored_params(module: torch.nn.Module) -> set[torch.nn.Parameter]:
+    """Keep tiny BlockAttnRes params replicated to avoid hot-path DTensor gathers."""
+    ignored: set[torch.nn.Parameter] = set()
+    for submodule in module.modules():
+        if isinstance(submodule, BlockAttnResOp):
+            ignored.add(submodule.query)
+            ignored.add(submodule.norm_weight)
+    return ignored
+
+
+def _fsdp_kwargs_with_ignored_params(
+    fsdp_kwargs: dict,
+    module: torch.nn.Module,
+) -> dict:
+    ignored = _block_attnres_ignored_params(module)
+    if not ignored:
+        return fsdp_kwargs
+    merged = set(fsdp_kwargs.get("ignored_params") or set())
+    merged.update(ignored)
+    updated = dict(fsdp_kwargs)
+    updated["ignored_params"] = merged
+    return updated
+
+
+def _fsdp_kwargs_without_forward_input_cast(
+    fsdp_kwargs: dict,
+) -> dict:
+    """Preserve f32 BlockAttnRes state tensors through FSDP layer entry."""
+    mp_policy = fsdp_kwargs.get("mp_policy")
+    if mp_policy is None or not getattr(mp_policy, "cast_forward_inputs", True):
+        return fsdp_kwargs
+    updated = dict(fsdp_kwargs)
+    updated["mp_policy"] = MixedPrecisionPolicy(
+        param_dtype=mp_policy.param_dtype,
+        reduce_dtype=mp_policy.reduce_dtype,
+        output_dtype=mp_policy.output_dtype,
+        cast_forward_inputs=False,
+    )
+    return updated
+
+
+def _split_params_by_grad_storage(
+    parameters,
+) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+    """Split params with grads into DTensor-backed and plain local tensors."""
+    dtensor_params: list[torch.nn.Parameter] = []
+    local_params: list[torch.nn.Parameter] = []
+    seen: set[int] = set()
+    for param in parameters:
+        if param is None or id(param) in seen or param.grad is None:
+            continue
+        seen.add(id(param))
+        if isinstance(param, DTensor) or isinstance(param.grad, DTensor):
+            dtensor_params.append(param)
+        else:
+            local_params.append(param)
+    return dtensor_params, local_params
+
+
+def _sync_replicated_local_grads(
+    params: tuple[torch.nn.Parameter, ...],
+) -> None:
+    """All-reduce grads for ignored replicated params excluded from FSDP sync."""
+    if (
+        not params
+        or not dist.is_available()
+        or not dist.is_initialized()
+        or dist.get_world_size() <= 1
+    ):
+        return
+    world_size = dist.get_world_size()
+    for param in params:
+        grad = param.grad
+        if grad is None:
+            continue
+        dist.all_reduce(grad)
+        grad.div_(world_size)
+
+
+def _local_grad_total_norm(
+    local_params: list[torch.nn.Parameter],
+    norm_type: float,
+) -> torch.Tensor:
+    grads = [param.grad.detach() for param in local_params if param.grad is not None]
+    if not grads:
+        return torch.zeros((), dtype=torch.float32)
+    if norm_type == math.inf:
+        return torch.stack([grad.float().abs().max() for grad in grads]).max()
+    norms = [torch.linalg.vector_norm(grad.float(), ord=norm_type) for grad in grads]
+    return torch.linalg.vector_norm(torch.stack(norms), ord=norm_type)
+
+
+def _clip_grad_norm_mixed(
+    parameters,
+    *,
+    max_norm: float,
+    norm_type: float = 2.0,
+    error_if_nonfinite: bool = False,
+) -> "torch.Tensor | DTensor":
+    """Clip a mixed local+DTensor parameter set without triggering DTensor dispatch errors."""
+    dtensor_params, local_params = _split_params_by_grad_storage(parameters)
+    if not dtensor_params and not local_params:
+        return torch.zeros((), dtype=torch.float32)
+
+    if not local_params:
+        return torch.nn.utils.clip_grad_norm_(
+            dtensor_params,
+            max_norm=max_norm,
+            norm_type=norm_type,
+            error_if_nonfinite=error_if_nonfinite,
+        )
+    if not dtensor_params:
+        return torch.nn.utils.clip_grad_norm_(
+            local_params,
+            max_norm=max_norm,
+            norm_type=norm_type,
+            error_if_nonfinite=error_if_nonfinite,
+        )
+
+    dtensor_norm = torch.nn.utils.clip_grad_norm_(
+        dtensor_params,
+        max_norm=float("inf"),
+        norm_type=norm_type,
+        error_if_nonfinite=False,
+    )
+    dtensor_norm_local = _local_tensor(dtensor_norm).float()
+    local_norm = _local_grad_total_norm(local_params, norm_type).to(
+        device=dtensor_norm_local.device
+    )
+
+    if norm_type == math.inf:
+        total_norm = torch.maximum(dtensor_norm_local, local_norm)
+    else:
+        total_norm = torch.linalg.vector_norm(
+            torch.stack((dtensor_norm_local, local_norm)),
+            ord=norm_type,
+        )
+    if error_if_nonfinite and not torch.isfinite(total_norm):
+        raise RuntimeError(
+            f"The total norm of order {norm_type} for gradients is non-finite: {total_norm.item()}"
+        )
+    if math.isfinite(max_norm):
+        clip_coef = torch.clamp(max_norm / (total_norm + 1e-6), max=1.0)
+        clip_coef_value = float(clip_coef.item())
+        if clip_coef_value < 1.0:
+            for param in (*dtensor_params, *local_params):
+                param.grad.detach().mul_(clip_coef_value)
+    return total_norm
 
 
 def _fully_shard_encoder_sublayers(
@@ -507,7 +717,12 @@ def _fully_shard_encoder_sublayers(
         if enc.mlp is not None:
             fully_shard(enc.mlp, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
     if shard_parent:
-        fully_shard(enc, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+        fully_shard(
+            enc,
+            mesh=mesh,
+            reshard_after_forward=False,
+            **_fsdp_kwargs_with_ignored_params(fsdp_kwargs, enc),
+        )
 
 
 def _fully_shard_transformer_layer(
@@ -518,29 +733,53 @@ def _fully_shard_transformer_layer(
     sublayer: bool = False,
 ) -> None:
     """Shard one logical transformer layer bottom-up for better overlap."""
+    layer_fsdp_kwargs = fsdp_kwargs
+    wrap_parent_layer = True
+    if isinstance(layer, ModernBertEncoderLayer) and layer.attn_res is not None:
+        layer_fsdp_kwargs = _fsdp_kwargs_without_forward_input_cast(layer_fsdp_kwargs)
     if isinstance(layer, ModernBertEncoderLayer):
         _fully_shard_encoder_sublayers(
             layer,
             mesh=mesh,
-            fsdp_kwargs=fsdp_kwargs,
+            fsdp_kwargs=layer_fsdp_kwargs,
             shard_parent=False,
             sublayer=sublayer,
         )
+        wrap_parent_layer = not sublayer
     elif isinstance(layer, MHCLiteBlock):
-        _fully_shard_encoder_sublayers(layer.layer, mesh=mesh, fsdp_kwargs=fsdp_kwargs, sublayer=sublayer)
+        _fully_shard_encoder_sublayers(
+            layer.layer, mesh=mesh, fsdp_kwargs=layer_fsdp_kwargs, sublayer=sublayer
+        )
     elif isinstance(layer, MHCLiteSublayersLayer):
         _fully_shard_encoder_sublayers(
             layer.enc,
             mesh=mesh,
-            fsdp_kwargs=fsdp_kwargs,
+            fsdp_kwargs=layer_fsdp_kwargs,
             shard_parent=False,
             sublayer=sublayer,
         )
         if sublayer:
-            fully_shard(layer.mhc_attn, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+            fully_shard(
+                layer.mhc_attn,
+                mesh=mesh,
+                reshard_after_forward=False,
+                **layer_fsdp_kwargs,
+            )
             if layer.mhc_mlp is not None:
-                fully_shard(layer.mhc_mlp, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
-    fully_shard(layer, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+                fully_shard(
+                    layer.mhc_mlp,
+                    mesh=mesh,
+                    reshard_after_forward=False,
+                    **layer_fsdp_kwargs,
+                )
+        wrap_parent_layer = not sublayer
+    if wrap_parent_layer:
+        fully_shard(
+            layer,
+            mesh=mesh,
+            reshard_after_forward=False,
+            **_fsdp_kwargs_with_ignored_params(layer_fsdp_kwargs, layer),
+        )
 
 
 def _fully_shard_root_groups(
@@ -550,7 +789,9 @@ def _fully_shard_root_groups(
     fsdp_kwargs: dict,
 ) -> None:
     """Split root-only params into separate groups to avoid a serialized root tail."""
-    tied_embeddings = model.decoder.weight is model.model.embeddings.tok_embeddings.weight
+    tied_embeddings = (
+        model.decoder.weight is model.model.embeddings.tok_embeddings.weight
+    )
     if tied_embeddings:
         # Keep the tied embedding/unembedding weight in one FSDP group.
         fully_shard(
@@ -560,9 +801,18 @@ def _fully_shard_root_groups(
             **fsdp_kwargs,
         )
     else:
-        fully_shard(model.model.embeddings, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
-        fully_shard(model.decoder, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
-    fully_shard(model.model.final_norm, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+        fully_shard(
+            model.model.embeddings,
+            mesh=mesh,
+            reshard_after_forward=False,
+            **fsdp_kwargs,
+        )
+        fully_shard(
+            model.decoder, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs
+        )
+    fully_shard(
+        model.model.final_norm, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs
+    )
     fully_shard(model.head, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
 
 
@@ -625,7 +875,9 @@ def _dist_barrier(local_rank: int) -> None:
 def _get_distributed_mode(cfg: PretrainingConfig, *, distributed: bool) -> str:
     mode = str(getattr(cfg, "distributed_mode", "fsdp")).strip().lower()
     if mode not in {"fsdp", "ddp"}:
-        raise ValueError(f"Unsupported distributed_mode={mode!r}. Expected 'fsdp' or 'ddp'.")
+        raise ValueError(
+            f"Unsupported distributed_mode={mode!r}. Expected 'fsdp' or 'ddp'."
+        )
     if not distributed and mode == "ddp":
         raise ValueError("distributed_mode='ddp' requires multi_gpu=True.")
     return mode
@@ -718,7 +970,9 @@ def _make_pure_profiler(
     prof = torch.profiler.profile(
         activities=activities,
         # Single profiling window; avoid repeating the cycle throughout training.
-        schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=1),
+        schedule=torch.profiler.schedule(
+            wait=wait, warmup=warmup, active=active, repeat=1
+        ),
         on_trace_ready=on_trace_ready,
         record_shapes=True,
     )
@@ -735,6 +989,7 @@ def _make_pure_profiler(
 # ---------------------------------------------------------------------------
 # FLOPs estimation
 # ---------------------------------------------------------------------------
+
 
 def _estimate_model_flops_per_token(config, seq_len: int) -> int:
     """Training FLOPs per token (forward + backward ≈ 3× forward).
@@ -803,11 +1058,11 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
     if getattr(config, "use_canon_layers", False) and config.canon_layer_set:
         K = config.canon_layers_kernel_size
         canon_set = config.canon_layer_set
-        if "a" in canon_set:                        # before attention, C = h
+        if "a" in canon_set:  # before attention, C = h
             canon_flops += n_layers * 2 * K * h
-        if "b" in canon_set:                        # on QKV output
+        if "b" in canon_set:  # on QKV output
             canon_flops += n_layers * 2 * K * qkv_out_dim
-        if "c" in canon_set:                        # before MLP, C = h
+        if "c" in canon_set:  # before MLP, C = h
             canon_flops += n_layers * 2 * K * h
         if "d" in canon_set and config.mlp_activation != "srelu":
             # after first MLP projection, C = 2*ff (gated MLPs only)
@@ -835,8 +1090,10 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
         perm_mix_flops = 2 * n_fact * n * n
         pre_map_flops = 2 * n * h
         post_res_flops = 2 * n * n * h
-        mhc_flops = n_layers * blocks_per_layer * (
-            proj_flops + perm_mix_flops + pre_map_flops + post_res_flops
+        mhc_flops = (
+            n_layers
+            * blocks_per_layer
+            * (proj_flops + perm_mix_flops + pre_map_flops + post_res_flops)
         )
 
     forward_flops = (
@@ -855,6 +1112,7 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
 # Optimizer / Scheduler
 # ---------------------------------------------------------------------------
 
+
 def _create_optimizer(model, cfg, distributed_mesh=None):
     name = str(cfg.optimizer).lower()
     if name in {"muon", "normuon"}:
@@ -866,10 +1124,17 @@ def _create_optimizer(model, cfg, distributed_mesh=None):
             continue
         (decay if _use_weight_decay(p_name, param) else no_decay).append(param)
 
-    groups = [
-        {"params": decay, "weight_decay": float(cfg.adam_weight_decay)},
-        {"params": no_decay, "weight_decay": 0.0},
-    ]
+    groups: list[dict] = []
+    extend_homogeneous_param_groups(
+        groups,
+        decay,
+        weight_decay=float(cfg.adam_weight_decay),
+    )
+    extend_homogeneous_param_groups(
+        groups,
+        no_decay,
+        weight_decay=0.0,
+    )
     kwargs = dict(
         params=groups,
         lr=float(cfg.adam_learning_rate),
@@ -885,7 +1150,9 @@ def _create_optimizer(model, cfg, distributed_mesh=None):
             logger.warning("StableAdamW unavailable; falling back to AdamW.")
             return torch.optim.AdamW(**kwargs)
         return cls(**kwargs)
-    raise ValueError(f"Invalid optimizer: {cfg.optimizer}. Supported: [adamw, stable_adamw, muon, normuon]")
+    raise ValueError(
+        f"Invalid optimizer: {cfg.optimizer}. Supported: [adamw, stable_adamw, muon, normuon]"
+    )
 
 
 class _SchedulerGroup:
@@ -941,15 +1208,20 @@ def _create_scheduler(
             (useful when reconstructing the schedule on resume).
             ``initial_lr`` is injected into param groups automatically.
     """
+
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return step / max(1, warmup_steps)
         decay_steps = max(1, total_steps - warmup_steps)
         progress = min(1.0, (step - warmup_steps) / decay_steps)
         if lr_schedule.lower() == "cosine":
-            return lr_decay_to_fraction + 0.5 * (1.0 - lr_decay_to_fraction) * (1.0 + math.cos(math.pi * progress))
+            return lr_decay_to_fraction + 0.5 * (1.0 - lr_decay_to_fraction) * (
+                1.0 + math.cos(math.pi * progress)
+            )
         else:
-            return max(lr_decay_to_fraction, 1.0 - (1.0 - lr_decay_to_fraction) * progress)
+            return max(
+                lr_decay_to_fraction, 1.0 - (1.0 - lr_decay_to_fraction) * progress
+            )
 
     def _make_scheduler(opt, last_ep):
         if last_ep >= 0:
@@ -1020,7 +1292,9 @@ def _sync_train_loader_len(
             max_len,
         )
     return min_len
-  # TODO: this is comming from master branch
+
+
+# TODO: this is comming from master branch
 # def _dist_barrier(local_rank: int) -> None:
 #     if not dist.is_initialized():
 #         return
@@ -1034,6 +1308,7 @@ def _sync_train_loader_len(
 # Eval
 # ---------------------------------------------------------------------------
 
+
 @torch.compiler.disable
 @torch.inference_mode()
 def _evaluate(model, eval_loader, device, distributed, amp_dtype) -> float:
@@ -1045,7 +1320,11 @@ def _evaluate(model, eval_loader, device, distributed, amp_dtype) -> float:
 
     for batch in eval_loader:
         batch = _move_batch_to_device(batch, device)
-        ctx = torch.autocast(device_type=device.type, dtype=amp_dtype) if amp_dtype else nullcontext()
+        ctx = (
+            torch.autocast(device_type=device.type, dtype=amp_dtype)
+            if amp_dtype
+            else nullcontext()
+        )
         with ctx:
             out = model(
                 input_ids=batch["input_ids"],
@@ -1069,6 +1348,7 @@ def _evaluate(model, eval_loader, device, distributed, amp_dtype) -> float:
 # ---------------------------------------------------------------------------
 # Checkpointing
 # ---------------------------------------------------------------------------
+
 
 def _legacy_shard_opt_state_for_fsdp(opt_sd, optimizer):
     """Backward-compat fallback: manually shard a full optimizer state_dict for FSDP2.
@@ -1101,7 +1381,9 @@ def _legacy_shard_opt_state_for_fsdp(opt_sd, optimizer):
                     continue
                 if val.ndim >= 1 and val.shape[0] == local_shape[0] * world:
                     chunk_size = val.shape[0] // world
-                    entry[key] = val.narrow(0, rank * chunk_size, chunk_size).contiguous()
+                    entry[key] = val.narrow(
+                        0, rank * chunk_size, chunk_size
+                    ).contiguous()
                 elif val.ndim >= 1 and val.shape[0] != local_shape[0]:
                     chunks = torch.tensor_split(val, world, dim=0)
                     if chunks[rank].shape[0] == local_shape[0]:
@@ -1110,7 +1392,10 @@ def _legacy_shard_opt_state_for_fsdp(opt_sd, optimizer):
                         logger.warning(
                             "Optimizer state param %s key '%s': shape %s cannot "
                             "be sharded to match local %s",
-                            param_idx, key, val.shape, local_shape,
+                            param_idx,
+                            key,
+                            val.shape,
+                            local_shape,
                         )
 
     if isinstance(optimizer, MuonAdamWGroup) and "muon" in opt_sd:
@@ -1121,11 +1406,23 @@ def _legacy_shard_opt_state_for_fsdp(opt_sd, optimizer):
 
 
 def _save_checkpoint(
-    model, optimizer, scheduler, global_step, epoch,
-    output_dir, logging_steps, eval_steps, save_steps,
-    distributed=False, is_main=True, distributed_mode="fsdp",
-    model_config=None, manifest=None,
-    pretrain_config=None, total_steps=None, warmup_steps=None,
+    model,
+    optimizer,
+    scheduler,
+    global_step,
+    epoch,
+    output_dir,
+    logging_steps,
+    eval_steps,
+    save_steps,
+    distributed=False,
+    is_main=True,
+    distributed_mode="fsdp",
+    model_config=None,
+    manifest=None,
+    pretrain_config=None,
+    total_steps=None,
+    warmup_steps=None,
     dataset_fingerprint=None,
     epoch_data_step: Optional[int] = None,
     epoch_sub_batch_step: Optional[int] = None,
@@ -1138,8 +1435,12 @@ def _save_checkpoint(
         model_sd = get_model_state_dict(model, options=_fsdp_opts)
         if isinstance(optimizer, MuonAdamWGroup):
             opt_sd = {
-                "muon": get_optimizer_state_dict(model, optimizer.muon, options=_fsdp_opts),
-                "adamw": get_optimizer_state_dict(model, optimizer.adamw, options=_fsdp_opts),
+                "muon": get_optimizer_state_dict(
+                    model, optimizer.muon, options=_fsdp_opts
+                ),
+                "adamw": get_optimizer_state_dict(
+                    model, optimizer.adamw, options=_fsdp_opts
+                ),
             }
         else:
             opt_sd = get_optimizer_state_dict(model, optimizer, options=_fsdp_opts)
@@ -1157,7 +1458,9 @@ def _save_checkpoint(
     torch.save(
         {
             "torch_rng": torch.random.get_rng_state(),
-            "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+            "cuda_rng": torch.cuda.get_rng_state_all()
+            if torch.cuda.is_available()
+            else [],
             "numpy_rng": np.random.get_state(),
             "python_rng": random.getstate(),
         },
@@ -1166,8 +1469,11 @@ def _save_checkpoint(
     # Include schedule metadata so resumed runs can reconstruct the exact
     # LR curve without depending on the current pretrain.yaml.
     training_state = dict(
-        global_step=global_step, epoch=epoch,
-        logging_steps=logging_steps, eval_steps=eval_steps, save_steps=save_steps,
+        global_step=global_step,
+        epoch=epoch,
+        logging_steps=logging_steps,
+        eval_steps=eval_steps,
+        save_steps=save_steps,
         distributed_mode=_checkpoint_distributed_mode(
             distributed=distributed,
             distributed_mode=distributed_mode,
@@ -1194,11 +1500,17 @@ def _save_checkpoint(
     # self-contained (inference can reconstruct the model without the
     # original pretrain.yaml or dataset directory).
     if model_config is not None:
-        cfg_dict = asdict(model_config) if hasattr(model_config, '__dataclass_fields__') else dict(model_config)
+        cfg_dict = (
+            asdict(model_config)
+            if hasattr(model_config, "__dataclass_fields__")
+            else dict(model_config)
+        )
         with open(ckpt / "model_config.yaml", "w") as f:
             yaml.dump(cfg_dict, f, default_flow_style=False, sort_keys=False)
     if manifest is not None:
-        manifest_dict = manifest.to_dict() if hasattr(manifest, 'to_dict') else dict(manifest)
+        manifest_dict = (
+            manifest.to_dict() if hasattr(manifest, "to_dict") else dict(manifest)
+        )
         with open(ckpt / "data_manifest.yaml", "w") as f:
             yaml.dump(manifest_dict, f, default_flow_style=False, sort_keys=False)
 
@@ -1219,8 +1531,14 @@ def _save_checkpoint(
 
 
 def _load_checkpoint(
-    model, optimizer, scheduler, checkpoint_dir, device,
-    distributed=False, load_scheduler=True, distributed_mode="fsdp",
+    model,
+    optimizer,
+    scheduler,
+    checkpoint_dir,
+    device,
+    distributed=False,
+    load_scheduler=True,
+    distributed_mode="fsdp",
 ) -> Tuple[int, int]:
     """Restore model, optimizer, (optionally) scheduler, and RNG states.
 
@@ -1245,9 +1563,13 @@ def _load_checkpoint(
     )
     mode_mismatch = checkpoint_mode is not None and checkpoint_mode != current_mode
 
-    model_sd = torch.load(ckp / "pytorch_model.bin", map_location=device, weights_only=True)
+    model_sd = torch.load(
+        ckp / "pytorch_model.bin", map_location=device, weights_only=True
+    )
     if distributed and distributed_mode == "fsdp":
-        set_model_state_dict(model, model_sd, options=StateDictOptions(full_state_dict=True))
+        set_model_state_dict(
+            model, model_sd, options=StateDictOptions(full_state_dict=True)
+        )
     else:
         model.load_state_dict(model_sd)
 
@@ -1271,22 +1593,29 @@ def _load_checkpoint(
         try:
             if isinstance(optimizer, MuonAdamWGroup) and "muon" in opt_sd:
                 set_optimizer_state_dict(
-                    model, optimizer.muon,
-                    optim_state_dict=opt_sd["muon"], options=_fsdp_opts,
+                    model,
+                    optimizer.muon,
+                    optim_state_dict=opt_sd["muon"],
+                    options=_fsdp_opts,
                 )
                 set_optimizer_state_dict(
-                    model, optimizer.adamw,
-                    optim_state_dict=opt_sd["adamw"], options=_fsdp_opts,
+                    model,
+                    optimizer.adamw,
+                    optim_state_dict=opt_sd["adamw"],
+                    options=_fsdp_opts,
                 )
             else:
                 set_optimizer_state_dict(
-                    model, optimizer,
-                    optim_state_dict=opt_sd, options=_fsdp_opts,
+                    model,
+                    optimizer,
+                    optim_state_dict=opt_sd,
+                    options=_fsdp_opts,
                 )
         except Exception as exc:
             logger.warning(
                 "FSDP2-aware optimizer state restore failed (%s). "
-                "Falling back to legacy manual sharding.", exc,
+                "Falling back to legacy manual sharding.",
+                exc,
             )
             _legacy_shard_opt_state_for_fsdp(opt_sd, optimizer)
             try:
@@ -1296,7 +1625,8 @@ def _load_checkpoint(
                     logger.warning(
                         "Optimizer param-group layout changed since checkpoint was saved "
                         "(%s). Skipping optimizer state restore — optimizer will "
-                        "restart with fresh momentum/variance buffers.", exc2,
+                        "restart with fresh momentum/variance buffers.",
+                        exc2,
                     )
                 else:
                     raise
@@ -1308,7 +1638,8 @@ def _load_checkpoint(
                 logger.warning(
                     "Optimizer param-group layout changed since checkpoint was saved "
                     "(%s). Skipping optimizer state restore — optimizer will "
-                    "restart with fresh momentum/variance buffers.", exc,
+                    "restart with fresh momentum/variance buffers.",
+                    exc,
                 )
             else:
                 raise
@@ -1397,13 +1728,22 @@ def _rebuild_scheduler_for_resume(
         if is_main:
             diffs: list[str] = []
             for key in (
-                "adam_learning_rate", "muon_learning_rate", "warmup_steps",
-                "lr_schedule", "lr_decay_to_fraction",
+                "adam_learning_rate",
+                "muon_learning_rate",
+                "warmup_steps",
+                "lr_schedule",
+                "lr_decay_to_fraction",
             ):
                 ckpt_val = saved_cfg.get(key)
                 yaml_val = getattr(pretrain_config, key, None)
-                if ckpt_val is not None and yaml_val is not None and ckpt_val != yaml_val:
-                    diffs.append(f"  {key}: {ckpt_val} (checkpoint) \u2192 {yaml_val} (current YAML)")
+                if (
+                    ckpt_val is not None
+                    and yaml_val is not None
+                    and ckpt_val != yaml_val
+                ):
+                    diffs.append(
+                        f"  {key}: {ckpt_val} (checkpoint) \u2192 {yaml_val} (current YAML)"
+                    )
             if diffs:
                 logger.warning(
                     "Schedule config drift detected between checkpoint and current YAML:\n"
@@ -1470,15 +1810,23 @@ def _rebuild_scheduler_for_resume(
                 f"base_lr={eff_lr:.2e}, decay_to={eff_decay}"
             )
         scheduler = _create_scheduler(
-            optimizer, eff_warmup, remaining,
-            eff_lr, eff_decay, eff_schedule,
+            optimizer,
+            eff_warmup,
+            remaining,
+            eff_lr,
+            eff_decay,
+            eff_schedule,
         )
     else:
         # Reconstruct the original schedule and position at start_step.
         # last_epoch=N-1 causes __init__ to call step() once → last_epoch=N.
         scheduler = _create_scheduler(
-            optimizer, eff_warmup, eff_total,
-            eff_lr, eff_decay, eff_schedule,
+            optimizer,
+            eff_warmup,
+            eff_total,
+            eff_lr,
+            eff_decay,
+            eff_schedule,
             last_epoch=max(-1, start_step - 1),
         )
 
@@ -1497,12 +1845,12 @@ def _rebuild_scheduler_for_resume(
 # Main entry point
 # ---------------------------------------------------------------------------
 
+
 def run_pure_pretraining(
     model: PureProtModernBertMLM,
     pretrain_config: PretrainingConfig,
     resume_config: Optional[ResumeConfig] = None,
 ) -> None:
-
     # Set allocator config (respect existing user settings)
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
@@ -1569,10 +1917,21 @@ def run_pure_pretraining(
         0,
         int(getattr(pretrain_config, "batch_size_warmup_steps", 0)),
     )
-    if any(v is None for v in (inferred_grad_accum_steps, global_batch_size_samples, achieved_global_batch_tokens)):
-        raise ValueError("Batch setup missing on PretrainingConfig. Run through nanoplm CLI.")
+    if any(
+        v is None
+        for v in (
+            inferred_grad_accum_steps,
+            global_batch_size_samples,
+            achieved_global_batch_tokens,
+        )
+    ):
+        raise ValueError(
+            "Batch setup missing on PretrainingConfig. Run through nanoplm CLI."
+        )
 
-    world_tokens_per_micro_step = achieved_global_batch_tokens // max(1, inferred_grad_accum_steps)
+    world_tokens_per_micro_step = achieved_global_batch_tokens // max(
+        1, inferred_grad_accum_steps
+    )
     tokens_per_micro = pretrain_config.micro_batch_size * manifest.max_seq_len
     logger.info(
         f"Batch setup: target_global_batch_size={pretrain_config.global_batch_size:,} tokens, "
@@ -1612,7 +1971,6 @@ def run_pure_pretraining(
     distributed_mode = _get_distributed_mode(pretrain_config, distributed=distributed)
     ddp_bucket_cap_mb = int(getattr(pretrain_config, "ddp_bucket_cap_mb", 25))
 
-
     if distributed:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         if torch.cuda.is_available():
@@ -1625,13 +1983,21 @@ def run_pure_pretraining(
                 dist.init_process_group(backend=backend)
 
     is_main = (not distributed) or dist.get_rank() == 0
-    eval_sampler = DistributedSampler(val_ds, shuffle=False) if distributed else SequentialSampler(val_ds)
+    eval_sampler = (
+        DistributedSampler(val_ds, shuffle=False)
+        if distributed
+        else SequentialSampler(val_ds)
+    )
 
     # ---- Collator / Sampler / Packing ----
     train_sampler = None
 
     if use_packing:
-        inner_sampler = DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed) if distributed else RandomSampler(train_ds)
+        inner_sampler = (
+            DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed)
+            if distributed
+            else RandomSampler(train_ds)
+        )
 
         train_ds = TokenPackingDataset(
             train_ds,
@@ -1650,12 +2016,17 @@ def run_pure_pretraining(
         if use_static_inp_size:
             min_tokens_per_seq = max(
                 1,
-                int(manifest.min_seq_len) + int(tokenizer.num_special_tokens_to_add(pair=False)),
+                int(manifest.min_seq_len)
+                + int(tokenizer.num_special_tokens_to_add(pair=False)),
             )
             # +1 leaves room for an optional trailing dummy sequence used for fixed-token padding.
             max_sequences_per_batch = max(1, tokens_per_micro // min_tokens_per_seq + 1)
-            seq_count_buckets = build_power_of_two_buckets(max_sequences_per_batch, min_power_of_two=32)
-            max_seqlen_buckets = build_power_of_two_buckets(int(manifest.max_seq_len), min_power_of_two=32)
+            seq_count_buckets = build_power_of_two_buckets(
+                max_sequences_per_batch, min_power_of_two=32
+            )
+            max_seqlen_buckets = build_power_of_two_buckets(
+                int(manifest.max_seq_len), min_power_of_two=32
+            )
             collator = DataCollatorWithFlattening(
                 collator=inner_collator,
                 return_position_ids=True,
@@ -1688,17 +2059,31 @@ def run_pure_pretraining(
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
         )
-        train_sampler = DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed) if distributed else RandomSampler(train_ds)
+        train_sampler = (
+            DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed)
+            if distributed
+            else RandomSampler(train_ds)
+        )
 
     # ---- FP8 (optional) ----
     if pretrain_config.fp8:
         if device.type != "cuda":
             raise ValueError("fp8=True requires CUDA.")
-        fp8_filter = lambda mod, _: isinstance(mod, torch.nn.Linear) and mod.in_features % 16 == 0 and mod.out_features % 16 == 0
-        convert_to_float8_training(model, config=Float8LinearConfig.from_recipe_name("tensorwise"), module_filter_fn=fp8_filter)
+        fp8_filter = (
+            lambda mod, _: isinstance(mod, torch.nn.Linear)
+            and mod.in_features % 16 == 0
+            and mod.out_features % 16 == 0
+        )
+        convert_to_float8_training(
+            model,
+            config=Float8LinearConfig.from_recipe_name("tensorwise"),
+            module_filter_fn=fp8_filter,
+        )
         n_fp8 = sum(1 for m in model.modules() if isinstance(m, Float8Linear))
         n_lin = sum(1 for m in model.modules() if isinstance(m, torch.nn.Linear))
-        logger.info(f"FP8 enabled (tensorwise): converted={n_fp8} linear layers, skipped={max(0, n_lin - n_fp8)}")
+        logger.info(
+            f"FP8 enabled (tensorwise): converted={n_fp8} linear layers, skipped={max(0, n_lin - n_fp8)}"
+        )
 
     # ---- Model to device + compile + FSDP ----
     model.to(device)
@@ -1707,23 +2092,41 @@ def run_pure_pretraining(
     compile_dynamic = not bool(use_packing and use_static_inp_size)
 
     # Precision detection (needed before FSDP MixedPrecisionPolicy)
-    use_bf16 = pretrain_config.bf16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
+    use_bf16 = (
+        pretrain_config.bf16
+        and device.type == "cuda"
+        and torch.cuda.is_bf16_supported()
+    )
     use_fp16 = pretrain_config.bf16 and (
-        (device.type == "cuda" and not torch.cuda.is_bf16_supported()) or device.type == "mps"
+        (device.type == "cuda" and not torch.cuda.is_bf16_supported())
+        or device.type == "mps"
     )
 
     fsdp_mesh = None
     optimizer_dist = None
+    replicated_block_attnres_params: tuple[torch.nn.Parameter, ...] = ()
     if distributed and distributed_mode == "fsdp":
         fsdp_kwargs: dict = {}
         if use_bf16:
-            fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+            fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+            )
         fsdp_mesh = init_device_mesh("cuda", (effective_world_size,))
-        fsdp_sublayer = getattr(pretrain_config, "fsdp_shard_granularity", "layer") == "sublayer"
+        fsdp_sublayer = (
+            getattr(pretrain_config, "fsdp_shard_granularity", "layer") == "sublayer"
+        )
         for layer in base_model.model.layers:
-            _fully_shard_transformer_layer(layer, mesh=fsdp_mesh, fsdp_kwargs=fsdp_kwargs, sublayer=fsdp_sublayer)
+            _fully_shard_transformer_layer(
+                layer, mesh=fsdp_mesh, fsdp_kwargs=fsdp_kwargs, sublayer=fsdp_sublayer
+            )
         _fully_shard_root_groups(base_model, mesh=fsdp_mesh, fsdp_kwargs=fsdp_kwargs)
-        fully_shard(base_model, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_kwargs)
+        fully_shard(
+            base_model,
+            mesh=fsdp_mesh,
+            reshard_after_forward=False,
+            **_fsdp_kwargs_with_ignored_params(fsdp_kwargs, base_model),
+        )
+        replicated_block_attnres_params = tuple(_block_attnres_ignored_params(base_model))
         optimizer_dist = fsdp_mesh
 
         # Explicit prefetching for FSDP2
@@ -1731,9 +2134,13 @@ def run_pure_pretraining(
             layers = base_model.model.layers
             for i, layer in enumerate(layers):
                 if i + 1 < len(layers):
-                    layer.set_modules_to_forward_prefetch(layers[i + 1 : i + 1 + N_PREFETCH_LAYERS_FSDP2])
+                    layer.set_modules_to_forward_prefetch(
+                        layers[i + 1 : i + 1 + N_PREFETCH_LAYERS_FSDP2]
+                    )
                 if i - 1 >= 0:
-                    layer.set_modules_to_backward_prefetch(list(reversed(layers[max(0, i - N_PREFETCH_LAYERS_FSDP2) : i])))
+                    layer.set_modules_to_backward_prefetch(
+                        list(reversed(layers[max(0, i - N_PREFETCH_LAYERS_FSDP2) : i]))
+                    )
 
     # Keep base_model for checkpointing/eval (eval changes shapes → recompilation).
     orig_model = base_model
@@ -1742,7 +2149,13 @@ def run_pure_pretraining(
         if getattr(pretrain_config, "use_compile_max_autotune", False)
         else None
     )
-    _maybe_expand_dynamo_cache_for_batch_warmup(batch_size_warmup_steps)
+    _maybe_expand_dynamo_cache(
+        batch_size_warmup_steps,
+        use_block_attnres=bool(getattr(base_model.config, "use_block_attnres", False)),
+        block_attnres_num_blocks=int(
+            getattr(base_model.config, "block_attnres_num_blocks", 0)
+        ),
+    )
 
     # ---- TorchInductor knobs (must be set before torch.compile) ----
     if device.type == "cuda":
@@ -1775,7 +2188,9 @@ def run_pure_pretraining(
                 os.environ.get("TORCHINDUCTOR_MIX_ORDER_REDUCTION"),
             )
         except Exception:
-            logger.exception("Failed to apply TorchInductor config overrides; continuing.")
+            logger.exception(
+                "Failed to apply TorchInductor config overrides; continuing."
+            )
 
     model = _build_compiled_training_model(
         base_model,
@@ -1806,13 +2221,31 @@ def run_pure_pretraining(
         prefetch_factor=prefetch_factor,
     )
     if use_packing:
-        train_loader = DataLoader(train_ds, batch_size=None, collate_fn=collator, **dl_kwargs)
+        train_loader = DataLoader(
+            train_ds, batch_size=None, collate_fn=collator, **dl_kwargs
+        )
     else:
-        train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=pretrain_config.micro_batch_size, collate_fn=collator, drop_last=False, **dl_kwargs)
-    eval_loader = DataLoader(val_ds, sampler=eval_sampler, batch_size=pretrain_config.micro_batch_size, collate_fn=eval_collator, drop_last=False, **dl_kwargs)
+        train_loader = DataLoader(
+            train_ds,
+            sampler=train_sampler,
+            batch_size=pretrain_config.micro_batch_size,
+            collate_fn=collator,
+            drop_last=False,
+            **dl_kwargs,
+        )
+    eval_loader = DataLoader(
+        val_ds,
+        sampler=eval_sampler,
+        batch_size=pretrain_config.micro_batch_size,
+        collate_fn=eval_collator,
+        drop_last=False,
+        **dl_kwargs,
+    )
 
     # ---- Optimizer / Scheduler ----
-    optimizer = _create_optimizer(orig_model, pretrain_config, distributed_mesh=optimizer_dist)
+    optimizer = _create_optimizer(
+        orig_model, pretrain_config, distributed_mesh=optimizer_dist
+    )
 
     synced_len = _sync_train_loader_len(len(train_loader), distributed, device)
     epoch_start_steps = _compute_epoch_start_steps(
@@ -1822,12 +2255,17 @@ def run_pure_pretraining(
         full_micro_batch=pretrain_config.micro_batch_size,
         batch_size_warmup_steps=batch_size_warmup_steps,
     )
-    steps_per_epoch = max(1, epoch_start_steps[1] - epoch_start_steps[0]) if num_epochs > 0 else 1
+    steps_per_epoch = (
+        max(1, epoch_start_steps[1] - epoch_start_steps[0]) if num_epochs > 0 else 1
+    )
     total_steps = epoch_start_steps[-1]
     warmup_steps = min(pretrain_config.warmup_steps, total_steps)
     scheduler = _create_scheduler(
-        optimizer, warmup_steps, total_steps,
-        pretrain_config.adam_learning_rate, pretrain_config.lr_decay_to_fraction,
+        optimizer,
+        warmup_steps,
+        total_steps,
+        pretrain_config.adam_learning_rate,
+        pretrain_config.lr_decay_to_fraction,
         pretrain_config.lr_schedule,
     )
 
@@ -1839,8 +2277,14 @@ def run_pure_pretraining(
     if resume_config and resume_config.is_resume:
         logger.info(f"Resuming from checkpoint: {resume_config.checkpoint_dir}")
         start_step, start_epoch = _load_checkpoint(
-            orig_model, optimizer, scheduler, resume_config.checkpoint_dir,
-            device, distributed, load_scheduler=False, distributed_mode=distributed_mode,
+            orig_model,
+            optimizer,
+            scheduler,
+            resume_config.checkpoint_dir,
+            device,
+            distributed,
+            load_scheduler=False,
+            distributed_mode=distributed_mode,
         )
         logger.info(f"Resumed at global_step={start_step}, epoch={start_epoch}")
 
@@ -1883,16 +2327,22 @@ def run_pure_pretraining(
             if _ckp_state is not None and "epoch_data_step" in _ckp_state:
                 resume_data_step = int(_ckp_state.get("epoch_data_step", 0))
                 resume_sub_batch_step = int(_ckp_state.get("epoch_sub_batch_step", 0))
-                resume_batch_split_divisor = max(1, int(_ckp_state.get("batch_split_divisor", 1)))
+                resume_batch_split_divisor = max(
+                    1, int(_ckp_state.get("batch_split_divisor", 1))
+                )
             else:
-                epoch_start_step = epoch_start_steps[min(start_epoch, len(epoch_start_steps) - 1)]
-                resume_data_step, resume_sub_batch_step, resume_batch_split_divisor = _locate_resume_position_in_epoch(
-                    train_loader_len=synced_len,
-                    epoch_start_step=epoch_start_step,
-                    resume_global_step=start_step,
-                    full_grad_accum=inferred_grad_accum_steps,
-                    full_micro_batch=pretrain_config.micro_batch_size,
-                    batch_size_warmup_steps=batch_size_warmup_steps,
+                epoch_start_step = epoch_start_steps[
+                    min(start_epoch, len(epoch_start_steps) - 1)
+                ]
+                resume_data_step, resume_sub_batch_step, resume_batch_split_divisor = (
+                    _locate_resume_position_in_epoch(
+                        train_loader_len=synced_len,
+                        epoch_start_step=epoch_start_step,
+                        resume_global_step=start_step,
+                        full_grad_accum=inferred_grad_accum_steps,
+                        full_micro_batch=pretrain_config.micro_batch_size,
+                        batch_size_warmup_steps=batch_size_warmup_steps,
+                    )
                 )
         if resume_data_step >= synced_len:
             resume_data_step = 0
@@ -1937,14 +2387,26 @@ def run_pure_pretraining(
             wandb.init(
                 project=pretrain_config.project_name,
                 name=wandb_run_name,
-                config={"pretrain": pretrain_config.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps},
+                config={
+                    "pretrain": pretrain_config.__dict__,
+                    "total_steps": total_steps,
+                    "warmup_steps": warmup_steps,
+                },
             )
             wandb_enabled = wandb.run is not None
             if wandb_enabled:
                 wandb.define_metric("train/global_step")
-                wandb.define_metric("time_elapsed_sec", step_metric="train/global_step", step_sync=True)
-                wandb.define_metric("train/time_elapsed_sec", step_metric="train/global_step", step_sync=True)
-                wandb.define_metric("*", step_metric="train/global_step", step_sync=True)
+                wandb.define_metric(
+                    "time_elapsed_sec", step_metric="train/global_step", step_sync=True
+                )
+                wandb.define_metric(
+                    "train/time_elapsed_sec",
+                    step_metric="train/global_step",
+                    step_sync=True,
+                )
+                wandb.define_metric(
+                    "*", step_metric="train/global_step", step_sync=True
+                )
                 upload_run_source_snapshot()
         except Exception as exc:
             logger.warning(f"W&B init failed, continuing without logging. Error: {exc}")
@@ -1963,7 +2425,8 @@ def run_pure_pretraining(
 
     scaler = (
         torch.amp.GradScaler(enabled=(device.type == "cuda" and use_fp16))
-        if torch.cuda.is_available() else None
+        if torch.cuda.is_available()
+        else None
     )
 
     # ---- MFU estimation ----
@@ -1971,7 +2434,9 @@ def run_pure_pretraining(
     _cfg = _raw.config
     _flops_per_token = _estimate_model_flops_per_token(_cfg, manifest.max_seq_len)
     _peak_flops = H100_PEAK_TFLOPS * 1e12
-    logger.info(f"MFU estimation: {_flops_per_token:,} training FLOPs/token, H100 peak = {H100_PEAK_TFLOPS} TFLOPS")
+    logger.info(
+        f"MFU estimation: {_flops_per_token:,} training FLOPs/token, H100 peak = {H100_PEAK_TFLOPS} TFLOPS"
+    )
 
     _run_t0 = time.perf_counter()
     logger.info(
@@ -2024,7 +2489,11 @@ def run_pure_pretraining(
     # ProRes: set up progressive residual warmup step tracking.
     _use_prores = getattr(_cfg, "use_prores", False)
     _prores_model = _raw.model if hasattr(_raw, "model") else None
-    if _use_prores and _prores_model is not None and hasattr(_prores_model, "update_prores_alphas"):
+    if (
+        _use_prores
+        and _prores_model is not None
+        and hasattr(_prores_model, "update_prores_alphas")
+    ):
         _prores_model.update_prores_alphas(start_step)
         logger.info(
             f"ProRes: T={_cfg.prores_T}, "
@@ -2055,12 +2524,16 @@ def run_pure_pretraining(
     raw_token_count = torch.zeros((), dtype=torch.long, device=device)
     log_window_t0 = time.perf_counter()
     first_step_of_run = True
-    debug_non_finite_params = bool(getattr(pretrain_config, "debug_non_finite_params", True))
+    debug_non_finite_params = bool(
+        getattr(pretrain_config, "debug_non_finite_params", True)
+    )
 
     epoch_setter = train_ds if use_packing else train_sampler
     # [0]=loss, [1]=grad_norm (local)
     log_buf = torch.empty(2, device=device, dtype=torch.float32)
-    profiler_ctx, profiler_step_cb = _make_pure_profiler(pretrain_config, output_dir, is_main)
+    profiler_ctx, profiler_step_cb = _make_pure_profiler(
+        pretrain_config, output_dir, is_main
+    )
     if batch_size_warmup_steps > 0 and is_main:
         logger.info(
             "Batch-size warmup active: steps=%d, initial_grad_accum=%d, initial_micro_batch=%d, split_divisor=%d",
@@ -2136,7 +2609,9 @@ def run_pure_pretraining(
                 # different batch counts per rank.  Coordinate so all ranks break
                 # together to avoid FSDP / NCCL deadlock.
                 if distributed and dist.is_initialized():
-                    has_batch_t = torch.tensor(1 if has_batch else 0, device=device, dtype=torch.int32)
+                    has_batch_t = torch.tensor(
+                        1 if has_batch else 0, device=device, dtype=torch.int32
+                    )
                     dist.all_reduce(has_batch_t, op=dist.ReduceOp.MIN)
                     if int(has_batch_t.item()) == 0:
                         epoch_ended_early = True
@@ -2145,7 +2620,11 @@ def run_pure_pretraining(
                     epoch_ended_early = True
                     break
 
-                if resume_data_step > 0 and epoch == resume_epoch and micro_step < resume_data_step:
+                if (
+                    resume_data_step > 0
+                    and epoch == resume_epoch
+                    and micro_step < resume_data_step
+                ):
                     if micro_step % 1000 == 0 and is_main:
                         logger.info(
                             f"Fast-forwarding dataloader: {micro_step}/{resume_data_step} "
@@ -2155,19 +2634,32 @@ def run_pure_pretraining(
 
                 resume_sub_batch_start = 0
                 batch_split_divisor = mbs_divisor
-                if epoch == resume_epoch and micro_step == resume_data_step and resume_sub_batch_step > 0:
+                if (
+                    epoch == resume_epoch
+                    and micro_step == resume_data_step
+                    and resume_sub_batch_step > 0
+                ):
                     resume_sub_batch_start = resume_sub_batch_step
                     batch_split_divisor = resume_batch_split_divisor
-                elif epoch == resume_epoch and micro_step == resume_data_step and resume_data_step > 0 and is_main:
+                elif (
+                    epoch == resume_epoch
+                    and micro_step == resume_data_step
+                    and resume_data_step > 0
+                    and is_main
+                ):
                     logger.info(
                         f"Dataloader fast-forward complete — resuming training at data_step {micro_step}"
                     )
 
-                effective_tokens_per_split = max(1, tokens_per_micro // max(1, batch_split_divisor))
+                effective_tokens_per_split = max(
+                    1, tokens_per_micro // max(1, batch_split_divisor)
+                )
                 sub_batches = _split_batch(
                     full_batch,
                     n_splits=batch_split_divisor,
-                    effective_tokens_per_split=effective_tokens_per_split if "cu_seqlens" in full_batch else None,
+                    effective_tokens_per_split=effective_tokens_per_split
+                    if "cu_seqlens" in full_batch
+                    else None,
                 )
                 total_sub_batches = len(sub_batches)
                 if resume_sub_batch_start > 0 and is_main:
@@ -2189,11 +2681,13 @@ def run_pure_pretraining(
                         if at_accum_boundary:
                             discard_accumulation = False
                             accum_micro_count = 0
-                            effective_grad_accum, effective_micro_batch, mbs_divisor = _get_batch_warmup_params(
-                                global_step,
-                                inferred_grad_accum_steps,
-                                pretrain_config.micro_batch_size,
-                                batch_size_warmup_steps,
+                            effective_grad_accum, effective_micro_batch, mbs_divisor = (
+                                _get_batch_warmup_params(
+                                    global_step,
+                                    inferred_grad_accum_steps,
+                                    pretrain_config.micro_batch_size,
+                                    batch_size_warmup_steps,
+                                )
                             )
                         continue
 
@@ -2213,11 +2707,19 @@ def run_pure_pretraining(
                         token_count += batch["input_ids"].numel()
                         raw_token_count += batch["input_ids"].numel()
 
-                    sync_ctx = _ddp_sync_context(model, distributed_mode=distributed_mode, sync=sync)
-                    amp_ctx = torch.autocast(device_type=device.type, dtype=amp_dtype) if amp_dtype else nullcontext()
+                    sync_ctx = _ddp_sync_context(
+                        model, distributed_mode=distributed_mode, sync=sync
+                    )
+                    amp_ctx = (
+                        torch.autocast(device_type=device.type, dtype=amp_dtype)
+                        if amp_dtype
+                        else nullcontext()
+                    )
                     with sync_ctx:
                         with amp_ctx:
-                            fwd_kwargs = dict(input_ids=batch["input_ids"], labels=batch["labels"])
+                            fwd_kwargs = dict(
+                                input_ids=batch["input_ids"], labels=batch["labels"]
+                            )
                             if "attention_mask" in batch:
                                 fwd_kwargs["attention_mask"] = batch["attention_mask"]
                             if "cu_seqlens" in batch:
@@ -2231,11 +2733,19 @@ def run_pure_pretraining(
 
                         loss = out["loss"] if isinstance(out, dict) else out.loss
                         if not torch.isfinite(loss.detach()).all():
-                            rank = dist.get_rank() if distributed and dist.is_initialized() else 0
+                            rank = (
+                                dist.get_rank()
+                                if distributed and dist.is_initialized()
+                                else 0
+                            )
                             logger.error(
                                 "Skipping optimizer step %d due to non-finite loss on rank %d "
                                 "(epoch=%d micro_step=%d sub_batch=%d).",
-                                upcoming_step, rank, epoch, micro_step, sub_batch_idx,
+                                upcoming_step,
+                                rank,
+                                epoch,
+                                micro_step,
+                                sub_batch_idx,
                             )
                             optimizer.zero_grad(set_to_none=True)
                             accum_loss.zero_()
@@ -2262,11 +2772,19 @@ def run_pure_pretraining(
                             scaler.unscale_(optimizer.adamw)
                         else:
                             scaler.unscale_(optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        orig_model.parameters(),
-                        max_norm=max_grad_norm,
-                        error_if_nonfinite=False,
-                    )
+                    if replicated_block_attnres_params:
+                        _sync_replicated_local_grads(replicated_block_attnres_params)
+                        grad_norm = _clip_grad_norm_mixed(
+                            orig_model.parameters(),
+                            max_norm=max_grad_norm,
+                            error_if_nonfinite=False,
+                        )
+                    else:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            orig_model.parameters(),
+                            max_norm=max_grad_norm,
+                            error_if_nonfinite=False,
+                        )
 
                     step_skipped = False
                     if scaler is not None and scaler.is_enabled():
@@ -2282,8 +2800,14 @@ def run_pure_pretraining(
                         optimizer.step()
                     if debug_non_finite_params and _has_nonfinite_params(orig_model):
                         bad_param = _first_nonfinite_param(orig_model)
-                        bad_name = bad_param[0] if bad_param is not None else "<unknown>"
-                        rank = dist.get_rank() if distributed and dist.is_initialized() else 0
+                        bad_name = (
+                            bad_param[0] if bad_param is not None else "<unknown>"
+                        )
+                        rank = (
+                            dist.get_rank()
+                            if distributed and dist.is_initialized()
+                            else 0
+                        )
                         raise RuntimeError(
                             f"Non-finite parameter detected after optimizer step {upcoming_step} "
                             f"in {bad_name} on rank {rank} (epoch={epoch} data_step={micro_step} "
@@ -2313,7 +2837,9 @@ def run_pure_pretraining(
                     if _use_repo and global_step == repo_rope_warmup_steps:
                         _repo_model.repo_active = True
                         if is_main:
-                            logger.info(f"[step {global_step}] RePO activated (repo warmup complete)")
+                            logger.info(
+                                f"[step {global_step}] RePO activated (repo warmup complete)"
+                            )
 
                     prev_warmup_state = (
                         effective_grad_accum,
@@ -2321,11 +2847,13 @@ def run_pure_pretraining(
                         mbs_divisor,
                     )
                     accum_micro_count = 0
-                    effective_grad_accum, effective_micro_batch, mbs_divisor = _get_batch_warmup_params(
-                        global_step,
-                        inferred_grad_accum_steps,
-                        pretrain_config.micro_batch_size,
-                        batch_size_warmup_steps,
+                    effective_grad_accum, effective_micro_batch, mbs_divisor = (
+                        _get_batch_warmup_params(
+                            global_step,
+                            inferred_grad_accum_steps,
+                            pretrain_config.micro_batch_size,
+                            batch_size_warmup_steps,
+                        )
                     )
                     if prev_warmup_state[2] != mbs_divisor:
                         pending_compile_rebuild = True
@@ -2333,7 +2861,8 @@ def run_pure_pretraining(
                     if (
                         batch_size_warmup_steps > 0
                         and is_main
-                        and prev_warmup_state != (effective_grad_accum, effective_micro_batch, mbs_divisor)
+                        and prev_warmup_state
+                        != (effective_grad_accum, effective_micro_batch, mbs_divisor)
                     ):
                         logger.info(
                             "[step %d] Batch-size warmup -> grad_accum=%d micro_batch=%d split_divisor=%d",
@@ -2361,7 +2890,15 @@ def run_pure_pretraining(
                         log_window_t0 = t1
                         avg_step_ms = (window_dt * 1000.0) / max(1, window_steps)
                         log_buf[0] = window_loss / max(1, window_steps)
-                        log_buf[1] = grad_norm.full_tensor() if isinstance(grad_norm, DTensor) else (grad_norm if isinstance(grad_norm, torch.Tensor) else float(grad_norm))
+                        log_buf[1] = (
+                            grad_norm.full_tensor()
+                            if isinstance(grad_norm, DTensor)
+                            else (
+                                grad_norm
+                                if isinstance(grad_norm, torch.Tensor)
+                                else float(grad_norm)
+                            )
+                        )
                         log_vals = log_buf.cpu()
                         avg_loss = float(log_vals[0])
                         grad_norm_val = float(log_vals[1])
@@ -2370,15 +2907,18 @@ def run_pure_pretraining(
                         if distributed and dist.is_initialized():
                             tok_buf = torch.tensor([tok, raw_tok], device=device)
                             dist.all_reduce(tok_buf, op=dist.ReduceOp.SUM)
-                            tok, raw_tok = float(tok_buf[0].item()), float(tok_buf[1].item())
+                            tok, raw_tok = (
+                                float(tok_buf[0].item()),
+                                float(tok_buf[1].item()),
+                            )
                         tps = int(raw_tok / window_dt)
                         step_tok = tok / max(1, window_steps)
                         step_raw_tok = raw_tok / max(1, window_steps)
                         real_tps = tok / window_dt
                         real_tps_log = int(real_tps)
-                        mfu = (
-                            _flops_per_token * real_tps
-                        ) / (_peak_flops * max(effective_world_size, 1))
+                        mfu = (_flops_per_token * real_tps) / (
+                            _peak_flops * max(effective_world_size, 1)
+                        )
 
                         token_count.zero_()
                         raw_token_count.zero_()
@@ -2391,10 +2931,13 @@ def run_pure_pretraining(
                             )
                     if should_log and is_main:
                         waste = (1.0 - step_tok / max(step_raw_tok, 1)) * 100
-                        muon_str = f"muon_lr={muon_lr:.2e} " if muon_lr is not None else ""
+                        muon_str = (
+                            f"muon_lr={muon_lr:.2e} " if muon_lr is not None else ""
+                        )
                         wall_elapsed = time.perf_counter() - _run_t0
                         epoch_progress = epoch + (
-                            micro_step + ((sub_batch_idx + 1) / max(1, total_sub_batches))
+                            micro_step
+                            + ((sub_batch_idx + 1) / max(1, total_sub_batches))
                         ) / max(1, synced_len)
                         logger.info(
                             f"[step {global_step}/{total_steps}] "
@@ -2425,11 +2968,15 @@ def run_pure_pretraining(
                                 wandb.log(payload)
                             except Exception as exc:
                                 wandb_enabled = False
-                                logger.warning(f"W&B log failed; disabling. Error: {exc}")
+                                logger.warning(
+                                    f"W&B log failed; disabling. Error: {exc}"
+                                )
 
                     if first_step_of_run:
                         first_step_of_run = False
-                        gc.collect(); gc.freeze(); gc.disable()
+                        gc.collect()
+                        gc.freeze()
+                        gc.disable()
                     elif global_step % 5000 == 0:
                         gc.collect()
 
@@ -2438,15 +2985,26 @@ def run_pure_pretraining(
                         window_steps = 0
 
                     if global_step % eval_steps == 0:
-                        eval_loss = _evaluate(orig_model, eval_loader, device, distributed, amp_dtype)
+                        eval_loss = _evaluate(
+                            orig_model, eval_loader, device, distributed, amp_dtype
+                        )
                         if is_main:
-                            logger.info(f"[step {global_step}] eval_loss={eval_loss:.4f}")
+                            logger.info(
+                                f"[step {global_step}] eval_loss={eval_loss:.4f}"
+                            )
                             if wandb_enabled and wandb.run is not None:
                                 try:
-                                    wandb.log({"train/global_step": global_step, "eval/loss": eval_loss})
+                                    wandb.log(
+                                        {
+                                            "train/global_step": global_step,
+                                            "eval/loss": eval_loss,
+                                        }
+                                    )
                                 except Exception as exc:
                                     wandb_enabled = False
-                                    logger.warning(f"W&B log failed; disabling. Error: {exc}")
+                                    logger.warning(
+                                        f"W&B log failed; disabling. Error: {exc}"
+                                    )
                         model.train()
 
                     if global_step % save_steps == 0:
@@ -2458,12 +3016,23 @@ def run_pure_pretraining(
                             next_sub_batch_step = 0
                             next_batch_split_divisor = mbs_divisor
                         _save_checkpoint(
-                            orig_model, optimizer, scheduler, global_step, epoch,
-                            output_dir, logging_steps, eval_steps, save_steps,
-                            distributed, is_main, distributed_mode=distributed_mode,
-                            model_config=_model_config, manifest=_manifest,
+                            orig_model,
+                            optimizer,
+                            scheduler,
+                            global_step,
+                            epoch,
+                            output_dir,
+                            logging_steps,
+                            eval_steps,
+                            save_steps,
+                            distributed,
+                            is_main,
+                            distributed_mode=distributed_mode,
+                            model_config=_model_config,
+                            manifest=_manifest,
                             pretrain_config=pretrain_config,
-                            total_steps=total_steps, warmup_steps=warmup_steps,
+                            total_steps=total_steps,
+                            warmup_steps=warmup_steps,
                             dataset_fingerprint=_dataset_fingerprint,
                             epoch_data_step=next_data_step,
                             epoch_sub_batch_step=next_sub_batch_step,
@@ -2490,10 +3059,13 @@ def run_pure_pretraining(
             if is_main:
                 logger.info(
                     "Epoch %d/%d complete: %d effective micro-steps, %d optimizer steps%s",
-                    epoch + 1, num_epochs, epoch_fwd_count,
+                    epoch + 1,
+                    num_epochs,
+                    epoch_fwd_count,
                     global_step - epoch_start_step,
                     f" ({partial_discarded} trailing micro-step(s) discarded)"
-                    if partial_discarded else "",
+                    if partial_discarded
+                    else "",
                 )
             optimizer.zero_grad(set_to_none=True)
             accum_loss.zero_()
@@ -2504,7 +3076,9 @@ def run_pure_pretraining(
             window_loss.zero_()
             window_steps = 0
 
-            if (resume_data_step > 0 or resume_sub_batch_step > 0) and epoch == resume_epoch:
+            if (
+                resume_data_step > 0 or resume_sub_batch_step > 0
+            ) and epoch == resume_epoch:
                 resume_data_step = 0
                 resume_sub_batch_step = 0
                 resume_batch_split_divisor = 1
@@ -2514,18 +3088,31 @@ def run_pure_pretraining(
         _dist_barrier(local_rank)
 
     _save_checkpoint(
-        orig_model, optimizer, scheduler, global_step, num_epochs,
-        output_dir, logging_steps, eval_steps, save_steps,
-        distributed, is_main, distributed_mode=distributed_mode,
-        model_config=_model_config, manifest=_manifest,
+        orig_model,
+        optimizer,
+        scheduler,
+        global_step,
+        num_epochs,
+        output_dir,
+        logging_steps,
+        eval_steps,
+        save_steps,
+        distributed,
+        is_main,
+        distributed_mode=distributed_mode,
+        model_config=_model_config,
+        manifest=_manifest,
         pretrain_config=pretrain_config,
-        total_steps=total_steps, warmup_steps=warmup_steps,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps,
         dataset_fingerprint=_dataset_fingerprint,
     )
 
     if is_main and wandb_enabled and wandb.run is not None:
         try:
-            (Path(output_dir) / "wandb_run_id.txt").write_text(wandb.run.id, encoding="utf-8")
+            (Path(output_dir) / "wandb_run_id.txt").write_text(
+                wandb.run.id, encoding="utf-8"
+            )
             wandb.finish()
         except Exception as exc:
             logger.warning(f"W&B finalize failed. Error: {exc}")
