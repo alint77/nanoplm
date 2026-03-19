@@ -159,13 +159,22 @@ class MoELayer(nn.Module):
         self.aux_loss_coef: float = float(config.moe_aux_loss_coef)
         self.z_loss_coef: float = float(config.moe_z_loss_coef)
         self.routed_scaling_factor: float = float(config.moe_routed_scaling_factor)
-        self._reuse_dispatch_workspaces = not bool(
-            getattr(config, "activation_checkpointing", False)
+        ckpt_enabled = bool(getattr(config, "activation_checkpointing", False))
+        ckpt_mode = str(
+            getattr(config, "activation_checkpointing_mode", "layer")
+        ).strip().lower()
+        # Recompute can revisit the MoE branch in full-layer checkpointing or
+        # when the MLP branch itself is checkpointed. Attention-only
+        # checkpointing does not re-enter MoE, so keep workspace reuse enabled
+        # there to avoid the slower bincount fallback.
+        self._reuse_dispatch_workspaces = not (
+            ckpt_enabled and ckpt_mode in {"layer", "attn+mlp"}
         )
 
         # Reuse small dispatch metadata buffers across steps to reduce allocator
-        # churn in the static packed MoE path. Keep this off under activation
-        # checkpointing so recompute cannot clobber buffers still needed later.
+        # churn in the static packed MoE path. Keep this off when checkpoint
+        # recompute can re-enter the MoE branch and clobber buffers still needed
+        # later.
         self.register_buffer(
             "_dispatch_sort_values",
             torch.empty(0, dtype=torch.long),
