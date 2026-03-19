@@ -185,7 +185,7 @@ The key design decisions that came directly out of the research are:
   The first few layers can remain dense because early token processing is less specialization-heavy.
 
 - **Dropless grouped-GEMM dispatch**
-  `grouped_mm` allows jagged token counts per expert without token dropping or padding to capacity.
+  grouped GEMM allows jagged token counts per expert without token dropping or padding to capacity.
 
 - **Optional group-limited routing**
   This gives a path toward higher expert counts without turning routing into a fully unconstrained search.
@@ -227,7 +227,7 @@ Per-token flow:
 shared_out = shared_expert(x)
 weights, indices = router(x)
 dispatch tokens to experts
-run routed expert MLPs with grouped_mm
+run routed expert MLPs with grouped_gemm
 combine routed outputs with normalized weights
 add shared_out
 ```
@@ -240,16 +240,16 @@ MoELayer.forward(x):
   weights, indices, z_loss, router_scores = router(x)
   x_expanded = repeat_interleave(x, top_k)
   sort expanded tokens by expert id
-  grouped_mm through expert Wi
+  grouped_gemm through expert Wi
   SwiGLU
-  grouped_mm through expert Wo
+  grouped_gemm through expert Wo
   unsort back to token order
   routed_out = weighted_sum(expert_out, weights) * routed_scaling_factor
   aux = balance_loss(router_scores) + z_loss
   return routed_out + shared_out
 ```
 
-## Why `grouped_mm` is the core primitive
+## Why grouped GEMM is the core primitive
 
 Earlier MoE designs often rely on fixed capacity per expert:
 
@@ -260,14 +260,73 @@ Earlier MoE designs often rely on fixed capacity per expert:
 
 That is not attractive for nanoPLM.
 
-`torch.nn.functional.grouped_mm` is a better match because it:
+The current nanoPLM implementation uses a custom
+`torch.ops.nanoplm_moe.grouped_gemm` operator backed by an in-tree CUTLASS CUDA
+extension.
+
+That is a good match because it:
 
 - natively handles jagged per-expert token counts
 - avoids capacity hyperparameters
 - avoids overflow token dropping
 - avoids wasted compute on padded expert slots
 
-That is why routed experts are stored as stacked expert tensors instead of as separate `nn.Linear` modules.
+That is why routed experts are stored as stacked expert tensors instead of as
+separate `nn.Linear` modules.
+
+The earlier implementation used the external `grouped_gemm` package. The
+current code no longer depends on that library. Instead, nanoPLM vendors
+CUTLASS under `third_party/cutlass` and JIT-builds a local extension on first
+use through `torch.utils.cpp_extension.load`.
+
+### Why nanoPLM does not use PyTorch `grouped_mm`
+
+PyTorch's grouped MM path was considered, but it is not the current backend for
+nanoPLM.
+
+The practical reason is performance behavior in the actual MoE training path:
+
+- it introduced host-side synchronization around grouped GEMM launch/setup
+- that created CPU waits in the critical path
+- those waits stalled the GPU work queue instead of keeping dispatch fully
+  device-driven
+- in practice this made the routed expert path materially slower
+
+For nanoPLM's MoE usage, that matters a lot because grouped GEMM is not an
+occasional side op. It is the core expert compute primitive and runs twice per
+MoE layer (`Wi` and `Wo`) in forward, then again through the same primitive in
+backward.
+
+So the current backend choice is not just "CUTLASS is lower level." It is:
+
+- PyTorch `grouped_mm` matched the math
+- but its runtime behavior caused CPU sync and GPU-thread stalls in this workload
+- the in-house CUTLASS path lets nanoPLM keep grouped metadata and scheduling in
+  a more GPU-native execution path
+- that is why the current implementation uses a custom CUTLASS-backed op instead
+  of PyTorch's built-in grouped MM
+
+The current operator has three important layers:
+
+1. A Python-side `torch.library` definition with fake tensor and autograd
+   registrations in [moe_grouped_gemm_ops.py](/workspace/nanoplm/src/nanoplm/pretraining/models/modern_bert/moe_grouped_gemm_ops.py).
+2. A small Python loader in [cutlass_grouped_gemm.py](/workspace/nanoplm/src/nanoplm/pretraining/models/modern_bert/cutlass_grouped_gemm.py)
+   that compiles and caches the extension under `.cache/torch_extensions`.
+3. A CUTLASS-backed CUDA implementation in
+   [moe_cutlass_grouped_gemm.cu](/workspace/nanoplm/src/nanoplm/pretraining/models/modern_bert/csrc/moe_cutlass_grouped_gemm.cu)
+   that builds grouped metadata on device and launches a CUTLASS
+   `GemmGrouped` kernel in `GroupScheduleMode::kDeviceOnly`.
+
+The current CUDA backend supports:
+
+- `float16`
+- `bfloat16`
+- `trans_a=False, trans_b=False`
+- `trans_a=False, trans_b=True`
+- `trans_a=True, trans_b=False`
+
+For CPU execution, and as a safety/reference path for unsupported CUDA dtypes,
+the Python op falls back to a simple per-expert PyTorch implementation.
 
 ## Router Design
 
@@ -365,7 +424,7 @@ Wo = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
 This layout is:
 
 - `(num_experts, in, out)`
-- intentionally chosen for `grouped_mm`
+- intentionally chosen for grouped GEMM
 - not the same as `nn.Linear`'s `(out, in)`
 
 The shared expert is a normal dense MLP module.
@@ -375,7 +434,7 @@ Dispatch flow:
 1. expand each token `top_k` times
 2. flatten selected expert ids
 3. stable-sort by expert id
-4. compute expert boundaries with `bincount` + `cumsum`
+4. compute per-expert token counts
 5. run grouped expert `Wi`
 6. apply SwiGLU
 7. run grouped expert `Wo`
@@ -383,6 +442,25 @@ Dispatch flow:
 9. combine selected expert outputs with normalized weights
 
 This is the simplest dropless local MoE design that still uses the right primitive.
+
+### Current grouped GEMM call contract
+
+The current op contract is:
+
+```python
+torch.ops.nanoplm_moe.grouped_gemm(a, b, batch_sizes, trans_a=False, trans_b=False)
+```
+
+with the following semantics:
+
+- `a`: packed 2D token matrix
+- `b`: stacked 3D expert weights for the forward `NN` and `NT` cases, or a
+  packed 2D matrix for the `TN` reduction-style case used in backward
+- `batch_sizes`: 1D `int64` tensor of per-expert token counts
+
+This contract is important because the autograd registration is written in
+terms of the same grouped GEMM primitive. Backward is not a separate fused
+kernel family; it reuses grouped GEMM with different transpose settings.
 
 ## Dense-first Layers and Active Compute Matching
 
@@ -452,6 +530,22 @@ This keeps:
 
 That makes the MoE path friendly to `torch.compile(dynamic=False)`.
 
+### Grouped GEMM build/runtime behavior
+
+The in-tree CUTLASS backend is built lazily on first CUDA use.
+
+Operational implications:
+
+- the machine needs a CUDA toolkit compatible with `torch.version.cuda`
+- the first CUDA MoE call pays the extension build cost
+- later calls reuse the cached extension
+- supported GPU targets depend on the extension build arch list, typically
+  controlled through `TORCH_CUDA_ARCH_LIST`
+
+The current kernel template is instantiated with a CUTLASS `Sm80` architecture
+tag, so the intended support range is Ampere-and-newer GPUs. In practice, that
+means the backend is designed for `sm80+` rather than pre-Ampere cards.
+
 ### Activation checkpointing
 
 MoE works with:
@@ -504,6 +598,27 @@ Those are fixed by design:
 - sigmoid routing
 - group routing inferred from `moe_n_group > 1`
 
+## Current Testing State
+
+The grouped GEMM path now has focused correctness coverage in
+[test_moe_grouped_gemm_ops.py](/workspace/nanoplm/tests/test_moe_grouped_gemm_ops.py).
+
+The current tests cover:
+
+- CPU reference behavior
+- CUDA CUTLASS behavior
+- all three grouped GEMM transpose modes used by forward/backward
+- zero-token experts
+- backward parity against the PyTorch reference path
+
+So the current state of the code is:
+
+- research-driven Ling/DeepSeek-style routing logic
+- local dropless dispatch
+- Triton permutation/unpermutation kernels
+- in-house CUTLASS grouped GEMM backend
+- Python `torch.library` registrations for fake tensor and autograd support
+
 ## Why this is the current landing point
 
 The final design choice was not "copy Ling".
@@ -538,4 +653,6 @@ In short:
 - Ling-V2 repo: [https://github.com/inclusionAI/Ling-V2](https://github.com/inclusionAI/Ling-V2)
 - Ling-mini-2.0 model card: [https://huggingface.co/inclusionAI/Ling-mini-2.0](https://huggingface.co/inclusionAI/Ling-mini-2.0)
 - Ling-mini-base-2.0 config: [https://huggingface.co/inclusionAI/Ling-mini-base-2.0/blob/main/config.json](https://huggingface.co/inclusionAI/Ling-mini-base-2.0/blob/main/config.json)
-- PyTorch `grouped_mm`: [https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.grouped_mm.html](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.grouped_mm.html)
+- CUTLASS overview: [https://docs.nvidia.com/cutlass/latest/overview.html](https://docs.nvidia.com/cutlass/latest/overview.html)
+- CUTLASS grouped GEMM example: [https://github.com/NVIDIA/cutlass/tree/main/examples/24_gemm_grouped](https://github.com/NVIDIA/cutlass/tree/main/examples/24_gemm_grouped)
+- PyTorch custom C++/CUDA ops tutorial: [https://pytorch.org/tutorials/advanced/cpp_custom_ops.html](https://pytorch.org/tutorials/advanced/cpp_custom_ops.html)
