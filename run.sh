@@ -19,15 +19,6 @@ if [[ ! -x "$nanoplm_bin" ]]; then
   exit 1
 fi
 
-if ! "$python_bin" - <<'PY' >/dev/null 2>&1
-import grouped_gemm  # noqa: F401
-PY
-then
-  echo "grouped_gemm is missing." >&2
-  echo "Install it manually with GROUPED_GEMM_CUTLASS=1 and --no-build-isolation as documented in README.md." >&2
-  exit 1
-fi
-
 exec env TORCH_LOGS="recompiles" \
-  torchrun --nproc-per-node=4 \
+  torchrun --nproc-per-node=2 \
   "$nanoplm_bin" pretrain from-yaml --pure-torch 2>&1 | tee pretrain.log

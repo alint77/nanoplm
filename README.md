@@ -47,9 +47,9 @@ For CUDA training, install the extra runtime dependencies first:
 uv pip install -e '.[cuda]'
 ```
 
-`grouped_gemm` must be installed separately. The pinned `grouped_gemm` source
-build imports your active `torch` during compilation, so install it without
-build isolation and with a CUDA toolkit that matches `torch.version.cuda`.
+MoE training now uses an in-tree CUTLASS grouped GEMM extension instead of the
+external `grouped_gemm` package. The extension is JIT-built on first use, so
+you only need a CUDA toolkit that matches `torch.version.cuda`.
 
 1. Check your active PyTorch CUDA version:
 
@@ -61,22 +61,21 @@ uv run python -c "import torch; print(torch.__version__, torch.version.cuda)"
 to build for:
 
 ```bash
-export CUDA_HOME=/usr/local/cuda-12.6
+export CUDA_HOME=/usr/local/cuda-13.0
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
-export TORCH_CUDA_ARCH_LIST="8.0"
+export TORCH_CUDA_ARCH_LIST="12.0"
 ```
 
-3. Install `grouped_gemm` from the pinned commit against the active torch:
+3. Run nanoPLM normally. The first CUDA MoE call will compile the vendored
+CUTLASS backend and cache it under `.cache/torch_extensions`:
 
 ```bash
-GROUPED_GEMM_CUTLASS=1 \
-uv pip install --no-build-isolation --no-deps \
-  "grouped-gemm @ git+https://github.com/tgale96/grouped_gemm@f1429a3"
+uv pip install -e '.[cuda]'
 ```
 
 If you need different architectures, override `TORCH_CUDA_ARCH_LIST` before
-running the install command.
+running your first MoE job.
 ---
 
 ## 🤖 Zero‑to‑model in 4 commands

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import grouped_gemm as gg
 import torch
 import torch.library
+
+from .cutlass_grouped_gemm import grouped_gemm as cutlass_grouped_gemm
 
 
 _lib = torch.library.Library("nanoplm_moe", "FRAGMENT")
@@ -49,6 +50,44 @@ def _output_shape(
     return (a.shape[0], b.shape[2])
 
 
+def _reference_grouped_gemm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    batch_sizes: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+) -> torch.Tensor:
+    _validate_inputs(a, b, batch_sizes, trans_a, trans_b)
+    sizes = [int(x) for x in batch_sizes.detach().to(device="cpu").tolist()]
+
+    if trans_a:
+        out = torch.empty(
+            (len(sizes), a.shape[1], b.shape[1]),
+            device=a.device,
+            dtype=a.dtype,
+        )
+        offset = 0
+        for idx, rows in enumerate(sizes):
+            a_slice = a[offset : offset + rows]
+            b_slice = b[offset : offset + rows]
+            if rows == 0:
+                out[idx].zero_()
+            else:
+                out[idx] = a_slice.transpose(0, 1) @ b_slice
+            offset += rows
+        return out
+
+    out_cols = b.shape[1] if trans_b else b.shape[2]
+    out = torch.empty((a.shape[0], out_cols), device=a.device, dtype=a.dtype)
+    offset = 0
+    for idx, rows in enumerate(sizes):
+        a_slice = a[offset : offset + rows]
+        b_slice = b[idx].transpose(0, 1) if trans_b else b[idx]
+        out[offset : offset + rows] = a_slice @ b_slice
+        offset += rows
+    return out
+
+
 @torch.library.register_fake("nanoplm_moe::grouped_gemm")
 def _grouped_gemm_fake(
     a: torch.Tensor,
@@ -73,7 +112,20 @@ def _grouped_gemm_cuda(
     trans_b: bool = False,
 ):
     _validate_inputs(a, b, batch_sizes, trans_a, trans_b)
-    return gg.backend.gmm(a, b, batch_sizes, trans_a=trans_a, trans_b=trans_b)
+    if a.dtype not in {torch.float16, torch.bfloat16}:
+        return _reference_grouped_gemm(a, b, batch_sizes, trans_a, trans_b)
+    return cutlass_grouped_gemm(a, b, batch_sizes, trans_a=trans_a, trans_b=trans_b)
+
+
+@torch.library.impl(_lib, "grouped_gemm", "CPU")
+def _grouped_gemm_cpu(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    batch_sizes: torch.Tensor,
+    trans_a: bool = False,
+    trans_b: bool = False,
+):
+    return _reference_grouped_gemm(a, b, batch_sizes, trans_a, trans_b)
 
 
 def _setup_context(ctx, inputs, output):
