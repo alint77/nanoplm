@@ -63,3 +63,6 @@ scripts/
 
 # Planning directory (local only)
 .planning/
+
+# Local extension build cache
+.cache/

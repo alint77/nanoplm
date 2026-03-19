@@ -17,7 +17,7 @@ help:
 	@echo "Available targets:"
 	@echo "  help          - Show this help message"
 	@echo "  setup         - Set up virtual environment and install dependencies"
-	@echo "  setup-cuda    - Show the manual CUDA install flow for grouped_gemm"
+	@echo "  setup-cuda    - Show the CUDA install flow for the in-tree CUTLASS backend"
 	@echo "  test          - Run all tests"
 	@echo "  test-verbose  - Run tests with verbose output"
 	@echo "  test-fast     - Run tests in parallel for faster execution"
@@ -48,12 +48,15 @@ setup-cuda:
 	@echo "Install the base project and CUDA extras:"
 	@echo "  uv pip install -e '.[cuda]'"
 	@echo ""
-	@echo "Then install grouped_gemm manually against the active torch:"
-	@echo "  export CUDA_HOME=/usr/local/cuda-12.6"
+	@echo "The first MoE run will JIT-build the vendored CUTLASS grouped GEMM extension."
+	@echo "Make sure your CUDA toolkit matches torch.version.cuda:"
+	@echo "  uv run python -c \"import torch; print(torch.__version__, torch.version.cuda)\""
+	@echo ""
+	@echo "Typical environment:"
+	@echo "  export CUDA_HOME=/usr/local/cuda-13.0"
 	@echo "  export PATH=\"$$CUDA_HOME/bin:$$PATH\""
 	@echo "  export LD_LIBRARY_PATH=\"$$CUDA_HOME/lib64:$${LD_LIBRARY_PATH:-}\""
-	@echo "  export TORCH_CUDA_ARCH_LIST=\"8.0\""
-	@echo "  GROUPED_GEMM_CUTLASS=1 uv pip install --no-build-isolation --no-deps \"grouped-gemm @ git+https://github.com/tgale96/grouped_gemm@f1429a3\""
+	@echo "  export TORCH_CUDA_ARCH_LIST=\"12.0\""
 
 # Run tests
 .PHONY: test
