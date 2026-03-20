@@ -1,4 +1,4 @@
-# Mixture-of-Experts: Research, Design, and Implementation
+# Mixture-of-Experts: Design and Implementation
 
 ## Purpose
 
@@ -9,8 +9,6 @@ It does three jobs:
 1. Summarizes the research path across public MoE models.
 2. Explains why Ling-mini-2.0 / Ling-V2 became the main inspiration point.
 3. Documents the current nanoPLM implementation and the reasons behind its design choices.
-
-This replaces the older split between "implementation notes" and the separate Ling research report.
 
 ## Scope
 
@@ -213,7 +211,7 @@ The current implementation differs in a few deliberate ways:
 
 So the current design is "Ling-style routing logic with a simpler local systems stack and more conservative stabilization defaults."
 
-## Current nanoPLM Architecture
+## Architecture
 
 Each MoE layer replaces a dense SwiGLU MLP with:
 
@@ -224,32 +222,49 @@ Each MoE layer replaces a dense SwiGLU MLP with:
 Per-token flow:
 
 ```text
-shared_out = shared_expert(x)
-weights, indices = router(x)
-dispatch tokens to experts
-run routed expert MLPs with grouped_gemm
-combine routed outputs with normalized weights
-add shared_out
-```
-
-More explicitly:
-
-```text
 MoELayer.forward(x):
   shared_out = shared_expert(x)
   weights, indices, z_loss, router_scores = router(x)
-  x_expanded = repeat_interleave(x, top_k)
-  sort expanded tokens by expert id
+
+  # dispatch metadata
+  sort expanded expert ids by expert
+  token_idx = sorted_idx // top_k   # which original token
+  slot_idx  = sorted_idx % top_k    # which top_k slot
+  inv_map = build_inverse_map(token_idx, slot_idx, T, top_k)
+
+  # dispatch: fused repeat_interleave + permute
+  x_sorted = scatter_dispatch(x, token_idx)
+
+  # expert compute
   grouped_gemm through expert Wi
-  SwiGLU
+  SwiGLU activation
   grouped_gemm through expert Wo
-  unsort back to token order
-  routed_out = weighted_sum(expert_out, weights) * routed_scaling_factor
+
+  # combine: fused unpermute + weighted sum
+  routed_out = gather_combine(expert_out_sorted, inv_map, weights, scale)
+
   aux = balance_loss(router_scores) + z_loss
   return routed_out + shared_out
 ```
 
-## Why grouped GEMM is the core primitive
+### Expert computation and weight layout
+
+The routed experts are stored as stacked tensors:
+
+```python
+Wi = nn.Parameter(torch.empty(num_experts, hidden_size, 2 * intermediate_size))
+Wo = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
+```
+
+This layout is:
+
+- `(num_experts, in, out)`
+- intentionally chosen for grouped GEMM
+- not the same as `nn.Linear`'s `(out, in)`
+
+The shared expert is a normal dense MLP module.
+
+### Why grouped GEMM is the core primitive
 
 Earlier MoE designs often rely on fixed capacity per expert:
 
@@ -281,8 +296,7 @@ use through `torch.utils.cpp_extension.load`.
 
 ### Why nanoPLM does not use PyTorch `grouped_mm`
 
-PyTorch's grouped MM path was considered, but it is not the current backend for
-nanoPLM.
+PyTorch's grouped MM path was considered, but it is not the current backend.
 
 The practical reason is performance behavior in the actual MoE training path:
 
@@ -292,7 +306,7 @@ The practical reason is performance behavior in the actual MoE training path:
   device-driven
 - in practice this made the routed expert path materially slower
 
-For nanoPLM's MoE usage, that matters a lot because grouped GEMM is not an
+For nanoPLM's MoE usage, that matters because grouped GEMM is not an
 occasional side op. It is the core expert compute primitive and runs twice per
 MoE layer (`Wi` and `Wo`) in forward, then again through the same primitive in
 backward.
@@ -303,17 +317,17 @@ So the current backend choice is not just "CUTLASS is lower level." It is:
 - but its runtime behavior caused CPU sync and GPU-thread stalls in this workload
 - the in-house CUTLASS path lets nanoPLM keep grouped metadata and scheduling in
   a more GPU-native execution path
-- that is why the current implementation uses a custom CUTLASS-backed op instead
-  of PyTorch's built-in grouped MM
 
-The current operator has three important layers:
+### Grouped GEMM operator stack
+
+The current operator has three layers:
 
 1. A Python-side `torch.library` definition with fake tensor and autograd
-   registrations in [moe_grouped_gemm_ops.py](/workspace/nanoplm/src/nanoplm/pretraining/models/modern_bert/moe_grouped_gemm_ops.py).
-2. A small Python loader in [cutlass_grouped_gemm.py](/workspace/nanoplm/src/nanoplm/pretraining/models/modern_bert/cutlass_grouped_gemm.py)
+   registrations in `moe_grouped_gemm_ops.py`.
+2. A small Python loader in `cutlass_grouped_gemm.py`
    that compiles and caches the extension under `.cache/torch_extensions`.
 3. A CUTLASS-backed CUDA implementation in
-   [moe_cutlass_grouped_gemm.cu](/workspace/nanoplm/src/nanoplm/pretraining/models/modern_bert/csrc/moe_cutlass_grouped_gemm.cu)
+   `csrc/moe_cutlass_grouped_gemm.cu`
    that builds grouped metadata on device and launches a CUTLASS
    `GemmGrouped` kernel in `GroupScheduleMode::kDeviceOnly`.
 
@@ -328,11 +342,136 @@ The current CUDA backend supports:
 For CPU execution, and as a safety/reference path for unsupported CUDA dtypes,
 the Python op falls back to a simple per-expert PyTorch implementation.
 
+The op contract:
+
+```python
+torch.ops.nanoplm_moe.grouped_gemm(a, b, batch_sizes, trans_a=False, trans_b=False)
+```
+
+- `a`: packed 2D token matrix
+- `b`: stacked 3D expert weights for the forward `NN` and `NT` cases, or a
+  packed 2D matrix for the `TN` reduction-style case used in backward
+- `batch_sizes`: 1D `int64` tensor of per-expert token counts
+
+Backward is not a separate fused kernel family; it reuses grouped GEMM with different transpose settings.
+
+## Fused Dispatch and Combine Ops
+
+The dispatch and combine paths between the router and the grouped GEMMs are
+implemented as fused Triton kernels in `moe_triton_ops.py`. These replace the
+naive multi-kernel PyTorch sequences that were the original bottleneck.
+
+### Motivation
+
+The unfused path materialized many intermediate `(T*top_k, C)` tensors:
+
+```text
+Forward (unfused):
+  x_expanded = x.repeat_interleave(top_k)       # WRITE (M, C)
+  x_sorted = permute(x_expanded, sorted_idx)     # READ+WRITE (M, C)
+  ... grouped_gemm ...
+  expert_out = unpermute(expert_out_sorted)       # READ+WRITE (M, C)
+  temp = expert_out * weights * scale             # READ+WRITE (M, C)
+  output = temp.sum(dim=1)                        # READ+WRITE
+```
+
+Total dispatch+combine IO was ~7 GB per layer (forward + backward), spread
+across 8-9 separate kernel launches with cache-cold intermediates. On the
+original unfused code this cost 198.8 ms across all layers.
+
+### Op 1: `scatter_dispatch`
+
+Fuses `repeat_interleave` + `permute` into a single gather:
+
+```python
+x_sorted = moe_scatter_dispatch(x, token_idx)
+# Impl: x_sorted[i] = x[token_idx[i]]
+```
+
+Forward IO: read `(T, C)` + `token_idx` + write `(M, C)` = 303 MB (was 600 MB).
+
+Backward uses a Triton `scatter_add` kernel with `tl.atomic_add`. With
+`top_k=2`, contention is exactly 2-way per token — trivial on modern GPUs.
+
+### Op 2: `gather_combine`
+
+Fuses `unpermute` + `mul(weights)` + `sum(top_k)` into a single kernel:
+
+```python
+output = moe_gather_combine(expert_out_sorted, inv_map, weights, scale)
+# Impl: out[t] = sum_k weights[t,k] * expert_out_sorted[inv_map[t,k]] * scale
+```
+
+Forward IO: read `(M, C)` + weights + `inv_map` + write `(T, C)` = 404 MB (was 800+ MB).
+
+The backward is a single fused kernel that computes both `grad_expert_sorted`
+and `grad_weights` in one pass, loading `grad_out[t]` once:
+
+```python
+# For each token t and each slot k:
+#   grad_eo[inv_map[t,k]] = grad_out[t] * weights[t,k] * scale
+#   grad_w[t,k] = dot(grad_out[t], expert_out[inv_map[t,k]]) * scale
+```
+
+Fusing these saved a full redundant `grad_out` DRAM read per token.
+
+### Dispatch metadata
+
+Before either fused op, precompute once during dispatch:
+
+```python
+token_idx = (sorted_idx // top_k).to(torch.int32)   # which original token
+slot_idx  = (sorted_idx % top_k).to(torch.int32)    # which top_k slot
+inv_map = build_inverse_map(token_idx, slot_idx, T, top_k)  # (T, top_k) int32
+```
+
+`int32` is used because `T*top_k` = 131072 fits comfortably, and halving
+metadata bandwidth reduces register pressure. These tensors are saved for
+backward via `ctx.save_for_backward` — no buffer reuse, since checkpoint
+re-entry or gradient accumulation would corrupt shared buffers.
+
+### Dtype contract
+
+Router weights are fp32. Expert outputs are bf16. The fused kernels:
+
+1. Load `expert_out` in native dtype (bf16)
+2. Cast to fp32 before multiply with weights
+3. Accumulate the top_k sum in fp32
+4. Store output as fp32 (matching PyTorch's implicit promotion rules)
+
+A `FP32_ACCUM: tl.constexpr` flag controls the conditional cast, with fp64
+passthrough for `gradcheck`.
+
+### Eager fallbacks
+
+All Triton kernels are specialized for `C <= 1024` (current hidden_size=768).
+For larger C, the CUDA impls fall back to eager PyTorch paths. CPU always uses
+eager. The op signatures, `register_fake`, and autograd wiring are
+shape-agnostic — only the CUDA dispatch checks `C`.
+
+### `torch.compile` integration
+
+All ops (forward and backward) are registered via `torch.library`:
+
+- `DEF` + `register_fake` for shape/dtype inference
+- `impl("CUDA")` + `impl("CPU")` for execution
+- `register_autograd` for backward wiring
+
+Two lessons from the implementation:
+
+1. **Backward ops must be registered custom ops.** Direct Triton kernel
+   launches in the backward break `torch.compile` because Dynamo can't trace
+   FakeTensors through raw kernel calls.
+
+2. **Inductor cache invalidation.** After changing backward implementations,
+   the inductor cache in `/tmp/torchinductor_*` can serve stale compiled
+   graphs. Clear it when changing op implementations.
+
 ## Router Design
 
 ### Sigmoid top-k
 
-The router in [moe.py](/workspace/nanoplm/src/nanoplm/pretraining/models/modern_bert/moe.py) projects hidden states to expert logits, casts them to fp32, applies sigmoid, and selects `top_k` experts.
+The router in `moe.py` projects hidden states to expert logits, casts them to fp32, applies sigmoid, and selects `top_k` experts.
 
 Why sigmoid:
 
@@ -378,7 +517,7 @@ That distinction is important. It lets nanoPLM steer expert usage without corrup
 
 ### Global bias update
 
-The bias update lives in [pure_pipeline.py](/workspace/nanoplm/src/nanoplm/pretraining/pure_pipeline.py).
+The bias update lives in `pure_pipeline.py`.
 
 The update flow is:
 
@@ -412,59 +551,9 @@ This is not the main balancing mechanism. The main mechanism is still bias corre
 
 The aux loss stays because in the small-model regime it is a cheap extra stabilizer, especially before expert specialization settles down.
 
-## Expert Computation and Weight Layout
-
-The routed experts are stored as stacked tensors:
-
-```python
-Wi = nn.Parameter(torch.empty(num_experts, hidden_size, 2 * intermediate_size))
-Wo = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
-```
-
-This layout is:
-
-- `(num_experts, in, out)`
-- intentionally chosen for grouped GEMM
-- not the same as `nn.Linear`'s `(out, in)`
-
-The shared expert is a normal dense MLP module.
-
-Dispatch flow:
-
-1. expand each token `top_k` times
-2. flatten selected expert ids
-3. stable-sort by expert id
-4. compute per-expert token counts
-5. run grouped expert `Wi`
-6. apply SwiGLU
-7. run grouped expert `Wo`
-8. unsort back to token order
-9. combine selected expert outputs with normalized weights
-
-This is the simplest dropless local MoE design that still uses the right primitive.
-
-### Current grouped GEMM call contract
-
-The current op contract is:
-
-```python
-torch.ops.nanoplm_moe.grouped_gemm(a, b, batch_sizes, trans_a=False, trans_b=False)
-```
-
-with the following semantics:
-
-- `a`: packed 2D token matrix
-- `b`: stacked 3D expert weights for the forward `NN` and `NT` cases, or a
-  packed 2D matrix for the `TN` reduction-style case used in backward
-- `batch_sizes`: 1D `int64` tensor of per-expert token counts
-
-This contract is important because the autograd registration is written in
-terms of the same grouped GEMM primitive. Backward is not a separate fused
-kernel family; it reuses grouped GEMM with different transpose settings.
-
 ## Dense-first Layers and Active Compute Matching
 
-The config in [modeling.py](/workspace/nanoplm/src/nanoplm/pretraining/models/modern_bert/modeling.py) computes:
+The config computes:
 
 - `moe_layer_flags`
 - `moe_dense_intermediate_size = (moe_top_k + 1) * intermediate_size`
@@ -474,7 +563,7 @@ This means:
 - the first `moe_leading_dense_layers` can remain dense
 - those dense layers are widened so their active compute matches the sparse MoE layers
 
-That is a very Ling-aligned decision:
+That is a Ling-aligned decision:
 
 - early layers often benefit less from routing
 - but they should still be compute-matched for fair ablations
@@ -493,7 +582,7 @@ The correction bias is a buffer, so it stays replicated and is updated directly 
 
 ### Optimizer grouping
 
-The optimizer logic in [optim.py](/workspace/nanoplm/src/nanoplm/pretraining/optim.py) is worth calling out because it is MoE-specific.
+The optimizer logic in `optim.py` is MoE-specific.
 
 Originally, the routed expert tensors were falling through to AdamW simply because they are stored as 3D stacks.
 
@@ -543,8 +632,7 @@ Operational implications:
   controlled through `TORCH_CUDA_ARCH_LIST`
 
 The current kernel template is instantiated with a CUTLASS `Sm80` architecture
-tag, so the intended support range is Ampere-and-newer GPUs. In practice, that
-means the backend is designed for `sm80+` rather than pre-Ampere cards.
+tag, so the intended support range is Ampere-and-newer GPUs.
 
 ### Activation checkpointing
 
@@ -558,6 +646,10 @@ MoE does **not** work with:
 - `activation_checkpointing_mode: "attn+mlp"`
 
 That is enforced in config validation.
+
+When `layer` mode is active, the MoE forward is recomputed during backward.
+The dispatch workspace buffers (`_dispatch_sort_values`, etc.) disable reuse
+in this mode to avoid clobbering metadata still needed by the backward pass.
 
 ### Eval path
 
@@ -598,49 +690,98 @@ Those are fixed by design:
 - sigmoid routing
 - group routing inferred from `moe_n_group > 1`
 
-## Current Testing State
+## Testing
 
-The grouped GEMM path now has focused correctness coverage in
-[test_moe_grouped_gemm_ops.py](/workspace/nanoplm/tests/test_moe_grouped_gemm_ops.py).
+Tests are in two files:
 
-The current tests cover:
+- `test_moe_grouped_gemm_ops.py` — grouped GEMM correctness:
+  - CPU reference behavior
+  - CUDA CUTLASS behavior
+  - all three transpose modes used by forward/backward
+  - zero-token experts
+  - backward parity against the PyTorch reference path
 
-- CPU reference behavior
-- CUDA CUTLASS behavior
-- all three grouped GEMM transpose modes used by forward/backward
-- zero-token experts
-- backward parity against the PyTorch reference path
+- `test_moe_fused_ops.py` — fused dispatch/combine correctness:
+  - `scatter_dispatch` forward match vs eager reference (bf16, fp32, CPU, CUDA)
+  - `scatter_dispatch` backward match vs eager reference
+  - `scatter_dispatch` fp64 gradcheck
+  - `gather_combine` forward match vs eager reference (bf16, fp32, CPU, CUDA)
+  - `gather_combine` backward match vs eager reference (including grad_weights)
+  - `gather_combine` fp64 gradcheck
+  - `gather_combine` output dtype contract (bf16 input + fp32 weights = fp32 output)
+  - `build_inverse_map` correctness
+  - full MoE layer integration test (forward + backward vs pure PyTorch reference)
 
-So the current state of the code is:
+## Performance
 
-- research-driven Ling/DeepSeek-style routing logic
-- local dropless dispatch
-- Triton permutation/unpermutation kernels
-- in-house CUTLASS grouped GEMM backend
-- Python `torch.library` registrations for fake tensor and autograd support
+### Hardware and config
 
-## Why this is the current landing point
+- RTX 5090: 1792 GB/s memory BW, 209.6 TFLOP/s bf16 tensor core
+- T=65536, C=768, top_k=2, M=T*top_k=131072, E=11, inter=512, bf16
+- 12 layers (11 MoE + 1 dense), FSDP, activation checkpointing (attn mode)
+- Roofline crossover: 117 FLOP/byte for bf16 — all dispatch+combine kernels are BW-bound
 
-The final design choice was not "copy Ling".
+### Profiler comparison
 
-It was:
+| Run | Description | GPU kernel time | Delta vs baseline |
+|---|---|---|---|
+| run-20031213 | Baseline (unfused) | 2748.7 ms | -- |
+| run-20031346 | Fused ops + Triton scatter_add bwd | 2677.9 ms | -70.8 ms (-2.6%) |
+| run-20031659 | Fused backward (bwd_eo + bwd_w merged) | 2572.3 ms | -176.4 ms (-6.4%) |
 
-- take the **routing philosophy** from DeepSeek / GLM / Ling
-- take the **small-scale relevance** and **training visibility** from Ling
-- keep the **systems scope** modest enough for nanoPLM
+### Dispatch+combine kernel budget
 
-That is why the current implementation looks the way it does:
+| Run | Time | Delta |
+|---|---|---|
+| Baseline | 198.8 ms | -- |
+| Fused ops + scatter_add | 113.9 ms | -84.9 ms (-42.7%) |
+| Fused backward | 103.6 ms | -95.2 ms (-47.9%) |
 
-- not a toy top-2 MoE
-- not a full expert-parallel megacluster stack
-- but a serious sparse MLP design with modern routing and stabilization choices
+### Baseline kernels removed (198.8 ms total)
 
-In short:
+| Kernel | Time | Count | Avg | Replaced by |
+|---|---|---|---|---|
+| `_moe_unpermute_kernel` | 46.1 ms | 180 | 256 us | `gather_combine` fwd + bwd |
+| `_moe_permute_kernel` (bwd half) | 30.0 ms | 92 | 326 us | Triton `scatter_add` |
+| `fused_add_mul_sum_unsqueeze_view` | 27.1 ms | 88 | 308 us | `gather_combine` fwd |
+| `fused_expand_mul_sum_unsqueeze_view` | 24.2 ms | 92 | 263 us | `gather_combine` bwd |
+| `fused__to_copy_expand_mul_permute_unsqueeze_view` | 21.2 ms | 92 | 230 us | `gather_combine` bwd |
+| `fused_clone_expand_unsqueeze` (repeat_interleave) | 16.3 ms | 88 | 185 us | `scatter_dispatch` fwd |
+| `fused_sum_view` | 15.0 ms | 93 | 161 us | `gather_combine` fwd |
+| `fused_zeros` | 4.6 ms | 92 | 50 us | eliminated |
 
-- DeepSeek and GLM clarified the routing family
-- Qwen clarified the alternative softmax family
-- Ling made the small-scale case convincing
-- nanoPLM implemented the subset that is most defensible and most transferable
+### Current fused kernels (103.6 ms total) -- roofline analysis
+
+All kernels are bandwidth-bound. IO calculated for T=65536, C=768, top_k=2, bf16/fp32.
+
+| Kernel | Time | Count | Avg | IO (MB) | BW floor (us) | BW eff. |
+|---|---|---|---|---|---|---|
+| `_moe_gather_combine_bwd_fused_kernel` | 36.3 ms | 92 | 394 us | 607 | 339 | **86%** |
+| `_moe_scatter_add_kernel` | 24.3 ms | 92 | 265 us | 403 | 225 | **85%** |
+| `_moe_gather_combine_fwd_kernel` | 22.0 ms | 88 | 250 us | 404 | 225 | **90%** |
+| `_moe_gather_kernel` (scatter_dispatch fwd) | 18.9 ms | 88 | 214 us | 303 | 169 | **79%** |
+
+IO breakdown:
+
+- `scatter_dispatch` fwd: read x (T,C) bf16 100.7MB + token_idx 0.5MB + write x_sorted (M,C) bf16 201.3MB = 303MB
+- `scatter_add` bwd: read grad_sorted (M,C) bf16 201.3MB + token_idx 0.5MB + RMW grad_x (T,C) bf16 201.4MB = 403MB
+- `gather_combine` fwd: read expert_out (M,C) bf16 201.3MB + inv_map/weights 1.0MB + write output (T,C) fp32 201.3MB = 404MB
+- `gather_combine` bwd fused: read grad_out (T,C) fp32 201.3MB + expert_out (M,C) bf16 201.3MB + inv_map/weights 1.5MB + write grad_eo (M,C) bf16 201.3MB + grad_w (T,top_k) fp32 0.5MB = 607MB
+
+### Key optimization: `index_add_` replacement
+
+The CUDA `indexFuncLargeIndex` implementation of `index_add_` achieved only
+28% bandwidth efficiency (493 GB/s vs 1792 GB/s peak), at 609 us avg per call.
+Replaced with a Triton `scatter_add` kernel using `tl.atomic_add`. With
+`top_k=2`, contention is exactly 2-way per token — result: 265 us avg (85% BW
+efficiency).
+
+### Key optimization: fused backward
+
+The original backward used two separate kernels (`bwd_eo` and `bwd_w`), each
+loading `grad_out[t]` from DRAM independently. Merging them into a single
+kernel that loads `grad_out` once saved 127 us per call (11.8 ms total across
+92 invocations).
 
 ## Sources
 

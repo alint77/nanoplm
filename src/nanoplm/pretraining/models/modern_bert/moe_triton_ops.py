@@ -1,11 +1,11 @@
 """Fused Triton kernels for MoE dispatch and combine.
 
-Provides three custom ops registered via ``torch.library``:
+Provides custom ops registered via ``torch.library``:
   - ``scatter_dispatch``: fuses repeat_interleave + permute into a single gather
   - ``scatter_add_bwd``: Triton atomic scatter-add for scatter_dispatch backward
   - ``gather_combine``: fuses unpermute + mul(weights) + sum(top_k)
-  - ``gather_combine_bwd_eo``: backward for grad_expert_sorted
-  - ``gather_combine_bwd_w``: backward for grad_weights
+  - ``gather_combine_bwd``: fused backward producing both grad_expert_sorted
+    and grad_weights in a single pass (loads grad_out once)
 
 All backward ops are registered as separate custom ops (not direct Triton
 launches) so that ``torch.compile`` can trace through FakeTensors.
@@ -28,12 +28,9 @@ _lib.define(
     "Tensor weights, float scale) -> Tensor"
 )
 _lib.define(
-    "gather_combine_bwd_eo(Tensor grad_out, Tensor inv_map, "
-    "Tensor weights, float scale, int M, int eo_dtype) -> Tensor"
-)
-_lib.define(
-    "gather_combine_bwd_w(Tensor grad_out, Tensor expert_out_sorted, "
-    "Tensor inv_map, float scale) -> Tensor"
+    "gather_combine_bwd(Tensor grad_out, Tensor expert_out_sorted, "
+    "Tensor inv_map, Tensor weights, float scale, int M, int eo_dtype) "
+    "-> (Tensor, Tensor)"
 )
 
 # Encode dtype as int so it can pass through the op schema.
@@ -136,65 +133,54 @@ def _moe_gather_combine_fwd_kernel(
 
 
 @triton.jit
-def _moe_gather_combine_bwd_eo_kernel(
-    go_ptr, inv_ptr, w_ptr, ge_ptr,
-    scale,
-    C,
-    stride_go_t, stride_go_d,
-    stride_inv_t, stride_inv_k,
-    stride_w_t, stride_w_k,
-    stride_ge_m, stride_ge_d,
-    BLOCK_D: tl.constexpr,
-    TOP_K: tl.constexpr,
-    FP32_ACCUM: tl.constexpr,
-):
-    """grad_expert_sorted[inv_map[t,k]] = grad_out[t] * w[t,k] * scale."""
-    t = tl.program_id(0)
-    offs_d = tl.arange(0, BLOCK_D)
-    mask_d = offs_d < C
-
-    go = tl.load(go_ptr + t * stride_go_t + offs_d * stride_go_d, mask=mask_d, other=0.0)
-
-    for k in range(TOP_K):
-        pos = tl.load(inv_ptr + t * stride_inv_t + k * stride_inv_k).to(tl.int64)
-        w = tl.load(w_ptr + t * stride_w_t + k * stride_w_k)
-        val = go * w * scale
-        tl.store(
-            ge_ptr + pos * stride_ge_m + offs_d * stride_ge_d, val, mask=mask_d,
-        )
-
-
-@triton.jit
-def _moe_gather_combine_bwd_w_kernel(
-    go_ptr, eo_ptr, inv_ptr, gw_ptr,
+def _moe_gather_combine_bwd_fused_kernel(
+    go_ptr, eo_ptr, inv_ptr, w_ptr, ge_ptr, gw_ptr,
     scale,
     C,
     stride_go_t, stride_go_d,
     stride_eo_m, stride_eo_d,
     stride_inv_t, stride_inv_k,
+    stride_w_t, stride_w_k,
+    stride_ge_m, stride_ge_d,
     stride_gw_t, stride_gw_k,
     BLOCK_D: tl.constexpr,
     TOP_K: tl.constexpr,
     FP32_ACCUM: tl.constexpr,
 ):
-    """grad_weights[t,k] = dot(grad_out[t], expert_out[inv_map[t,k]]) * scale."""
+    """Fused backward: computes both grad_expert_sorted and grad_weights.
+
+    Loads grad_out[t] once, then for each slot k:
+      - grad_eo[inv_map[t,k]] = grad_out[t] * weights[t,k] * scale
+      - grad_w[t,k] = dot(grad_out[t], expert_out[inv_map[t,k]]) * scale
+    """
     t = tl.program_id(0)
     offs_d = tl.arange(0, BLOCK_D)
     mask_d = offs_d < C
 
+    # Load grad_out[t] ONCE — the whole point of this fusion.
     go = tl.load(go_ptr + t * stride_go_t + offs_d * stride_go_d, mask=mask_d, other=0.0)
 
     for k in range(TOP_K):
         pos = tl.load(inv_ptr + t * stride_inv_t + k * stride_inv_k).to(tl.int64)
+        w = tl.load(w_ptr + t * stride_w_t + k * stride_w_k)
+
+        # Load expert_out_sorted[pos] for grad_w dot product.
         row = tl.load(
             eo_ptr + pos * stride_eo_m + offs_d * stride_eo_d,
             mask=mask_d, other=0.0,
         )
         if FP32_ACCUM:
             row = row.to(tl.float32)
+
+        # grad_eo[pos] = grad_out * w * scale  (implicit fp32→bf16 cast on store)
+        val = go * w * scale
+        tl.store(
+            ge_ptr + pos * stride_ge_m + offs_d * stride_ge_d, val, mask=mask_d,
+        )
+
+        # grad_w[t,k] = dot(grad_out, expert_out[pos]) * scale
         dot = tl.sum(go * row, axis=0)
-        gw = dot * scale
-        tl.store(gw_ptr + t * stride_gw_t + k * stride_gw_k, gw)
+        tl.store(gw_ptr + t * stride_gw_t + k * stride_gw_k, dot * scale)
 
 
 # ── Eager fallbacks (CPU + C > 1024 CUDA) ────────────────────────────────────
@@ -210,10 +196,14 @@ def _gather_combine_fwd_eager(expert_out_sorted, inv_map, weights, scale):
     return (rows * weights.unsqueeze(-1) * scale).sum(dim=1)
 
 
-def _gather_combine_bwd_eo_eager(grad_out, inv_map, weights, scale, M, out_dtype):
+def _gather_combine_bwd_eager(
+    grad_out, expert_out_sorted, inv_map, weights, scale, M, out_dtype,
+):
     T, top_k = inv_map.shape
     C = grad_out.shape[1]
     fp32_accum = out_dtype in (torch.bfloat16, torch.float16)
+
+    # grad_expert_sorted
     grad_eo = torch.empty(M, C, dtype=out_dtype, device=grad_out.device)
     for k in range(top_k):
         positions = inv_map[:, k].long()
@@ -221,12 +211,8 @@ def _gather_combine_bwd_eo_eager(grad_out, inv_map, weights, scale, M, out_dtype
         if fp32_accum:
             val = val.to(out_dtype)
         grad_eo[positions] = val
-    return grad_eo
 
-
-def _gather_combine_bwd_w_eager(grad_out, expert_out_sorted, inv_map, scale):
-    T, top_k = inv_map.shape
-    fp32_accum = expert_out_sorted.dtype in (torch.bfloat16, torch.float16)
+    # grad_weights
     grad_w = torch.empty(T, top_k, dtype=grad_out.dtype, device=grad_out.device)
     for k in range(top_k):
         positions = inv_map[:, k].long()
@@ -234,7 +220,8 @@ def _gather_combine_bwd_w_eager(grad_out, expert_out_sorted, inv_map, scale):
         if fp32_accum:
             eo_k = eo_k.float()
         grad_w[:, k] = (grad_out * eo_k).sum(dim=-1) * scale
-    return grad_w
+
+    return grad_eo, grad_w
 
 
 # ── build_inverse_map helper ─────────────────────────────────────────────────
@@ -394,80 +381,62 @@ def _gather_combine_cpu(expert_out_sorted, inv_map, weights, scale):
     return _gather_combine_fwd_eager(expert_out_sorted, inv_map, weights, scale)
 
 
-# ── gather_combine backward ops ──────────────────────────────────────────────
+# ── gather_combine fused backward ────────────────────────────────────────────
 
 
-@torch.library.register_fake("nanoplm_moe::gather_combine_bwd_eo")
-def _gather_combine_bwd_eo_fake(grad_out, inv_map, weights, scale, M, eo_dtype):
+@torch.library.register_fake("nanoplm_moe::gather_combine_bwd")
+def _gather_combine_bwd_fake(
+    grad_out, expert_out_sorted, inv_map, weights, scale, M, eo_dtype,
+):
+    T, top_k = inv_map.shape
     C = grad_out.shape[1]
-    return torch.empty(M, C, dtype=_INT_TO_DTYPE[eo_dtype], device=grad_out.device)
+    return (
+        torch.empty(M, C, dtype=_INT_TO_DTYPE[eo_dtype], device=grad_out.device),
+        torch.empty(T, top_k, dtype=grad_out.dtype, device=grad_out.device),
+    )
 
 
-@torch.library.impl(_lib, "gather_combine_bwd_eo", "CUDA")
-def _gather_combine_bwd_eo_cuda(grad_out, inv_map, weights, scale, M, eo_dtype):
+@torch.library.impl(_lib, "gather_combine_bwd", "CUDA")
+def _gather_combine_bwd_cuda(
+    grad_out, expert_out_sorted, inv_map, weights, scale, M, eo_dtype,
+):
     T, top_k = inv_map.shape
     C = grad_out.shape[1]
     out_dtype = _INT_TO_DTYPE[eo_dtype]
     fp32_accum = out_dtype != torch.float64
 
     if C > 1024:
-        return _gather_combine_bwd_eo_eager(grad_out, inv_map, weights, scale, M, out_dtype)
+        return _gather_combine_bwd_eager(
+            grad_out, expert_out_sorted, inv_map, weights, scale, M, out_dtype,
+        )
 
     BLOCK_D = triton.next_power_of_2(C)
     grad_eo = torch.empty(M, C, dtype=out_dtype, device=grad_out.device)
-    _moe_gather_combine_bwd_eo_kernel[(T,)](
-        grad_out, inv_map, weights, grad_eo,
-        scale, C,
-        grad_out.stride(0), grad_out.stride(1),
-        inv_map.stride(0), inv_map.stride(1),
-        weights.stride(0), weights.stride(1),
-        grad_eo.stride(0), grad_eo.stride(1),
-        BLOCK_D=BLOCK_D, TOP_K=top_k, FP32_ACCUM=fp32_accum,
-        num_warps=4, num_stages=1,
-    )
-    return grad_eo
-
-
-@torch.library.impl(_lib, "gather_combine_bwd_eo", "CPU")
-def _gather_combine_bwd_eo_cpu(grad_out, inv_map, weights, scale, M, eo_dtype):
-    return _gather_combine_bwd_eo_eager(
-        grad_out, inv_map, weights, scale, M, _INT_TO_DTYPE[eo_dtype],
-    )
-
-
-@torch.library.register_fake("nanoplm_moe::gather_combine_bwd_w")
-def _gather_combine_bwd_w_fake(grad_out, expert_out_sorted, inv_map, scale):
-    T, top_k = inv_map.shape
-    return torch.empty(T, top_k, dtype=grad_out.dtype, device=grad_out.device)
-
-
-@torch.library.impl(_lib, "gather_combine_bwd_w", "CUDA")
-def _gather_combine_bwd_w_cuda(grad_out, expert_out_sorted, inv_map, scale):
-    T, top_k = inv_map.shape
-    C = expert_out_sorted.shape[1]
-    fp32_accum = expert_out_sorted.dtype != torch.float64
-
-    if C > 1024:
-        return _gather_combine_bwd_w_eager(grad_out, expert_out_sorted, inv_map, scale)
-
-    BLOCK_D = triton.next_power_of_2(C)
     grad_w = torch.empty(T, top_k, dtype=grad_out.dtype, device=grad_out.device)
-    _moe_gather_combine_bwd_w_kernel[(T,)](
-        grad_out, expert_out_sorted, inv_map, grad_w,
+
+    _moe_gather_combine_bwd_fused_kernel[(T,)](
+        grad_out, expert_out_sorted, inv_map, weights, grad_eo, grad_w,
         scale, C,
         grad_out.stride(0), grad_out.stride(1),
         expert_out_sorted.stride(0), expert_out_sorted.stride(1),
         inv_map.stride(0), inv_map.stride(1),
+        weights.stride(0), weights.stride(1),
+        grad_eo.stride(0), grad_eo.stride(1),
         grad_w.stride(0), grad_w.stride(1),
         BLOCK_D=BLOCK_D, TOP_K=top_k, FP32_ACCUM=fp32_accum,
         num_warps=4, num_stages=1,
     )
-    return grad_w
+    return grad_eo, grad_w
 
 
-@torch.library.impl(_lib, "gather_combine_bwd_w", "CPU")
-def _gather_combine_bwd_w_cpu(grad_out, expert_out_sorted, inv_map, scale):
-    return _gather_combine_bwd_w_eager(grad_out, expert_out_sorted, inv_map, scale)
+@torch.library.impl(_lib, "gather_combine_bwd", "CPU")
+def _gather_combine_bwd_cpu(
+    grad_out, expert_out_sorted, inv_map, weights, scale, M, eo_dtype,
+):
+    return _gather_combine_bwd_eager(
+        grad_out, expert_out_sorted, inv_map, weights, scale, M,
+        _INT_TO_DTYPE[eo_dtype],
+    )
 
 
 # ── gather_combine autograd ──────────────────────────────────────────────────
@@ -487,11 +456,8 @@ def _gather_combine_backward(ctx, grad_out):
     eo_dtype_int = _DTYPE_TO_INT[ctx.eo_dtype]
     grad_out = grad_out.contiguous()
 
-    grad_eo = torch.ops.nanoplm_moe.gather_combine_bwd_eo(
-        grad_out, inv_map, weights, scale, M, eo_dtype_int,
-    )
-    grad_w = torch.ops.nanoplm_moe.gather_combine_bwd_w(
-        grad_out, expert_out_sorted, inv_map, scale,
+    grad_eo, grad_w = torch.ops.nanoplm_moe.gather_combine_bwd(
+        grad_out, expert_out_sorted, inv_map, weights, scale, M, eo_dtype_int,
     )
     return grad_eo, None, grad_w, None
 
