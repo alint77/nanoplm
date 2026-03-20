@@ -21,6 +21,8 @@ from torch.utils.checkpoint import checkpoint as _checkpoint
 
 # Registers torch.ops.nanoplm_mhc::* used by MHCLiteBlock's Triton path.
 from . import mhc_triton_ops as _mhc_triton_ops  # noqa: F401
+# Registers torch.ops.nanoplm_canon::* — Triton varlen depthwise conv.
+from .canon_ops import varlen_canon_conv as _varlen_canon_conv
 
 _HAS_FLASH_VARLEN = False
 _flash_varlen_fn = None
@@ -516,7 +518,7 @@ class ModernBertCanonLayer(nn.Module):
             seq_id = torch.searchsorted(cu_seqlens[1:], positions, right=True)
         weight = self.conv.weight[:, 0, :]
         bias = self.conv.bias
-        mixed = _varlen_canon_inner(x, seq_id, weight, bias, self.radius)
+        mixed = _varlen_canon_conv(x, seq_id, weight, bias, self.radius)
         return x + mixed
 
     def _forward_padded(self, x, attention_mask=None):
