@@ -444,10 +444,52 @@ passthrough for `gradcheck`.
 
 ### Eager fallbacks
 
-All Triton kernels are specialized for `C <= 1024` (current hidden_size=768).
-For larger C, the CUDA impls fall back to eager PyTorch paths. CPU always uses
-eager. The op signatures, `register_fake`, and autograd wiring are
-shape-agnostic — only the CUDA dispatch checks `C`.
+CPU always uses eager reference paths. On CUDA, `gather_combine` and its
+backward are implemented as strip-mined fused kernels: one program handles one
+token and loops over the hidden dimension in fixed-size tiles. That preserves
+the fusion boundary while removing the old `C <= 1024` specialization cliff, so
+the same fused ops can support larger research-scale hidden sizes such as
+`2048` and `4096`.
+
+### Autotuning
+
+Both `gather_combine` forward and backward kernels support `triton.autotune`
+for selecting `BLOCK_D`, `num_warps`, and `num_stages` per unique hidden
+dimension `C`. The strip-mined design makes this possible because `BLOCK_D` is
+a tunable tile size rather than a fixed constraint.
+
+Controlled by two environment variables:
+
+- `NANOPLM_MOE_TRITON_AUTOTUNE` (default `"1"`): enables/disables autotuning.
+  When disabled, architecture-aware heuristics select conservative defaults.
+- `NANOPLM_MOE_TRITON_AUTOTUNE_STATUS` (default `"1"`): enables/disables
+  `[nanoplm][triton]` status logging (cache hits, benchmarking, selected
+  configs).
+
+The config search space covers SM80 (Ampere), SM90 (Hopper), and SM120
+(Blackwell):
+
+| Kernel | BLOCK_D range | num_warps range | num_stages | Configs |
+|---|---|---|---|---|
+| Forward | 128–512 | 4–8 | 1–2 | 7 |
+| Backward | 64–256 | 2–8 | 1–2 | 7 |
+
+Forward configs are lighter on register pressure (load + accumulate + store),
+so they can afford larger tiles (up to 512). Backward configs are heavier
+(grad_out + expert_out + grad_w accumulator all live simultaneously), so the
+tile range is smaller.
+
+On first invocation for a given `C`, `triton.autotune` benchmarks all configs
+and caches the winner to disk. Subsequent runs load from the cache. The status
+logger prints the result:
+
+```text
+[nanoplm][triton] resolving autotune config: moe_gc_fwd key=(768,) (may benchmark up to 7 configs on first run)
+[nanoplm][triton] autotune finished: moe_gc_fwd selected=BLOCK_D=256, num_warps=8, num_stages=2
+```
+
+A `disable_moe_autotune_temporarily()` context manager is available for
+tests or profiling runs that need deterministic kernel selection.
 
 ### `torch.compile` integration
 
@@ -709,6 +751,8 @@ Tests are in two files:
   - `gather_combine` backward match vs eager reference (including grad_weights)
   - `gather_combine` fp64 gradcheck
   - `gather_combine` output dtype contract (bf16 input + fp32 weights = fp32 output)
+  - `gather_combine` large hidden dim (C=4096) on CUDA
+  - `gather_combine` non-power-of-two top_k (top_k=3, C=1024) on CUDA
   - `build_inverse_map` correctness
   - full MoE layer integration test (forward + backward vs pure PyTorch reference)
 

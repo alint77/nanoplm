@@ -13,6 +13,11 @@ launches) so that ``torch.compile`` can trace through FakeTensors.
 
 from __future__ import annotations
 
+import os
+import threading
+from contextlib import contextmanager
+from typing import Any
+
 import torch
 import torch.library
 import triton
@@ -36,6 +41,132 @@ _lib.define(
 # Encode dtype as int so it can pass through the op schema.
 _DTYPE_TO_INT = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2, torch.float64: 3}
 _INT_TO_DTYPE = {v: k for k, v in _DTYPE_TO_INT.items()}
+
+
+# ── Autotune control ─────────────────────────────────────────────────────────
+
+_AUTOTUNE_CONTROL = threading.local()
+
+
+def _autotune_disable_depth() -> int:
+    return int(getattr(_AUTOTUNE_CONTROL, "disable_depth", 0))
+
+
+@contextmanager
+def disable_moe_autotune_temporarily():
+    """Temporarily force the heuristic (non-autotune) launch path."""
+    _AUTOTUNE_CONTROL.disable_depth = _autotune_disable_depth() + 1
+    try:
+        yield
+    finally:
+        _AUTOTUNE_CONTROL.disable_depth = max(0, _autotune_disable_depth() - 1)
+
+
+def _moe_autotune_enabled() -> bool:
+    v = os.getenv("NANOPLM_MOE_TRITON_AUTOTUNE", "1").strip().lower()
+    return v not in {"0", "false", "off", "no"} and _autotune_disable_depth() == 0
+
+
+def _moe_autotune_status_enabled() -> bool:
+    v = os.getenv("NANOPLM_MOE_TRITON_AUTOTUNE_STATUS", "1").strip().lower()
+    return v not in {"0", "false", "off", "no"}
+
+
+_MOE_AUTOTUNE_STATUS_SEEN: set[tuple[str, tuple[Any, ...]]] = set()
+
+
+def _moe_autotune_key(autotuner: Any, args_by_name: dict[str, Any]) -> tuple[Any, ...]:
+    key: list[Any] = []
+    for name in getattr(autotuner, "keys", ()):
+        if name in args_by_name:
+            key.append(args_by_name[name])
+    for name in getattr(autotuner, "arg_names", ()):
+        if name in args_by_name:
+            arg = args_by_name[name]
+            if hasattr(arg, "dtype"):
+                key.append(str(arg.dtype))
+    return tuple(key)
+
+
+def _moe_autotune_status_begin(
+    *,
+    kernel_name: str,
+    autotuner: Any,
+    args_by_name: dict[str, Any],
+) -> tuple[tuple[Any, ...], bool, Any] | None:
+    if not _moe_autotune_status_enabled():
+        return None
+    key = _moe_autotune_key(autotuner, args_by_name)
+    tag = (kernel_name, key)
+    if tag in _MOE_AUTOTUNE_STATUS_SEEN:
+        return None
+    _MOE_AUTOTUNE_STATUS_SEEN.add(tag)
+
+    in_mem_hit = key in getattr(autotuner, "cache", {})
+    bench_before = getattr(autotuner, "bench_time", None)
+    if in_mem_hit:
+        cfg = autotuner.cache[key]
+        print(
+            f"[nanoplm][triton] autotune cache hit: {kernel_name} key={key} cfg={cfg}",
+            flush=True,
+        )
+    else:
+        num_cfgs = len(getattr(autotuner, "configs", ()))
+        print(
+            f"[nanoplm][triton] resolving autotune config: {kernel_name} key={key} "
+            f"(may benchmark up to {num_cfgs} configs on first run)",
+            flush=True,
+        )
+    return key, in_mem_hit, bench_before
+
+
+def _moe_autotune_status_end(
+    *,
+    kernel_name: str,
+    autotuner: Any,
+    state: tuple[tuple[Any, ...], bool, Any] | None,
+) -> None:
+    if not _moe_autotune_status_enabled() or state is None:
+        return
+    key, in_mem_hit, bench_before = state
+    if in_mem_hit:
+        return
+    bench_after = getattr(autotuner, "bench_time", None)
+    ran_benchmark = bench_after is not None and bench_after != bench_before
+    cfg = getattr(autotuner, "cache", {}).get(key, getattr(autotuner, "best_config", None))
+    if ran_benchmark:
+        print(
+            f"[nanoplm][triton] autotune finished: {kernel_name} selected={cfg}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[nanoplm][triton] autotune loaded from disk cache: {kernel_name} selected={cfg}",
+            flush=True,
+        )
+
+
+# Forward: register-light (load bf16 row, fp32 accumulate, store fp32).
+_MOE_GC_FWD_CONFIGS = [
+    triton.Config({"BLOCK_D": 512}, num_warps=8, num_stages=2),   # SM90: large tile, deep pipeline
+    triton.Config({"BLOCK_D": 512}, num_warps=4, num_stages=2),   # SM80: same tile, fewer warps
+    triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=2),   # SM120: validated on RTX 5090
+    triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=1),
+    triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=1),
+]
+
+# Backward: heavier (go + go_acc + row + row_acc + val + grad_w_acc live).
+_MOE_GC_BWD_CONFIGS = [
+    triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=2),   # SM90: aggressive
+    triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=2),   # SM120: validated on RTX 5090
+    triton.Config({"BLOCK_D": 128}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=1),
+    triton.Config({"BLOCK_D": 64}, num_warps=4, num_stages=2),    # SM80: conservative
+    triton.Config({"BLOCK_D": 64}, num_warps=2, num_stages=1),
+]
 
 
 # ── Triton kernels ────────────────────────────────────────────────────────────
@@ -112,24 +243,27 @@ def _moe_gather_combine_fwd_kernel(
     FP32_ACCUM: tl.constexpr,
 ):
     t = tl.program_id(0)
-    offs_d = tl.arange(0, BLOCK_D)
-    mask_d = offs_d < C
 
-    acc = tl.zeros([BLOCK_D], dtype=tl.float32 if FP32_ACCUM else tl.float64)
+    for d_tile in range(0, tl.cdiv(C, BLOCK_D)):
+        offs_d = d_tile * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < C
+        acc = tl.zeros([BLOCK_D], dtype=tl.float32 if FP32_ACCUM else tl.float64)
 
-    for k in range(TOP_K):
-        pos = tl.load(inv_ptr + t * stride_inv_t + k * stride_inv_k).to(tl.int64)
-        w = tl.load(w_ptr + t * stride_w_t + k * stride_w_k)
-        row = tl.load(
-            eo_ptr + pos * stride_eo_m + offs_d * stride_eo_d,
-            mask=mask_d, other=0.0,
+        for k in range(TOP_K):
+            pos_k = tl.load(inv_ptr + t * stride_inv_t + k * stride_inv_k).to(tl.int64)
+            weight_k = tl.load(w_ptr + t * stride_w_t + k * stride_w_k)
+            row = tl.load(
+                eo_ptr + pos_k * stride_eo_m + offs_d * stride_eo_d,
+                mask=mask_d, other=0.0,
+            )
+            if FP32_ACCUM:
+                row = row.to(tl.float32)
+            acc += weight_k * row
+
+        acc = acc * scale
+        tl.store(
+            out_ptr + t * stride_out_t + offs_d * stride_out_d, acc, mask=mask_d,
         )
-        if FP32_ACCUM:
-            row = row.to(tl.float32)
-        acc += w * row
-
-    acc = acc * scale
-    tl.store(out_ptr + t * stride_out_t + offs_d * stride_out_d, acc, mask=mask_d)
 
 
 @triton.jit
@@ -145,6 +279,7 @@ def _moe_gather_combine_bwd_fused_kernel(
     stride_gw_t, stride_gw_k,
     BLOCK_D: tl.constexpr,
     TOP_K: tl.constexpr,
+    TOP_K_PAD: tl.constexpr,
     FP32_ACCUM: tl.constexpr,
 ):
     """Fused backward: computes both grad_expert_sorted and grad_weights.
@@ -154,36 +289,64 @@ def _moe_gather_combine_bwd_fused_kernel(
       - grad_w[t,k] = dot(grad_out[t], expert_out[inv_map[t,k]]) * scale
     """
     t = tl.program_id(0)
-    offs_d = tl.arange(0, BLOCK_D)
-    mask_d = offs_d < C
+    offs_k = tl.arange(0, TOP_K_PAD)
+    mask_k = offs_k < TOP_K
+    grad_w_acc = tl.zeros([TOP_K_PAD], dtype=tl.float32 if FP32_ACCUM else tl.float64)
 
-    # Load grad_out[t] ONCE — the whole point of this fusion.
-    go = tl.load(go_ptr + t * stride_go_t + offs_d * stride_go_d, mask=mask_d, other=0.0)
+    for d_tile in range(0, tl.cdiv(C, BLOCK_D)):
+        offs_d = d_tile * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < C
 
-    for k in range(TOP_K):
-        pos = tl.load(inv_ptr + t * stride_inv_t + k * stride_inv_k).to(tl.int64)
-        w = tl.load(w_ptr + t * stride_w_t + k * stride_w_k)
-
-        # Load expert_out_sorted[pos] for grad_w dot product.
-        row = tl.load(
-            eo_ptr + pos * stride_eo_m + offs_d * stride_eo_d,
-            mask=mask_d, other=0.0,
+        # Load grad_out[t] once per D tile and reuse it for all top-k slots.
+        go = tl.load(
+            go_ptr + t * stride_go_t + offs_d * stride_go_d, mask=mask_d, other=0.0,
         )
-        if FP32_ACCUM:
-            row = row.to(tl.float32)
+        go_acc = go.to(tl.float32) if FP32_ACCUM else go
 
-        # grad_eo[pos] = grad_out * w * scale  (implicit fp32→bf16 cast on store)
-        val = go * w * scale
-        tl.store(
-            ge_ptr + pos * stride_ge_m + offs_d * stride_ge_d, val, mask=mask_d,
-        )
+        for k in range(TOP_K):
+            pos_k = tl.load(inv_ptr + t * stride_inv_t + k * stride_inv_k).to(tl.int64)
+            weight_k = tl.load(w_ptr + t * stride_w_t + k * stride_w_k)
+            row = tl.load(
+                eo_ptr + pos_k * stride_eo_m + offs_d * stride_eo_d,
+                mask=mask_d, other=0.0,
+            )
+            row_acc = row.to(tl.float32) if FP32_ACCUM else row
 
-        # grad_w[t,k] = dot(grad_out, expert_out[pos]) * scale
-        dot = tl.sum(go * row, axis=0)
-        tl.store(gw_ptr + t * stride_gw_t + k * stride_gw_k, dot * scale)
+            # grad_eo[pos] = grad_out * weight * scale.
+            val = go * weight_k * scale
+            tl.store(
+                ge_ptr + pos_k * stride_ge_m + offs_d * stride_ge_d,
+                val,
+                mask=mask_d,
+            )
+
+            # Accumulate the grad_w dot product across D tiles without leaving
+            # the fused backward kernel.
+            dot = tl.sum(go_acc * row_acc, axis=0)
+            grad_w_acc += tl.where(offs_k == k, dot, 0.0)
+
+    tl.store(
+        gw_ptr + t * stride_gw_t + offs_k * stride_gw_k,
+        grad_w_acc * scale,
+        mask=mask_k,
+    )
 
 
-# ── Eager fallbacks (CPU + C > 1024 CUDA) ────────────────────────────────────
+# ── Autotuned kernel wrappers ────────────────────────────────────────────────
+# Wrap the same @triton.jit kernels with triton.autotune to benchmark
+# BLOCK_D / num_warps / num_stages.  Other constexprs (TOP_K, FP32_ACCUM,
+# TOP_K_PAD) are passed through unchanged at call time.
+
+_moe_gather_combine_fwd_at = triton.autotune(
+    configs=_MOE_GC_FWD_CONFIGS, key=["C"], cache_results=True,
+)(_moe_gather_combine_fwd_kernel)
+
+_moe_gather_combine_bwd_at = triton.autotune(
+    configs=_MOE_GC_BWD_CONFIGS, key=["C"], cache_results=True,
+)(_moe_gather_combine_bwd_fused_kernel)
+
+
+# ── Eager fallbacks (CPU only) ───────────────────────────────────────────────
 
 
 def _gather_combine_fwd_eager(expert_out_sorted, inv_map, weights, scale):
@@ -353,26 +516,48 @@ def _launch_gather_combine_triton(expert_out_sorted, inv_map, weights, scale):
     out_dtype = torch.float32 if fp32_accum else torch.float64
 
     output = torch.empty(T, C, dtype=out_dtype, device=expert_out_sorted.device)
-    BLOCK_D = triton.next_power_of_2(C)
 
-    _moe_gather_combine_fwd_kernel[(T,)](
-        expert_out_sorted, inv_map, weights, output,
-        scale, C,
-        expert_out_sorted.stride(0), expert_out_sorted.stride(1),
-        inv_map.stride(0), inv_map.stride(1),
-        weights.stride(0), weights.stride(1),
-        output.stride(0), output.stride(1),
-        BLOCK_D=BLOCK_D, TOP_K=top_k, FP32_ACCUM=fp32_accum,
-        num_warps=4, num_stages=1,
-    )
+    if _moe_autotune_enabled():
+        autotuner = _moe_gather_combine_fwd_at
+        status = _moe_autotune_status_begin(
+            kernel_name="moe_gc_fwd",
+            autotuner=autotuner,
+            args_by_name={"C": C, "eo_ptr": expert_out_sorted},
+        )
+        autotuner[(T,)](
+            expert_out_sorted, inv_map, weights, output,
+            scale, C,
+            expert_out_sorted.stride(0), expert_out_sorted.stride(1),
+            inv_map.stride(0), inv_map.stride(1),
+            weights.stride(0), weights.stride(1),
+            output.stride(0), output.stride(1),
+            TOP_K=top_k, FP32_ACCUM=fp32_accum,
+        )
+        _moe_autotune_status_end(kernel_name="moe_gc_fwd", autotuner=autotuner, state=status)
+    else:
+        cc_major = torch.cuda.get_device_capability()[0]
+        if C < 256:
+            BLOCK_D = triton.next_power_of_2(C)
+            num_warps = 4
+        elif cc_major >= 9:  # SM90 (Hopper), SM120 (Blackwell)
+            BLOCK_D, num_warps = 256, 8
+        else:  # SM80 (Ampere) and older
+            BLOCK_D, num_warps = 256, 4
+        _moe_gather_combine_fwd_kernel[(T,)](
+            expert_out_sorted, inv_map, weights, output,
+            scale, C,
+            expert_out_sorted.stride(0), expert_out_sorted.stride(1),
+            inv_map.stride(0), inv_map.stride(1),
+            weights.stride(0), weights.stride(1),
+            output.stride(0), output.stride(1),
+            BLOCK_D=BLOCK_D, TOP_K=top_k, FP32_ACCUM=fp32_accum,
+            num_warps=num_warps, num_stages=2,
+        )
     return output
 
 
 @torch.library.impl(_lib, "gather_combine", "CUDA")
 def _gather_combine_cuda(expert_out_sorted, inv_map, weights, scale):
-    C = expert_out_sorted.shape[1]
-    if C > 1024:
-        return _gather_combine_fwd_eager(expert_out_sorted, inv_map, weights, scale)
     return _launch_gather_combine_triton(expert_out_sorted, inv_map, weights, scale)
 
 
@@ -404,28 +589,51 @@ def _gather_combine_bwd_cuda(
     C = grad_out.shape[1]
     out_dtype = _INT_TO_DTYPE[eo_dtype]
     fp32_accum = out_dtype != torch.float64
+    TOP_K_PAD = triton.next_power_of_2(top_k)
 
-    if C > 1024:
-        return _gather_combine_bwd_eager(
-            grad_out, expert_out_sorted, inv_map, weights, scale, M, out_dtype,
-        )
-
-    BLOCK_D = triton.next_power_of_2(C)
     grad_eo = torch.empty(M, C, dtype=out_dtype, device=grad_out.device)
     grad_w = torch.empty(T, top_k, dtype=grad_out.dtype, device=grad_out.device)
 
-    _moe_gather_combine_bwd_fused_kernel[(T,)](
-        grad_out, expert_out_sorted, inv_map, weights, grad_eo, grad_w,
-        scale, C,
-        grad_out.stride(0), grad_out.stride(1),
-        expert_out_sorted.stride(0), expert_out_sorted.stride(1),
-        inv_map.stride(0), inv_map.stride(1),
-        weights.stride(0), weights.stride(1),
-        grad_eo.stride(0), grad_eo.stride(1),
-        grad_w.stride(0), grad_w.stride(1),
-        BLOCK_D=BLOCK_D, TOP_K=top_k, FP32_ACCUM=fp32_accum,
-        num_warps=4, num_stages=1,
-    )
+    if _moe_autotune_enabled():
+        autotuner = _moe_gather_combine_bwd_at
+        status = _moe_autotune_status_begin(
+            kernel_name="moe_gc_bwd",
+            autotuner=autotuner,
+            args_by_name={"C": C, "go_ptr": grad_out},
+        )
+        autotuner[(T,)](
+            grad_out, expert_out_sorted, inv_map, weights, grad_eo, grad_w,
+            scale, C,
+            grad_out.stride(0), grad_out.stride(1),
+            expert_out_sorted.stride(0), expert_out_sorted.stride(1),
+            inv_map.stride(0), inv_map.stride(1),
+            weights.stride(0), weights.stride(1),
+            grad_eo.stride(0), grad_eo.stride(1),
+            grad_w.stride(0), grad_w.stride(1),
+            TOP_K=top_k, TOP_K_PAD=TOP_K_PAD, FP32_ACCUM=fp32_accum,
+        )
+        _moe_autotune_status_end(kernel_name="moe_gc_bwd", autotuner=autotuner, state=status)
+    else:
+        cc_major = torch.cuda.get_device_capability()[0]
+        if C < 128:
+            BLOCK_D = triton.next_power_of_2(C)
+            num_warps = 2
+        elif cc_major >= 9:  # SM90 (Hopper), SM120 (Blackwell)
+            BLOCK_D, num_warps = 128, 4
+        else:  # SM80 (Ampere) and older
+            BLOCK_D, num_warps = 128, 4
+        _moe_gather_combine_bwd_fused_kernel[(T,)](
+            grad_out, expert_out_sorted, inv_map, weights, grad_eo, grad_w,
+            scale, C,
+            grad_out.stride(0), grad_out.stride(1),
+            expert_out_sorted.stride(0), expert_out_sorted.stride(1),
+            inv_map.stride(0), inv_map.stride(1),
+            weights.stride(0), weights.stride(1),
+            grad_eo.stride(0), grad_eo.stride(1),
+            grad_w.stride(0), grad_w.stride(1),
+            BLOCK_D=BLOCK_D, TOP_K=top_k, TOP_K_PAD=TOP_K_PAD, FP32_ACCUM=fp32_accum,
+            num_warps=num_warps, num_stages=2,
+        )
     return grad_eo, grad_w
 
 

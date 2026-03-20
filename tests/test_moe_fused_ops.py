@@ -193,6 +193,54 @@ def test_gather_combine_output_dtype(device):
     assert out.dtype == torch.float32
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_gather_combine_large_hidden_dim_cuda():
+    """Fused CUDA path should handle research-scale hidden dims without eager fallback."""
+    T, top_k, C, E = 64, 2, 4096, 8
+    scale = 1.25
+    *_, inv_map, weights, _ = _make_test_data(T, top_k, C, E, torch.bfloat16, "cuda")
+    eo = torch.randn(T * top_k, C, device="cuda", dtype=torch.bfloat16)
+
+    eo1 = eo.clone().detach().requires_grad_(True)
+    w1 = weights.clone().detach().requires_grad_(True)
+    out1 = moe_gather_combine(eo1, inv_map, w1, scale)
+    out1.square().mean().backward()
+
+    eo2 = eo.clone().detach().requires_grad_(True)
+    w2 = weights.clone().detach().requires_grad_(True)
+    ref = _gather_combine_reference(eo2, inv_map, w2, scale)
+    ref.square().mean().backward()
+
+    assert out1.shape == ref.shape
+    assert out1.dtype == ref.dtype == torch.float32
+    assert torch.allclose(out1, ref, atol=2e-3, rtol=2e-3)
+    assert torch.allclose(eo1.grad.float(), eo2.grad.float(), atol=2e-3, rtol=2e-3)
+    assert torch.allclose(w1.grad.float(), w2.grad.float(), atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_gather_combine_non_power_of_two_topk_cuda():
+    """Fused backward must support MoE top-k values like 3, not just powers of two."""
+    T, top_k, C, E = 64, 3, 1024, 8
+    scale = 1.0
+    *_, inv_map, weights, _ = _make_test_data(T, top_k, C, E, torch.bfloat16, "cuda")
+    eo = torch.randn(T * top_k, C, device="cuda", dtype=torch.bfloat16)
+
+    eo1 = eo.clone().detach().requires_grad_(True)
+    w1 = weights.clone().detach().requires_grad_(True)
+    out1 = moe_gather_combine(eo1, inv_map, w1, scale)
+    out1.square().mean().backward()
+
+    eo2 = eo.clone().detach().requires_grad_(True)
+    w2 = weights.clone().detach().requires_grad_(True)
+    ref = _gather_combine_reference(eo2, inv_map, w2, scale)
+    ref.square().mean().backward()
+
+    assert torch.allclose(out1, ref, atol=2e-3, rtol=2e-3)
+    assert torch.allclose(eo1.grad.float(), eo2.grad.float(), atol=2e-3, rtol=2e-3)
+    assert torch.allclose(w1.grad.float(), w2.grad.float(), atol=2e-3, rtol=2e-3)
+
+
 # ── build_inverse_map test ───────────────────────────────────────────────────
 
 
