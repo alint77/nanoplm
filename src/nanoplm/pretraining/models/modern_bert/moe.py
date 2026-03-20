@@ -19,9 +19,7 @@ from .moe_grouped_gemm_ops import moe_grouped_gemm
 from .moe_triton_ops import (
     build_inverse_map,
     moe_gather_combine,
-    moe_permute,
     moe_scatter_dispatch,
-    moe_unpermute,
 )
 
 
