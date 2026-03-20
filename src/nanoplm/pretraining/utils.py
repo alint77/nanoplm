@@ -160,6 +160,10 @@ def prepare_run_and_steps(
     """
     ckp_root = Path(pretrain_config.ckp_dir)
 
+    explicit_wandb_name = getattr(pretrain_config, "wandb_run_name", None)
+    if isinstance(explicit_wandb_name, str):
+        explicit_wandb_name = explicit_wandb_name.strip() or None
+
     # Determine run directory and name
     if resume_config and resume_config.is_resume:
         checkpoint_path = Path(resume_config.checkpoint_dir)
@@ -181,7 +185,8 @@ def prepare_run_and_steps(
         counter_file.write_text(str(resume_counter), encoding="utf-8")
 
         # Create W&B run name with counter
-        wandb_run_name = f"{run_name}-re{resume_counter}"
+        wandb_base = explicit_wandb_name or run_name
+        wandb_run_name = f"{wandb_base}-re{resume_counter}"
         logger.info(f"Resume session #{resume_counter}: W&B run name = {wandb_run_name}")
 
         # Archive any future checkpoints to prevent conflicts
@@ -205,7 +210,7 @@ def prepare_run_and_steps(
                 suffix += 1
         run_name = candidate
         run_root = ckp_root / run_name
-        wandb_run_name = run_name  # Same as directory name for new runs
+        wandb_run_name = explicit_wandb_name or run_name
         resume_step = None
 
     create_dirs(str(run_root))
