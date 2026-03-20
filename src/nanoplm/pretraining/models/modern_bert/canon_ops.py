@@ -16,6 +16,11 @@ because ``torch.library.register_autograd`` hooks into the same
 
 from __future__ import annotations
 
+import os
+import threading
+from contextlib import contextmanager
+from typing import Any
+
 import torch
 import torch.library
 import triton
@@ -56,9 +61,88 @@ def _bwd_dw_db_fake(grad_out, x, seq_id, radius):
     return grad_w, grad_b
 
 
+# ── Autotune control ─────────────────────────────────────────────────────
+
+_AUTOTUNE_CONTROL = threading.local()
+
+
+def _autotune_disable_depth() -> int:
+    return int(getattr(_AUTOTUNE_CONTROL, "disable_depth", 0))
+
+
+@contextmanager
+def disable_autotune_temporarily():
+    """Temporarily force the fallback (hardcoded block-size) launch path."""
+    _AUTOTUNE_CONTROL.disable_depth = _autotune_disable_depth() + 1
+    try:
+        yield
+    finally:
+        _AUTOTUNE_CONTROL.disable_depth = max(0, _autotune_disable_depth() - 1)
+
+
+def _autotune_enabled() -> bool:
+    v = os.getenv("NANOPLM_CANON_TRITON_AUTOTUNE", "1").strip().lower()
+    return v not in {"0", "false", "off", "no"} and _autotune_disable_depth() == 0
+
+
+def _autotune_status_enabled() -> bool:
+    v = os.getenv("NANOPLM_CANON_TRITON_AUTOTUNE_STATUS", "1").strip().lower()
+    return v not in {"0", "false", "off", "no"}
+
+
+_AUTOTUNE_STATUS_SEEN: set[tuple[str, tuple[Any, ...]]] = set()
+
+
+def _autotune_status_begin(
+    *, kernel_name: str, autotuner: Any, args_by_name: dict[str, Any],
+) -> tuple[tuple[Any, ...], bool, Any] | None:
+    if not _autotune_status_enabled():
+        return None
+    key: list[Any] = []
+    for name in getattr(autotuner, "keys", ()):
+        if name in args_by_name:
+            key.append(args_by_name[name])
+    tkey = tuple(key)
+    tag = (kernel_name, tkey)
+    if tag in _AUTOTUNE_STATUS_SEEN:
+        return None
+    _AUTOTUNE_STATUS_SEEN.add(tag)
+
+    in_mem_hit = tkey in getattr(autotuner, "cache", {})
+    bench_before = getattr(autotuner, "bench_time", None)
+    if in_mem_hit:
+        cfg = autotuner.cache[tkey]
+        print(f"[nanoplm][triton] autotune cache hit: {kernel_name} key={tkey} cfg={cfg}", flush=True)
+    else:
+        num_cfgs = len(getattr(autotuner, "configs", ()))
+        print(
+            f"[nanoplm][triton] resolving autotune config: {kernel_name} key={tkey} "
+            f"(may benchmark up to {num_cfgs} configs on first run)",
+            flush=True,
+        )
+    return tkey, in_mem_hit, bench_before
+
+
+def _autotune_status_end(
+    *, kernel_name: str, autotuner: Any, state: tuple[tuple[Any, ...], bool, Any] | None,
+) -> None:
+    if not _autotune_status_enabled() or state is None:
+        return
+    tkey, in_mem_hit, bench_before = state
+    if in_mem_hit:
+        return
+    bench_after = getattr(autotuner, "bench_time", None)
+    ran_benchmark = bench_after is not None and bench_after != bench_before
+    cfg = getattr(autotuner, "cache", {}).get(tkey, getattr(autotuner, "best_config", None))
+    if ran_benchmark:
+        print(f"[nanoplm][triton] autotune finished: {kernel_name} selected={cfg}", flush=True)
+    else:
+        print(f"[nanoplm][triton] autotune loaded from disk cache: {kernel_name} selected={cfg}", flush=True)
+
+
 # ── CUDA implementations ─────────────────────────────────────────────────
 
-# Per-kernel block sizes tuned on RTX 5090 (T=65536, C=768, K=7, bf16).
+# Fallback per-kernel block sizes tuned on RTX 5090 (T=65536, C=768, K=7, bf16).
 _FWD_BLOCK_T, _FWD_BLOCK_C = 64, 128        # 78% roofline
 _BWD_DX_BLOCK_T, _BWD_DX_BLOCK_C = 32, 128  # 83% roofline
 _BWD_DW_BLOCK_T, _BWD_DW_BLOCK_C = 256, 64  # 48% roofline (atomic_add bound)
@@ -79,24 +163,31 @@ def _fwd_cuda(x, seq_id, weight, bias, radius):
     fp32_acc = _needs_fp32_accum(x.dtype)
 
     out = torch.empty_like(x)
-    grid = (triton.cdiv(T, _FWD_BLOCK_T), triton.cdiv(C, _FWD_BLOCK_C))
-    k._canon_fwd_kernel[grid](
-        x,
-        seq_id,
-        weight,
-        bias,
-        out,
-        T,
-        C,
-        x.stride(0),
-        x.stride(1),
-        RADIUS=radius,
-        BLOCK_T=_FWD_BLOCK_T,
-        BLOCK_C=_FWD_BLOCK_C,
-        FP32_ACCUM=fp32_acc,
-        num_warps=4,
-        num_stages=2,
-    )
+    if _autotune_enabled():
+        autotuner = k._canon_fwd_kernel_autotuned
+        status = _autotune_status_begin(
+            kernel_name="canon_fwd", autotuner=autotuner,
+            args_by_name={"T": T, "C": C},
+        )
+        grid = lambda META: (triton.cdiv(T, META["BLOCK_T"]), triton.cdiv(C, META["BLOCK_C"]))
+        autotuner[grid](
+            x, seq_id, weight, bias, out,
+            T, C, x.stride(0), x.stride(1),
+            RADIUS=radius, FP32_ACCUM=fp32_acc,
+        )
+        _autotune_status_end(kernel_name="canon_fwd", autotuner=autotuner, state=status)
+    else:
+        grid = (triton.cdiv(T, _FWD_BLOCK_T), triton.cdiv(C, _FWD_BLOCK_C))
+        k._canon_fwd_kernel[grid](
+            x, seq_id, weight, bias, out,
+            T, C, x.stride(0), x.stride(1),
+            RADIUS=radius,
+            BLOCK_T=_FWD_BLOCK_T,
+            BLOCK_C=_FWD_BLOCK_C,
+            FP32_ACCUM=fp32_acc,
+            num_warps=4,
+            num_stages=2,
+        )
     return out
 
 
@@ -110,23 +201,31 @@ def _bwd_dx_cuda(grad_out, seq_id, weight, radius):
     fp32_acc = _needs_fp32_accum(grad_out.dtype)
 
     grad_x = torch.empty_like(grad_out)
-    grid = (triton.cdiv(T, _BWD_DX_BLOCK_T), triton.cdiv(C, _BWD_DX_BLOCK_C))
-    k._canon_bwd_dx_kernel[grid](
-        grad_out,
-        seq_id,
-        weight,
-        grad_x,
-        T,
-        C,
-        grad_out.stride(0),
-        grad_out.stride(1),
-        RADIUS=radius,
-        BLOCK_T=_BWD_DX_BLOCK_T,
-        BLOCK_C=_BWD_DX_BLOCK_C,
-        FP32_ACCUM=fp32_acc,
-        num_warps=4,
-        num_stages=2,
-    )
+    if _autotune_enabled():
+        autotuner = k._canon_bwd_dx_kernel_autotuned
+        status = _autotune_status_begin(
+            kernel_name="canon_bwd_dx", autotuner=autotuner,
+            args_by_name={"T": T, "C": C},
+        )
+        grid = lambda META: (triton.cdiv(T, META["BLOCK_T"]), triton.cdiv(C, META["BLOCK_C"]))
+        autotuner[grid](
+            grad_out, seq_id, weight, grad_x,
+            T, C, grad_out.stride(0), grad_out.stride(1),
+            RADIUS=radius, FP32_ACCUM=fp32_acc,
+        )
+        _autotune_status_end(kernel_name="canon_bwd_dx", autotuner=autotuner, state=status)
+    else:
+        grid = (triton.cdiv(T, _BWD_DX_BLOCK_T), triton.cdiv(C, _BWD_DX_BLOCK_C))
+        k._canon_bwd_dx_kernel[grid](
+            grad_out, seq_id, weight, grad_x,
+            T, C, grad_out.stride(0), grad_out.stride(1),
+            RADIUS=radius,
+            BLOCK_T=_BWD_DX_BLOCK_T,
+            BLOCK_C=_BWD_DX_BLOCK_C,
+            FP32_ACCUM=fp32_acc,
+            num_warps=4,
+            num_stages=2,
+        )
     return grad_x
 
 
@@ -145,24 +244,31 @@ def _bwd_dw_db_cuda(grad_out, x, seq_id, radius):
     grad_w = torch.zeros(C, K, dtype=acc_dtype, device=x.device)
     grad_b = torch.zeros(C, dtype=acc_dtype, device=x.device)
 
-    grid = (triton.cdiv(T, _BWD_DW_BLOCK_T), triton.cdiv(C, _BWD_DW_BLOCK_C))
-    k._canon_bwd_dw_db_kernel[grid](
-        grad_out,
-        x,
-        seq_id,
-        grad_w,
-        grad_b,
-        T,
-        C,
-        grad_out.stride(0),
-        grad_out.stride(1),
-        RADIUS=radius,
-        BLOCK_T=_BWD_DW_BLOCK_T,
-        BLOCK_C=_BWD_DW_BLOCK_C,
-        FP32_ACCUM=fp32_acc,
-        num_warps=4,
-        num_stages=2,
-    )
+    if _autotune_enabled():
+        autotuner = k._canon_bwd_dw_db_kernel_autotuned
+        status = _autotune_status_begin(
+            kernel_name="canon_bwd_dw_db", autotuner=autotuner,
+            args_by_name={"T": T, "C": C},
+        )
+        grid = lambda META: (triton.cdiv(T, META["BLOCK_T"]), triton.cdiv(C, META["BLOCK_C"]))
+        autotuner[grid](
+            grad_out, x, seq_id, grad_w, grad_b,
+            T, C, grad_out.stride(0), grad_out.stride(1),
+            RADIUS=radius, FP32_ACCUM=fp32_acc,
+        )
+        _autotune_status_end(kernel_name="canon_bwd_dw_db", autotuner=autotuner, state=status)
+    else:
+        grid = (triton.cdiv(T, _BWD_DW_BLOCK_T), triton.cdiv(C, _BWD_DW_BLOCK_C))
+        k._canon_bwd_dw_db_kernel[grid](
+            grad_out, x, seq_id, grad_w, grad_b,
+            T, C, grad_out.stride(0), grad_out.stride(1),
+            RADIUS=radius,
+            BLOCK_T=_BWD_DW_BLOCK_T,
+            BLOCK_C=_BWD_DW_BLOCK_C,
+            FP32_ACCUM=fp32_acc,
+            num_warps=4,
+            num_stages=2,
+        )
     return grad_w, grad_b
 
 

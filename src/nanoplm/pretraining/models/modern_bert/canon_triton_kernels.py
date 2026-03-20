@@ -21,6 +21,63 @@ import triton
 import triton.language as tl
 
 
+# ── Autotune configurations ──────────────────────────────────────────────
+
+
+def _autotune_configs(
+    *,
+    block_ts: tuple[int, ...],
+    block_cs: tuple[int, ...],
+    warps: tuple[int, ...],
+    stages: tuple[int, ...],
+) -> list[triton.Config]:
+    return [
+        triton.Config(
+            {"BLOCK_T": bt, "BLOCK_C": bc},
+            num_warps=nw,
+            num_stages=ns,
+        )
+        for bt in block_ts
+        for bc in block_cs
+        for nw in warps
+        for ns in stages
+    ]
+
+
+_AUTOTUNE_FWD_CONFIGS = _autotune_configs(
+    block_ts=(32, 64, 128),
+    block_cs=(64, 128),
+    warps=(4, 8),
+    stages=(2, 3),
+)
+
+_AUTOTUNE_BWD_DX_CONFIGS = _autotune_configs(
+    block_ts=(32, 64, 128),
+    block_cs=(64, 128),
+    warps=(4, 8),
+    stages=(2, 3),
+)
+
+def _bwd_dw_db_pre_hook(nargs):
+    """Zero accumulator buffers before each autotune trial."""
+    nargs["grad_w_ptr"].zero_()
+    nargs["grad_b_ptr"].zero_()
+
+
+_AUTOTUNE_BWD_DW_DB_CONFIGS = [
+    triton.Config(
+        {"BLOCK_T": bt, "BLOCK_C": bc},
+        num_warps=nw,
+        num_stages=ns,
+        pre_hook=_bwd_dw_db_pre_hook,
+    )
+    for bt in (64, 128, 256)
+    for bc in (32, 64, 128)
+    for nw in (4, 8)
+    for ns in (2, 3)
+]
+
+
 # ── Forward kernel ────────────────────────────────────────────────────────
 
 
@@ -211,3 +268,60 @@ def _canon_bwd_dw_db_kernel(
 
         pw_k = tl.sum(go * x_val, axis=0)  # (BLOCK_C,)
         tl.atomic_add(grad_w_ptr + c_offs * K + k, pw_k, mask=c_mask)
+
+
+# ── Autotuned wrappers ──────────────────────────────────────────────────
+# Key includes T and C (problem size) so Triton caches per shape.
+# RADIUS is a constexpr passed through — each radius compiles a separate
+# kernel binary regardless, so it does not need to be in the key.
+
+
+@triton.autotune(configs=_AUTOTUNE_FWD_CONFIGS, key=["T", "C"], cache_results=True)
+@triton.jit
+def _canon_fwd_kernel_autotuned(
+    x_ptr, seq_id_ptr, weight_ptr, bias_ptr, out_ptr,
+    T, C, stride_t, stride_c,
+    RADIUS: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    FP32_ACCUM: tl.constexpr,
+):
+    _canon_fwd_kernel(
+        x_ptr, seq_id_ptr, weight_ptr, bias_ptr, out_ptr,
+        T, C, stride_t, stride_c,
+        RADIUS, BLOCK_T, BLOCK_C, FP32_ACCUM,
+    )
+
+
+@triton.autotune(configs=_AUTOTUNE_BWD_DX_CONFIGS, key=["T", "C"], cache_results=True)
+@triton.jit
+def _canon_bwd_dx_kernel_autotuned(
+    grad_out_ptr, seq_id_ptr, weight_ptr, grad_x_ptr,
+    T, C, stride_t, stride_c,
+    RADIUS: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    FP32_ACCUM: tl.constexpr,
+):
+    _canon_bwd_dx_kernel(
+        grad_out_ptr, seq_id_ptr, weight_ptr, grad_x_ptr,
+        T, C, stride_t, stride_c,
+        RADIUS, BLOCK_T, BLOCK_C, FP32_ACCUM,
+    )
+
+
+@triton.autotune(configs=_AUTOTUNE_BWD_DW_DB_CONFIGS, key=["T", "C"], cache_results=True)
+@triton.jit
+def _canon_bwd_dw_db_kernel_autotuned(
+    grad_out_ptr, x_ptr, seq_id_ptr, grad_w_ptr, grad_b_ptr,
+    T, C, stride_t, stride_c,
+    RADIUS: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    FP32_ACCUM: tl.constexpr,
+):
+    _canon_bwd_dw_db_kernel(
+        grad_out_ptr, x_ptr, seq_id_ptr, grad_w_ptr, grad_b_ptr,
+        T, C, stride_t, stride_c,
+        RADIUS, BLOCK_T, BLOCK_C, FP32_ACCUM,
+    )
