@@ -107,22 +107,118 @@ The `bwd_dw_db` kernel is limited by `tl.atomic_add` contention from
 `ceil(T/BLOCK_T)` blocks writing to the same `(C, K)` output. Larger `BLOCK_T`
 reduces the number of atomic writers per output element.
 
-## Benchmark results
+## Results
 
-Compiled benchmark (`torch.compile`, T=65536, C=768, K=7, 256 seqs, bf16, RTX 5090):
+### Isolated benchmark
 
-| Metric | Reference (compiled) | Triton (tuned) | Speedup |
-|--------|---------------------|----------------|---------|
-| Forward | 0.315 ms (36% eff) | 0.212 ms (53% eff) | 1.49× |
-| Backward | 0.978 ms (23% eff) | 0.505 ms (45% eff) | 1.94× |
-| Fwd+Bwd | 1.292 ms (26% eff) | 0.716 ms (47% eff) | 1.80× |
+Compiled microbenchmark (`torch.compile`, T=65536, C=768, K=7, 256 seqs, bf16, RTX 5090):
 
-### Per-step projection (24 Canon calls)
+| Metric | Reference (compiled) | Triton (autotuned) | Speedup |
+|--------|---------------------|-------------------|---------|
+| Forward | 0.315 ms (36% eff) | 0.200 ms (56% eff) | 1.58× |
+| Backward | 0.985 ms (23% eff) | 0.491 ms (46% eff) | 2.01× |
+| Fwd+Bwd | 1.300 ms (26% eff) | 0.691 ms (49% eff) | 1.88× |
 
-| | Reference | Triton | Delta |
-|--|-----------|--------|-------|
-| Canon overhead | 31.0 ms | 17.2 ms | −13.8 ms |
-| % of base step (573 ms) | 5.4% | 3.0% | −2.4 pp |
+Autotune selected configs (T=65536, C=768):
+
+| Kernel | BLOCK_T | BLOCK_C | warps | stages |
+|--------|---------|---------|-------|--------|
+| fwd | 32 | 128 | 8 | 2 |
+| bwd_dx | 32 | 128 | 4 | 3 |
+| bwd_dw_db | 256 | 64 | 4 | 3 |
+
+### Training trace comparison (before/after)
+
+Profiler traces from real 2×H100 FSDP training (T=65536, C=768, K=7, bf16, grad_accum=2,
+activation checkpointing enabled, `torch.compile mode=max-autotune-no-cudagraphs`).
+
+- **Before** — `run-20030051`: roll-based `_varlen_canon_inner`, step time ~567 ms, 10.7 MFU%
+- **After** — `run-20030054`: Triton `varlen_canon_conv` with autotune, step time ~498 ms, 12.1 MFU%
+
+#### GPU kernel time breakdown (8 profiled steps)
+
+| Metric | Before | After | Delta |
+|--------|--------|-------|-------|
+| Total GPU kernel time | 2593.7 ms | 2502.9 ms | −90.8 ms |
+| Canon kernel time | 544.0 ms (21.0%) | 134.4 ms (5.4%) | **−409.6 ms** |
+| LayerNorm fused w/ roll | 381.1 ms (14.7%) | 0 ms | **−381.1 ms** |
+| LayerNorm (clean) | 58.5 ms (2.3%) | 139.7 ms (5.6%) | +81.3 ms |
+| **Canon + LN combined** | **983.6 ms (37.9%)** | **274.1 ms (11.0%)** | **−709.4 ms** |
+
+The roll-based backward caused Inductor to fuse Canon with LayerNorm into pathological
+combined kernels (`triton_per_fused_..._native_layer_norm_backward_roll_select_*`), each
+running ~1.6 ms. These 381 ms of fused LN+roll kernels **vanish entirely** with the Triton
+op approach. LayerNorm reverts to its clean ~140 ms baseline, and the three Canon kernels
+run in a combined 134 ms — a **3.6× reduction** in Canon+LN GPU time.
+
+#### Per-kernel timing in training
+
+| Kernel | Count | Avg (μs) | Total (ms) | % GPU |
+|--------|-------|----------|------------|-------|
+| `_canon_fwd_kernel_autotuned` | 405 | 138 | 56.1 | 2.2% |
+| `_canon_bwd_dx_kernel_autotuned` | 213 | 115 | 24.4 | 1.0% |
+| `_canon_bwd_dw_db_kernel_autotuned` | 213 | 253 | 54.0 | 2.2% |
+
+Training kernels run ~30% faster than isolated benchmarks (GPU pipeline already saturated,
+overlapping compute/memory from surrounding ops).
+
+#### Neighboring kernels in training
+
+**Forward path** (most common pattern, 96 occurrences):
+```
+LayerNorm → canon_fwd → residual_add (triton_poi_fused_add)
+```
+
+**Backward path** (consistent across all 213 occurrences):
+```
+GEMM → canon_bwd_dx → 4× FillFunctor(zeros) → canon_bwd_dw_db → dtype_cast (fp32→bf16)
+```
+
+#### Wall-clock step time
+
+| | Before | After | Delta |
+|--|--------|-------|-------|
+| Steady-state step time | ~567 ms | ~498 ms | **−69 ms (−12.2%)** |
+| Throughput (tok/s) | ~462K | ~526K | **+64K (+13.9%)** |
+| H100 MFU | 10.7% | 12.1% | +1.4 pp |
+
+The 69 ms/step improvement exceeds the isolated Canon-only savings (~15 ms) because
+eliminating the pathological backward fusion also unblocks Inductor from generating
+better code for the surrounding LayerNorm and residual ops.
+
+#### Top 5 kernels by GPU time
+
+**Before (roll-based):**
+| Rank | % GPU | Kernel |
+|------|-------|--------|
+| 1 | 6.8% | `triton_red_fused__to_copy_mul_sum_7` (reduction) |
+| 2 | 6.7% | cutlass GEMM (64×128) |
+| 3 | 6.6% | cutlass GEMM (128×64) |
+| 4 | **6.1%** | `triton_per_fused_..._layer_norm_backward_roll_select_6` **(pathological)** |
+| 5 | 5.7% | `triton_tem_fused_mm_t_4` (matmul) |
+
+**After (Triton Canon):**
+| Rank | % GPU | Kernel |
+|------|-------|--------|
+| 1 | 13.3% | NCCL ReduceScatter |
+| 2 | 7.1% | cutlass GEMM (64×128) |
+| 3 | 7.0% | cutlass GEMM (128×64) |
+| 4 | 6.6% | `triton_tem_fused_mm_t_4` (matmul) |
+| 5 | 5.1% | cutlass GEMM (128×128) |
+
+Canon drops entirely out of the top 10. The profile is now dominated by GEMMs and NCCL
+collectives — the expected profile for a well-optimized transformer.
+
+### Remaining fusion opportunities
+
+1. **LayerNorm → canon_fwd** (96 occurrences): fusing would eliminate one kernel launch +
+   one intermediate (T,C) store/load = 100 MB round-trip, saving ~50-80 μs/call.
+2. **bwd_dx + bwd_dw_db merge**: both read `grad_out`; merging saves one 100 MB pass
+   (~56 μs). Risk: register pressure from combining both accumulation patterns.
+3. **Absorb zero-fill into bwd_dw_db**: 4 tiny `FillFunctor` kernels (1 μs each) precede
+   every `bwd_dw_db` call. Moving the zeroing into the Triton kernel eliminates 4 launch
+   overheads per call.
+4. **Fuse bwd_dw_db → dtype_cast**: the fp32→bf16 weight grad cast could be done in-kernel.
 
 ## Correctness
 
