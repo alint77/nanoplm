@@ -1259,6 +1259,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  world_size: 'auto'\n"
         "  ddp_bucket_cap_mb: 25  # only used when distributed_mode: ddp in pure_torch/pure_te; HF path ignores it\n"
         "  project_name: \"nanoplm-pretraining\"\n"
+        "  wandb_run_name: null  # optional: explicit W&B run display name\n"
         "  profiler_enabled: false\n"
         "  profiler_start_step: 10\n"
         "  profiler_end_step: 15\n"

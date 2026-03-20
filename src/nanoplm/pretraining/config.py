@@ -109,6 +109,9 @@ class PretrainingConfig:
     fsdp_shard_granularity: str = "layer"
     ddp_bucket_cap_mb: int = 25
     project_name: str = "nanoplm-pretraining"
+    # Optional explicit W&B run name. If set, overrides the default "run-DDMMHHMM"
+    # naming. When resuming, "-reN" is appended to avoid clobbering the original run.
+    wandb_run_name: Optional[str] = None
 
 
 @dataclass
