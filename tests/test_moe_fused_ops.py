@@ -220,10 +220,6 @@ def test_build_inverse_map():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_moe_layer_integration():
     """Full MoE layer forward+backward matches eager reference."""
-    from nanoplm.pretraining.models.modern_bert.moe_triton_ops import (
-        moe_permute,
-        moe_unpermute,
-    )
     from nanoplm.pretraining.models.modern_bert.moe_grouped_gemm_ops import (
         moe_grouped_gemm,
     )
@@ -257,16 +253,18 @@ def test_moe_layer_integration():
     out1 = moe_gather_combine(eo_sorted1, inv_map, w1, scale)
     out1.float().square().mean().backward()
 
-    # --- Eager path ---
+    # --- Eager reference path (pure PyTorch, no custom ops) ---
     x2 = x.clone().detach().requires_grad_(True)
     w2 = weights.clone().detach().requires_grad_(True)
     x_expanded = x2.repeat_interleave(top_k, dim=0)
-    x_sorted2 = moe_permute(x_expanded, sorted_idx)
+    x_sorted2 = x_expanded[sorted_idx]
     wi2 = moe_grouped_gemm(x_sorted2, Wi, counts)
     proj2, gate2 = wi2.chunk(2, dim=-1)
     act2 = torch.nn.functional.silu(gate2) * proj2
     eo_sorted2 = moe_grouped_gemm(act2, Wo, counts)
-    expert_out2 = moe_unpermute(eo_sorted2, sorted_idx)
+    # Unsort: place each sorted row back at its original position
+    expert_out2 = torch.empty_like(eo_sorted2)
+    expert_out2[sorted_idx] = eo_sorted2
     expert_out2 = expert_out2.view(T, top_k, C)
     out2 = (expert_out2 * w2.unsqueeze(-1) * scale).sum(dim=1)
     out2.float().square().mean().backward()
