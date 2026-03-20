@@ -22,6 +22,7 @@ from torch.utils.checkpoint import checkpoint as _checkpoint
 # Registers torch.ops.nanoplm_mhc::* used by MHCLiteBlock's Triton path.
 from . import mhc_triton_ops as _mhc_triton_ops  # noqa: F401
 # Registers torch.ops.nanoplm_canon::* — Triton varlen depthwise conv.
+from . import canon_ops as _canon_ops
 from .canon_ops import varlen_canon_conv as _varlen_canon_conv
 from .canon_ops import varlen_ln_canon_conv as _varlen_ln_canon_conv
 
@@ -601,7 +602,22 @@ class ModernBertCanonLayer(nn.Module):
             and torch.is_grad_enabled()
             and x.requires_grad
         )
+        # Eval/inference should avoid autotune warmup latency.
+        autotune_ctx = (
+            nullcontext()
+            if self.training
+            else _canon_ops.disable_autotune_temporarily()
+        )
 
+        with autotune_ctx:
+            return self._forward_dispatch(
+                x, position_ids=position_ids, cu_seqlens=cu_seqlens,
+                attention_mask=attention_mask, fuse_ln_weight=fuse_ln_weight,
+                fuse_ln_eps=fuse_ln_eps, use_ckpt=use_ckpt,
+            )
+
+    def _forward_dispatch(self, x, *, position_ids, cu_seqlens, attention_mask,
+                          fuse_ln_weight, fuse_ln_eps, use_ckpt):
         # Fused LN+Conv path (varlen multi-sequence only)
         if fuse_ln_weight is not None and cu_seqlens is not None:
             if use_ckpt:
