@@ -16,7 +16,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .moe_grouped_gemm_ops import moe_grouped_gemm
-from .moe_triton_ops import moe_permute, moe_unpermute
+from .moe_triton_ops import (
+    build_inverse_map,
+    moe_gather_combine,
+    moe_permute,
+    moe_scatter_dispatch,
+    moe_unpermute,
+)
 
 
 class Router(nn.Module):
@@ -246,8 +252,7 @@ class MoELayer(nn.Module):
         # --- routing ---
         weights, indices, z_loss, router_scores = self.router(x)  # (T, top_k), (T, top_k), scalar, (T, E)
 
-        # --- dispatch: expand, sort by expert, compute per-expert counts ---
-        x_expanded = x.repeat_interleave(self.top_k, dim=0)  # (T*top_k, H)
+        # --- dispatch: sort by expert, compute per-expert counts, fused gather ---
         expert_flat = indices.reshape(-1)  # (T*top_k,)
         if self._reuse_dispatch_workspaces:
             num_assignments = expert_flat.numel()
@@ -262,7 +267,10 @@ class MoELayer(nn.Module):
         else:
             sorted_idx = expert_flat.argsort(stable=True)
             counts = expert_flat.bincount(minlength=self.num_experts).to(torch.int64)
-        x_sorted = moe_permute(x_expanded, sorted_idx)  # (T*top_k, H)
+
+        token_idx = (sorted_idx // self.top_k).to(torch.int32)
+        slot_idx = (sorted_idx % self.top_k).to(torch.int32)
+        x_sorted = moe_scatter_dispatch(x, token_idx)  # (T*top_k, H)
 
         # Store for external bias-update logic.
         self.last_expert_counts = counts.detach().clone()
@@ -277,12 +285,11 @@ class MoELayer(nn.Module):
             counts,
         )  # (T*top_k, H)
 
-        # --- combine: unsort + weighted sum ---
-        expert_out = moe_unpermute(expert_out_sorted, sorted_idx)
-        expert_out = expert_out.view(T, self.top_k, H)
-        expert_out = (
-            expert_out * weights.unsqueeze(-1) * self.routed_scaling_factor
-        ).sum(dim=1)  # (T, H)
+        # --- combine: fused unsort + weighted sum ---
+        inv_map = build_inverse_map(token_idx, slot_idx, T, self.top_k)
+        expert_out = moe_gather_combine(
+            expert_out_sorted, inv_map, weights, self.routed_scaling_factor,
+        )  # (T, H)
 
         # --- auxiliary losses ---
         aux = torch.zeros(1, device=x.device, dtype=torch.float32)
