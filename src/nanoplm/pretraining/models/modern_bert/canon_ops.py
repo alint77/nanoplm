@@ -16,6 +16,7 @@ because ``torch.library.register_autograd`` hooks into the same
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 from contextlib import contextmanager
@@ -39,6 +40,24 @@ _lib.define(
     "varlen_conv_bwd_dw_db(Tensor grad_out, Tensor x, Tensor seq_id, int radius) -> (Tensor, Tensor)"
 )
 
+# Fused LayerNorm + Conv ops
+_lib.define(
+    "varlen_ln_conv_fwd(Tensor x, Tensor seq_id, Tensor ln_weight, float ln_eps, "
+    "Tensor conv_weight, Tensor conv_bias, int radius) -> (Tensor, Tensor, Tensor)"
+)
+_lib.define(
+    "varlen_ln_conv_bwd_dw_db(Tensor grad_out, Tensor x, Tensor seq_id, "
+    "Tensor ln_weight, Tensor mean, Tensor rstd, int radius) -> (Tensor, Tensor)"
+)
+_lib.define(
+    "varlen_ln_bwd_dx_dgamma(Tensor grad_ln_out, Tensor x, "
+    "Tensor mean, Tensor rstd, Tensor ln_weight) -> (Tensor, Tensor)"
+)
+_lib.define(
+    "varlen_ln_conv_bwd_dx_dgamma(Tensor grad_out, Tensor x, Tensor seq_id, "
+    "Tensor mean, Tensor rstd, Tensor ln_weight, Tensor conv_weight, int radius) -> (Tensor, Tensor)"
+)
+
 # ── FakeTensor implementations (for torch.compile shape inference) ────────
 
 
@@ -59,6 +78,39 @@ def _bwd_dw_db_fake(grad_out, x, seq_id, radius):
     grad_w = torch.empty(C, K, dtype=torch.float32, device=x.device)
     grad_b = torch.empty(C, dtype=torch.float32, device=x.device)
     return grad_w, grad_b
+
+
+@torch.library.register_fake("nanoplm_canon::varlen_ln_conv_fwd")
+def _ln_conv_fwd_fake(x, seq_id, ln_weight, ln_eps, conv_weight, conv_bias, radius):
+    T = x.shape[0]
+    out = torch.empty_like(x)
+    acc_dtype = torch.float32 if _needs_fp32_accum(x.dtype) else x.dtype
+    mean = torch.empty(T, dtype=acc_dtype, device=x.device)
+    rstd = torch.empty(T, dtype=acc_dtype, device=x.device)
+    return out, mean, rstd
+
+
+@torch.library.register_fake("nanoplm_canon::varlen_ln_conv_bwd_dw_db")
+def _ln_conv_bwd_dw_db_fake(grad_out, x, seq_id, ln_weight, mean, rstd, radius):
+    C = x.shape[1]
+    K = 2 * radius + 1
+    grad_w = torch.empty(C, K, dtype=torch.float32, device=x.device)
+    grad_b = torch.empty(C, dtype=torch.float32, device=x.device)
+    return grad_w, grad_b
+
+
+@torch.library.register_fake("nanoplm_canon::varlen_ln_bwd_dx_dgamma")
+def _ln_bwd_dx_dgamma_fake(grad_ln_out, x, mean, rstd, ln_weight):
+    grad_x = torch.empty_like(x)
+    grad_gamma = torch.empty_like(ln_weight)
+    return grad_x, grad_gamma
+
+
+@torch.library.register_fake("nanoplm_canon::varlen_ln_conv_bwd_dx_dgamma")
+def _ln_conv_bwd_dx_dgamma_fake(grad_out, x, seq_id, mean, rstd, ln_weight, conv_weight, radius):
+    grad_x = torch.empty_like(x)
+    grad_gamma = torch.empty_like(ln_weight)
+    return grad_x, grad_gamma
 
 
 # ── Autotune control ─────────────────────────────────────────────────────
@@ -272,6 +324,220 @@ def _bwd_dw_db_cuda(grad_out, x, seq_id, radius):
     return grad_w, grad_b
 
 
+# ── Fused LN+Conv CUDA implementations ────────────────────────────────────
+
+_LN_FWD_BLOCK_T, _LN_FWD_BLOCK_C = 64, 128
+_LN_BWD_DW_BLOCK_T, _LN_BWD_DW_BLOCK_C = 256, 64
+
+
+@torch.library.impl(_lib, "varlen_ln_conv_fwd", "CUDA")
+def _ln_conv_fwd_cuda(x, seq_id, ln_weight, ln_eps, conv_weight, conv_bias, radius):
+    from . import canon_triton_kernels as k
+
+    x = x.contiguous()
+    ln_weight = ln_weight.contiguous()
+    conv_weight = conv_weight.contiguous()
+    conv_bias = conv_bias.contiguous()
+    T, C = x.shape
+    fp32_acc = _needs_fp32_accum(x.dtype)
+
+    # One-pass stats kernel: single Triton kernel replaces x.to(fp32) + mean + var
+    BLOCK_N = triton.next_power_of_2(C)
+    acc_dtype = torch.float32 if fp32_acc else x.dtype
+    mean = torch.empty(T, dtype=acc_dtype, device=x.device)
+    rstd = torch.empty(T, dtype=acc_dtype, device=x.device)
+    if _autotune_enabled():
+        autotuner = k._ln_stats_kernel_autotuned
+        status = _autotune_status_begin(
+            kernel_name="canon_ln_stats", autotuner=autotuner,
+            args_by_name={"T": T, "C": C},
+        )
+        autotuner[(T,)](
+            x, mean, rstd,
+            T, C, x.stride(0), x.stride(1),
+            ln_eps, BLOCK_N=BLOCK_N, FP32_ACCUM=fp32_acc,
+        )
+        _autotune_status_end(kernel_name="canon_ln_stats", autotuner=autotuner, state=status)
+    else:
+        k._ln_stats_kernel[(T,)](
+            x, mean, rstd,
+            T, C, x.stride(0), x.stride(1),
+            ln_eps, BLOCK_N=BLOCK_N, FP32_ACCUM=fp32_acc,
+            num_warps=4,
+        )
+
+    out = torch.empty_like(x)
+    if _autotune_enabled():
+        autotuner = k._canon_ln_fwd_kernel_autotuned
+        status = _autotune_status_begin(
+            kernel_name="canon_ln_fwd", autotuner=autotuner,
+            args_by_name={"T": T, "C": C},
+        )
+        grid = lambda META: (triton.cdiv(T, META["BLOCK_T"]), triton.cdiv(C, META["BLOCK_C"]))
+        autotuner[grid](
+            x, seq_id, mean, rstd, ln_weight,
+            conv_weight, conv_bias, out,
+            T, C, x.stride(0), x.stride(1),
+            RADIUS=radius, FP32_ACCUM=fp32_acc,
+        )
+        _autotune_status_end(kernel_name="canon_ln_fwd", autotuner=autotuner, state=status)
+    else:
+        grid = (triton.cdiv(T, _LN_FWD_BLOCK_T), triton.cdiv(C, _LN_FWD_BLOCK_C))
+        k._canon_ln_fwd_kernel[grid](
+            x, seq_id, mean, rstd, ln_weight,
+            conv_weight, conv_bias, out,
+            T, C, x.stride(0), x.stride(1),
+            RADIUS=radius,
+            BLOCK_T=_LN_FWD_BLOCK_T,
+            BLOCK_C=_LN_FWD_BLOCK_C,
+            FP32_ACCUM=fp32_acc,
+            num_warps=4,
+            num_stages=2,
+        )
+    return out, mean, rstd
+
+
+@torch.library.impl(_lib, "varlen_ln_conv_bwd_dw_db", "CUDA")
+def _ln_conv_bwd_dw_db_cuda(grad_out, x, seq_id, ln_weight, mean, rstd, radius):
+    from . import canon_triton_kernels as k
+
+    grad_out = grad_out.contiguous()
+    x = x.contiguous()
+    ln_weight = ln_weight.contiguous()
+    T, C = x.shape
+    K = 2 * radius + 1
+    fp32_acc = _needs_fp32_accum(x.dtype)
+
+    acc_dtype = torch.float32 if fp32_acc else x.dtype
+    # Partial-buffer reduction: each T-block writes its partials, host sums.
+    _MIN_BLOCK_T = 64  # smallest BLOCK_T in autotune configs
+    max_t_blocks = triton.cdiv(T, _MIN_BLOCK_T)
+    partial_w = torch.zeros(max_t_blocks, C * K, dtype=acc_dtype, device=x.device)
+    partial_b = torch.zeros(max_t_blocks, C, dtype=acc_dtype, device=x.device)
+
+    if _autotune_enabled():
+        autotuner = k._canon_ln_bwd_dw_db_partial_kernel_autotuned
+        status = _autotune_status_begin(
+            kernel_name="canon_ln_bwd_dw_db", autotuner=autotuner,
+            args_by_name={"T": T, "C": C},
+        )
+        grid = lambda META: (triton.cdiv(T, META["BLOCK_T"]), triton.cdiv(C, META["BLOCK_C"]))
+        autotuner[grid](
+            grad_out, x, seq_id, mean, rstd, ln_weight,
+            partial_w, partial_b,
+            T, C, grad_out.stride(0), grad_out.stride(1),
+            RADIUS=radius, FP32_ACCUM=fp32_acc,
+        )
+        _autotune_status_end(kernel_name="canon_ln_bwd_dw_db", autotuner=autotuner, state=status)
+    else:
+        grid = (triton.cdiv(T, _LN_BWD_DW_BLOCK_T), triton.cdiv(C, _LN_BWD_DW_BLOCK_C))
+        k._canon_ln_bwd_dw_db_partial_kernel[grid](
+            grad_out, x, seq_id, mean, rstd, ln_weight,
+            partial_w, partial_b,
+            T, C, grad_out.stride(0), grad_out.stride(1),
+            RADIUS=radius,
+            BLOCK_T=_LN_BWD_DW_BLOCK_T,
+            BLOCK_C=_LN_BWD_DW_BLOCK_C,
+            FP32_ACCUM=fp32_acc,
+            num_warps=4,
+            num_stages=2,
+        )
+    # Reduce partial buffers
+    grad_w = partial_w.view(max_t_blocks, C, K).sum(0)
+    grad_b = partial_b.sum(0)
+    return grad_w, grad_b
+
+
+@torch.library.impl(_lib, "varlen_ln_bwd_dx_dgamma", "CUDA")
+def _ln_bwd_dx_dgamma_cuda(grad_ln_out, x, mean, rstd, ln_weight):
+    from . import canon_triton_kernels as k
+
+    grad_ln_out = grad_ln_out.contiguous()
+    x = x.contiguous()
+    ln_weight = ln_weight.contiguous()
+    T, C = x.shape
+    BLOCK_N = triton.next_power_of_2(C)
+    fp32_acc = _needs_fp32_accum(x.dtype)
+    acc_dtype = torch.float32 if fp32_acc else x.dtype
+
+    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count * 8
+    rows_per_program = math.ceil(T / sm_count)
+
+    grad_x = torch.empty_like(x)
+    partial_dgamma = torch.zeros(sm_count, C, dtype=acc_dtype, device=x.device)
+
+    if _autotune_enabled():
+        autotuner = k._ln_bwd_kernel_autotuned
+        status = _autotune_status_begin(
+            kernel_name="canon_ln_bwd", autotuner=autotuner,
+            args_by_name={"T": T, "C": C},
+        )
+        autotuner[(sm_count,)](
+            grad_ln_out, x, mean, rstd, ln_weight,
+            grad_x, partial_dgamma,
+            T, C, x.stride(0), x.stride(1),
+            rows_per_program, BLOCK_N=BLOCK_N, FP32_ACCUM=fp32_acc,
+        )
+        _autotune_status_end(kernel_name="canon_ln_bwd", autotuner=autotuner, state=status)
+    else:
+        k._ln_bwd_kernel[(sm_count,)](
+            grad_ln_out, x, mean, rstd, ln_weight,
+            grad_x, partial_dgamma,
+            T, C, x.stride(0), x.stride(1),
+            rows_per_program, BLOCK_N=BLOCK_N, FP32_ACCUM=fp32_acc,
+            num_warps=4,
+        )
+
+    grad_gamma = partial_dgamma.sum(0).to(ln_weight.dtype)
+    return grad_x, grad_gamma
+
+
+@torch.library.impl(_lib, "varlen_ln_conv_bwd_dx_dgamma", "CUDA")
+def _ln_conv_bwd_dx_dgamma_cuda(grad_out, x, seq_id, mean, rstd, ln_weight, conv_weight, radius):
+    """Fused conv_bwd_dx + add + ln_bwd in a single kernel launch."""
+    from . import canon_triton_kernels as k
+
+    grad_out = grad_out.contiguous()
+    x = x.contiguous()
+    ln_weight = ln_weight.contiguous()
+    conv_weight = conv_weight.contiguous()
+    T, C = x.shape
+    BLOCK_N = triton.next_power_of_2(C)
+    fp32_acc = _needs_fp32_accum(x.dtype)
+    acc_dtype = torch.float32 if fp32_acc else x.dtype
+
+    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count * 8
+    rows_per_program = math.ceil(T / sm_count)
+
+    grad_x = torch.empty_like(x)
+    partial_dgamma = torch.zeros(sm_count, C, dtype=acc_dtype, device=x.device)
+
+    if _autotune_enabled():
+        autotuner = k._fused_conv_bwd_dx_ln_bwd_kernel_autotuned
+        status = _autotune_status_begin(
+            kernel_name="canon_fused_conv_ln_bwd", autotuner=autotuner,
+            args_by_name={"T": T, "C": C},
+        )
+        autotuner[(sm_count,)](
+            grad_out, x, seq_id, mean, rstd, ln_weight, conv_weight,
+            grad_x, partial_dgamma,
+            T, C, x.stride(0), x.stride(1),
+            rows_per_program, RADIUS=radius, BLOCK_N=BLOCK_N, FP32_ACCUM=fp32_acc,
+        )
+        _autotune_status_end(kernel_name="canon_fused_conv_ln_bwd", autotuner=autotuner, state=status)
+    else:
+        k._fused_conv_bwd_dx_ln_bwd_kernel[(sm_count,)](
+            grad_out, x, seq_id, mean, rstd, ln_weight, conv_weight,
+            grad_x, partial_dgamma,
+            T, C, x.stride(0), x.stride(1),
+            rows_per_program, RADIUS=radius, BLOCK_N=BLOCK_N, FP32_ACCUM=fp32_acc,
+            num_warps=4,
+        )
+
+    grad_gamma = partial_dgamma.sum(0).to(ln_weight.dtype)
+    return grad_x, grad_gamma
+
+
 # ── Autograd glue ─────────────────────────────────────────────────────────
 
 
@@ -302,6 +568,43 @@ torch.library.register_autograd(
 )
 
 
+# ── Fused LN+Conv autograd glue ──────────────────────────────────────────
+
+
+def _ln_conv_setup_context(ctx, inputs, output):
+    x, seq_id, ln_weight, ln_eps, conv_weight, _conv_bias, radius = inputs
+    _out, mean, rstd = output
+    ctx.save_for_backward(x, seq_id, ln_weight, conv_weight, mean, rstd)
+    ctx.radius = int(radius)
+    ctx.ln_eps = float(ln_eps)
+
+
+def _ln_conv_backward(ctx, grad_out, _grad_mean, _grad_rstd):
+    x, seq_id, ln_weight, conv_weight, mean, rstd = ctx.saved_tensors
+    radius = ctx.radius
+    grad_out = grad_out.contiguous()
+
+    # 1+2+3 fused: conv_bwd_dx + residual add + LN backward (single kernel)
+    grad_x, grad_gamma = torch.ops.nanoplm_canon.varlen_ln_conv_bwd_dx_dgamma(
+        grad_out, x, seq_id, mean, rstd, ln_weight, conv_weight, radius
+    )
+
+    # 4. Conv weight/bias grads (partial-buffer Triton kernel, no atomics)
+    grad_conv_w, grad_conv_b = torch.ops.nanoplm_canon.varlen_ln_conv_bwd_dw_db(
+        grad_out, x, seq_id, ln_weight, mean, rstd, radius
+    )
+
+    # Return grads for: x, seq_id, ln_weight, ln_eps, conv_weight, conv_bias, radius
+    return grad_x, None, grad_gamma, None, grad_conv_w, grad_conv_b, None
+
+
+torch.library.register_autograd(
+    "nanoplm_canon::varlen_ln_conv_fwd",
+    _ln_conv_backward,
+    setup_context=_ln_conv_setup_context,
+)
+
+
 # ── Public API ────────────────────────────────────────────────────────────
 
 
@@ -324,3 +627,32 @@ def varlen_canon_conv(
         radius: Conv half-width (``kernel_size // 2``).
     """
     return torch.ops.nanoplm_canon.varlen_conv_fwd(x, seq_id, weight, bias, radius)
+
+
+def varlen_ln_canon_conv(
+    x: torch.Tensor,
+    seq_id: torch.Tensor,
+    ln_weight: torch.Tensor,
+    ln_eps: float,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor,
+    radius: int,
+) -> torch.Tensor:
+    """Fused LayerNorm + Canon varlen depthwise convolution.
+
+    Computes ``LN(x) + conv(LN(x))`` without materializing the intermediate
+    LN output tensor, saving one (T, C) write+read.
+
+    Args:
+        x: ``(T, C)`` raw (un-normalized) packed token features.
+        seq_id: ``(T,)`` int tensor mapping each token to its sequence index.
+        ln_weight: ``(C,)`` LayerNorm gamma (scale parameter).
+        ln_eps: LayerNorm epsilon.
+        conv_weight: ``(C, K)`` depthwise conv weights.
+        conv_bias: ``(C,)`` conv bias.
+        radius: Conv half-width (``kernel_size // 2``).
+    """
+    out, _mean, _rstd = torch.ops.nanoplm_canon.varlen_ln_conv_fwd(
+        x, seq_id, ln_weight, ln_eps, conv_weight, conv_bias, radius
+    )
+    return out

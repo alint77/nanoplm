@@ -32,7 +32,15 @@ Canon is deeply memory-bound on RTX 5090:
 
 ## Solution
 
-Three hand-written Triton kernels registered as opaque `torch.library` ops.
+Hand-written Triton kernels registered as opaque `torch.library` ops, with two
+API levels:
+
+1. **Unfused Canon conv** (`varlen_canon_conv`): three kernels (fwd, bwd_dx,
+   bwd_dw_db) for standalone depthwise conv without LayerNorm.
+2. **Fused LN+Conv** (`varlen_ln_canon_conv`): fuses LayerNorm normalization
+   into the conv, eliminating intermediate (T,C) materialization. Uses
+   FlashAttention-style 1D kernels for LN stats and backward.
+
 Because they are opaque to Inductor, it cannot fuse them with LayerNorm —
 eliminating the pathological backward kernel explosion entirely.
 
@@ -40,18 +48,32 @@ eliminating the pathological backward kernel explosion entirely.
 
 | File | Purpose |
 |------|---------|
-| `src/nanoplm/pretraining/models/modern_bert/canon_triton_kernels.py` | Triton kernel definitions (fwd, bwd_dx, bwd_dw_db) |
+| `src/nanoplm/pretraining/models/modern_bert/canon_triton_kernels.py` | Triton kernel definitions (11 kernels + autotuned wrappers) |
 | `src/nanoplm/pretraining/models/modern_bert/canon_ops.py` | `torch.library` registration, CUDA launchers, autograd glue |
-| `src/nanoplm/pretraining/models/modern_bert/modeling.py` | Integration point (line 575: `_varlen_canon_conv(...)`) |
-| `tests/test_canon_correctness.py` | 44 correctness tests (fwd, bwd, gradcheck, integration) |
-| `tests/canon_benchmark.py` | Compiled microbenchmark with roofline analysis |
+| `src/nanoplm/pretraining/models/modern_bert/modeling.py` | Integration point (`varlen_ln_canon_conv(...)` / `varlen_canon_conv(...)`) |
+| `tests/test_canon_correctness.py` | 82 correctness tests (fwd, bwd, gradcheck, integration) |
+| `tests/canon_benchmark.py` | Compiled microbenchmark (unfused conv only) |
+| `tests/canon_ln_benchmark.py` | Fused LN+Conv benchmark with roofline analysis |
 
 ### Architecture
 
 ```
-varlen_canon_conv()                         # Public API
-  → torch.ops.nanoplm_canon.varlen_conv_fwd # torch.library custom op
-    → _canon_fwd_kernel                      # Triton JIT kernel
+varlen_ln_canon_conv()                                # Public API (fused)
+  → torch.ops.nanoplm_canon.varlen_ln_conv_fwd       # fused forward
+    → _ln_stats_kernel                                #   one-pass mean + rstd
+    → _canon_ln_fwd_kernel                            #   inline LN + conv + skip
+
+Backward (via register_autograd):
+  → torch.ops.nanoplm_canon.varlen_ln_conv_bwd_dx_dgamma  # fused bwd steps 1-3
+    → _fused_conv_bwd_dx_ln_bwd_kernel                     #   conv transpose + add + LN bwd
+  → torch.ops.nanoplm_canon.varlen_ln_conv_bwd_dw_db      # conv weight/bias grads
+    → _canon_ln_bwd_dw_db_partial_kernel                   #   partial-buffer reduction
+```
+
+```
+varlen_canon_conv()                         # Public API (unfused)
+  → torch.ops.nanoplm_canon.varlen_conv_fwd # standalone conv forward
+    → _canon_fwd_kernel
 
 Backward (via register_autograd):
   → torch.ops.nanoplm_canon.varlen_conv_bwd_dx    # grad_x (transpose conv)
@@ -62,7 +84,7 @@ Backward (via register_autograd):
 - `DEF` — op schema (signature + return type)
 - `register_fake` — FakeTensor shapes for torch.compile tracing
 - `impl("CUDA")` — actual Triton kernel launchers
-- `register_autograd` — backward decomposition into the two backward ops
+- `register_autograd` — backward decomposition
 
 This approach is compatible with `torch.utils.checkpoint.checkpoint(use_reentrant=False)`
 because `register_autograd`'s `setup_context` / `save_for_backward` hooks into
@@ -71,47 +93,92 @@ relies on.
 
 ### Kernel design
 
-All three kernels tile over a 2D `(T, C)` grid. The inner K-tap loop uses
+**Unfused Conv kernels** tile over a 2D `(T, C)` grid. The inner K-tap loop uses
 `tl.static_range(K)` so the compiler can schedule all neighbor loads
 simultaneously.
 
-**Forward (`_canon_fwd_kernel`)**:
-`out[t, c] = bias[c] + Σ_k weight[c, k] * x[t + k - r, c] * valid`
+**Fused LN+Conv kernels** follow the FlashAttention Triton LayerNorm design:
+1D grid with `BLOCK_N >= C` (full hidden dim in registers per row). This enables
+single-pass stats, in-register LN normalize, and multi-row loops with partial
+dgamma/dw/db accumulation — no atomics needed.
 
-- Loads `seq_id[t]` and `seq_id[t+offset]`, masks invalid cross-boundary taps
-- `FP32_ACCUM` constexpr: accumulates in fp32 for bf16/fp16 inputs, native dtype for fp32/fp64
+All kernels use `FP32_ACCUM: tl.constexpr` to accumulate in fp32 for bf16/fp16
+inputs while preserving native precision for fp32/fp64 (required for gradcheck).
 
-**Backward grad_x (`_canon_bwd_dx_kernel`)**:
-Same structure as forward but with flipped weight indices (`K-1-k`) — the
-transpose convolution.
+#### Kernel inventory
 
-**Backward grad_weight + grad_bias (`_canon_bwd_dw_db_kernel`)**:
-Each block computes partial sums over its `BLOCK_T` tile, then uses
-`tl.atomic_add` to accumulate into global `(C, K)` grad_weight and `(C,)`
-grad_bias buffers (pre-zeroed). Weight/bias grads are always accumulated in
-fp32 for half-precision inputs.
+| Kernel | Grid | Purpose |
+|--------|------|---------|
+| `_canon_fwd_kernel` | 2D (T,C) | Standalone conv forward |
+| `_canon_bwd_dx_kernel` | 2D (T,C) | Conv backward grad_x (transpose conv) |
+| `_canon_bwd_dw_db_kernel` | 2D (T,C) | Conv backward grad_w/grad_b (atomic_add) |
+| `_canon_ln_fwd_kernel` | 2D (T,C) | Fused LN+Conv forward (inline normalize + conv + skip) |
+| `_ln_stats_kernel` | 1D (T) | One-pass mean + rstd per row |
+| `_ln_bwd_kernel` | 1D (SMs) | LN backward dx + partial dgamma (standalone) |
+| `_fused_conv_bwd_dx_ln_bwd_kernel` | 1D (SMs) | Fused conv transpose + add + LN backward |
+| `_canon_ln_bwd_dw_db_partial_kernel` | 2D (T,C) | Conv bwd_dw_db with partial-buffer reduction |
 
-### Block size tuning (RTX 5090)
+#### Key design patterns
 
-Per-kernel block sizes were profiled across multiple configurations. The key
-constraint is register pressure — large accumulator tiles (e.g. 128×128 = 64KB
-fp32) cause register spilling that destroys performance.
+**One-pass LN stats** (`_ln_stats_kernel`): single kernel replaces
+`x.to(fp32).mean(-1)` + `x.to(fp32).var(-1)` + `rsqrt`. One program per row,
+`BLOCK_N` covers full hidden dim. Eliminates 2 separate reduction passes.
 
-| Kernel | BLOCK_T | BLOCK_C | Raw efficiency | Notes |
-|--------|---------|---------|----------------|-------|
-| fwd | 64 | 128 | 78% | Sweet spot before spilling |
-| bwd_dx | 32 | 128 | 83% | Smaller T tile = fewer registers |
-| bwd_dw_db | 256 | 64 | 48% | Larger T tile reduces atomic_add contention |
+**Fused conv_bwd_dx + LN backward** (`_fused_conv_bwd_dx_ln_bwd_kernel`):
+merges three operations into one kernel launch:
+1. Conv transpose (K-tap loop over neighbor `grad_out` rows)
+2. Residual add (`grad_ln_out = grad_out + grad_conv`)
+3. LN backward (dx + partial dgamma)
 
-The `bwd_dw_db` kernel is limited by `tl.atomic_add` contention from
-`ceil(T/BLOCK_T)` blocks writing to the same `(C, K)` output. Larger `BLOCK_T`
-reduces the number of atomic writers per output element.
+This eliminates two intermediate (T,C) tensors (`grad_conv`, `grad_ln_out`) —
+~400 MB of IO saved. Uses 1D grid with multi-row loop; L2 cache absorbs most
+of the K-fold neighbor `grad_out` reuse.
+
+**Partial-buffer reduction** (`_canon_ln_bwd_dw_db_partial_kernel`): replaces
+the `tl.atomic_add` approach with per-block partial buffers. Each T-block writes
+its partial sums to `partial_w[pid_t, :]` and `partial_b[pid_t, :]`. The host
+reduces with `.sum(0)` afterward. Eliminates all atomic contention.
+
+**Inline LN recompute in dw_db**: the conv weight grad kernel recomputes
+`LN(x) = (x - mean) * rstd * gamma` inline for each K-tap neighbor, avoiding
+materialization of the LN output. Mean/rstd (T×fp32 each, ~256KB) stay in L2.
+
+### Autotune
+
+All kernels use `triton.autotune` with `cache_results=True` for persistent
+caching. Configs sweep `num_warps` for 1D kernels and `BLOCK_T × BLOCK_C ×
+num_warps × num_stages` for 2D kernels. The `bwd_dw_db` partial kernel uses a
+`pre_hook` to zero partial buffers before each autotune trial.
+
+Autotune can be disabled via `NANOPLM_CANON_TRITON_AUTOTUNE=0` for deterministic
+kernel selection (uses hardcoded fallback block sizes tuned on RTX 5090).
+
+Selected configs (T=65536, C=768, RTX 5090):
+
+| Kernel | Config | warps | stages |
+|--------|--------|-------|--------|
+| `_canon_ln_fwd` | BLOCK_T=32, BLOCK_C=128 | 4 | 2 |
+| `_ln_stats` | (1D) | 4 | 3 |
+| `_fused_conv_bwd_dx_ln_bwd` | (1D) | 1 | 3 |
+| `_canon_ln_bwd_dw_db_partial` | BLOCK_T=128, BLOCK_C=64 | 4 | 2 |
 
 ## Results
 
-### Isolated benchmark
+### Isolated benchmark (fused LN+Conv)
 
-Compiled microbenchmark (`torch.compile`, T=65536, C=768, K=7, 256 seqs, bf16, RTX 5090):
+Microbenchmark (T=65536, C=768, K=7, 256 seqs, bf16, RTX 5090):
+
+| Metric | Unfused (LN + Triton Conv) | Fused (LN+Conv) | Speedup |
+|--------|---------------------------|-----------------|---------|
+| Forward | 0.444 ms (51% eff) | 0.206 ms (55% eff) | 2.16× |
+| Backward | 1.396 ms (32% eff) | 0.876 ms (51% eff) | 1.59× |
+| Fwd+Bwd | 1.840 ms (37% eff) | 1.082 ms (52% eff) | 1.70× |
+
+Per-step projection (24 Canon layers): **18.2 ms recovered** vs unfused.
+
+### Isolated benchmark (unfused Conv only)
+
+Compiled microbenchmark (`torch.compile`, same config):
 
 | Metric | Reference (compiled) | Triton (autotuned) | Speedup |
 |--------|---------------------|-------------------|---------|
@@ -119,114 +186,81 @@ Compiled microbenchmark (`torch.compile`, T=65536, C=768, K=7, 256 seqs, bf16, R
 | Backward | 0.985 ms (23% eff) | 0.491 ms (46% eff) | 2.01× |
 | Fwd+Bwd | 1.300 ms (26% eff) | 0.691 ms (49% eff) | 1.88× |
 
-Autotune selected configs (T=65536, C=768):
+### Training trace comparison
 
-| Kernel | BLOCK_T | BLOCK_C | warps | stages |
-|--------|---------|---------|-------|--------|
-| fwd | 32 | 128 | 8 | 2 |
-| bwd_dx | 32 | 128 | 4 | 3 |
-| bwd_dw_db | 256 | 64 | 4 | 3 |
-
-### Training trace comparison (before/after)
-
-Profiler traces from real 2×H100 FSDP training (T=65536, C=768, K=7, bf16, grad_accum=2,
+Profiler traces from real training (T=65536, C=768, K=7, bf16,
 activation checkpointing enabled, `torch.compile mode=max-autotune-no-cudagraphs`).
 
-- **Before** — `run-20030051`: roll-based `_varlen_canon_inner`, step time ~567 ms, 10.7 MFU%
-- **After** — `run-20030054`: Triton `varlen_canon_conv` with autotune, step time ~498 ms, 12.1 MFU%
+#### Evolution across iterations
 
-#### GPU kernel time breakdown (8 profiled steps)
+| Trace | Description | Canon+LN time | % step |
+|-------|-------------|---------------|--------|
+| `run-20030051` | Roll-based (torch.compile) | 983.6 ms | 37.9% |
+| `run-20030054` | Triton Conv (unfused) | 274.1 ms | 12.7% |
+| `run-20030152` | First fused attempt (regression) | 305.0 ms | 13.4% |
+| **`run-20030914`** | **Fused LN+Conv (current)** | **171.4 ms** | **8.3%** |
 
-| Metric | Before | After | Delta |
-|--------|--------|-------|-------|
-| Total GPU kernel time | 2593.7 ms | 2502.9 ms | −90.8 ms |
-| Canon kernel time | 544.0 ms (21.0%) | 134.4 ms (5.4%) | **−409.6 ms** |
-| LayerNorm fused w/ roll | 381.1 ms (14.7%) | 0 ms | **−381.1 ms** |
-| LayerNorm (clean) | 58.5 ms (2.3%) | 139.7 ms (5.6%) | +81.3 ms |
-| **Canon + LN combined** | **983.6 ms (37.9%)** | **274.1 ms (11.0%)** | **−709.4 ms** |
+Total improvement: **812 ms saved** (5.7× reduction) from roll-based to current fused.
 
-The roll-based backward caused Inductor to fuse Canon with LayerNorm into pathological
-combined kernels (`triton_per_fused_..._native_layer_norm_backward_roll_select_*`), each
-running ~1.6 ms. These 381 ms of fused LN+roll kernels **vanish entirely** with the Triton
-op approach. LayerNorm reverts to its clean ~140 ms baseline, and the three Canon kernels
-run in a combined 134 ms — a **3.6× reduction** in Canon+LN GPU time.
+#### Per-kernel efficiency (run-20030914)
 
-#### Per-kernel timing in training
+| Kernel | Count | Avg (μs) | Total (ms) | % step | BW (GB/s) | Eff |
+|--------|-------|----------|------------|--------|-----------|-----|
+| `_fused_conv_bwd_dx_ln_bwd` | 204 | 258 | 52.7 | 2.6% | 1172 | 65% |
+| `_canon_ln_fwd` | 388 | 132 | 51.4 | 2.5% | 1525 | 85% |
+| `_canon_ln_bwd_dw_db_partial` | 204 | 176 | 35.8 | 1.7% | 1149 | 64% |
+| `_ln_stats` | 387 | 67 | 26.0 | 1.3% | 1509 | 84% |
+| **Total Canon** | | | **171.4** | **8.3%** | | |
 
-| Kernel | Count | Avg (μs) | Total (ms) | % GPU |
-|--------|-------|----------|------------|-------|
-| `_canon_fwd_kernel_autotuned` | 405 | 138 | 56.1 | 2.2% |
-| `_canon_bwd_dx_kernel_autotuned` | 213 | 115 | 24.4 | 1.0% |
-| `_canon_bwd_dw_db_kernel_autotuned` | 213 | 253 | 54.0 | 2.2% |
+The forward kernels (`_canon_ln_fwd` at 85%, `_ln_stats` at 84%) are near the
+memory bandwidth ceiling. The backward kernels (`_fused_conv_bwd_dx_ln_bwd` at
+65%, `_canon_ln_bwd_dw_db_partial` at 64%) have lower efficiency due to K-fold
+neighbor access patterns that exceed L2 cache reuse.
 
-Training kernels run ~30% faster than isolated benchmarks (GPU pipeline already saturated,
-overlapping compute/memory from surrounding ops).
+#### Step time context
 
-#### Neighboring kernels in training
+Canon at 8.3% of step time is now comparable to FlashAttention (~8%) and well
+below GEMMs (~42%) and NCCL collectives (~14%). The profile is dominated by
+GEMMs and communication — the expected profile for a well-optimized transformer.
 
-**Forward path** (most common pattern, 96 occurrences):
-```
-LayerNorm → canon_fwd → residual_add (triton_poi_fused_add)
-```
+#### Wall-clock step time (roll-based → current)
 
-**Backward path** (consistent across all 213 occurrences):
-```
-GEMM → canon_bwd_dx → 4× FillFunctor(zeros) → canon_bwd_dw_db → dtype_cast (fp32→bf16)
-```
+| | Roll-based | Triton unfused | Fused LN+Conv |
+|--|------------|---------------|---------------|
+| Steady-state step time | ~567 ms | ~498 ms | ~498 ms* |
+| Canon+LN GPU time | 983.6 ms | 274.1 ms | 171.4 ms |
 
-#### Wall-clock step time
+*Step time reduction from the fused path is partially masked by communication
+overlap. The 103 ms kernel time reduction frees GPU cycles for better compute/
+communication overlap.
 
-| | Before | After | Delta |
-|--|--------|-------|-------|
-| Steady-state step time | ~567 ms | ~498 ms | **−69 ms (−12.2%)** |
-| Throughput (tok/s) | ~462K | ~526K | **+64K (+13.9%)** |
-| H100 MFU | 10.7% | 12.1% | +1.4 pp |
+### Remaining optimization opportunities
 
-The 69 ms/step improvement exceeds the isolated Canon-only savings (~15 ms) because
-eliminating the pathological backward fusion also unblocks Inductor from generating
-better code for the surrounding LayerNorm and residual ops.
+1. **`_fused_conv_bwd_dx_ln_bwd` (65% eff)**: the per-row conv transpose loads
+   K=7 neighbor `grad_out` rows per row. With `rows_per_program` ≈ 64, L2
+   absorbs most reuse, but the ~35% gap from peak suggests some L2 misses on
+   row-chunk boundaries. Increasing `rows_per_program` (fewer programs, more
+   rows each) could improve locality.
 
-#### Top 5 kernels by GPU time
+2. **`_canon_ln_bwd_dw_db_partial` (64% eff)**: each K-tap loads neighbor x and
+   recomputes LN inline. The K-fold x access is the bottleneck. Pre-materializing
+   LN(x) would trade one (T,C) write for K-1 recomputes — at K=7 the recomputes
+   are likely cheaper due to L2-resident mean/rstd, so the current approach is
+   near-optimal.
 
-**Before (roll-based):**
-| Rank | % GPU | Kernel |
-|------|-------|--------|
-| 1 | 6.8% | `triton_red_fused__to_copy_mul_sum_7` (reduction) |
-| 2 | 6.7% | cutlass GEMM (64×128) |
-| 3 | 6.6% | cutlass GEMM (128×64) |
-| 4 | **6.1%** | `triton_per_fused_..._layer_norm_backward_roll_select_6` **(pathological)** |
-| 5 | 5.7% | `triton_tem_fused_mm_t_4` (matmul) |
-
-**After (Triton Canon):**
-| Rank | % GPU | Kernel |
-|------|-------|--------|
-| 1 | 13.3% | NCCL ReduceScatter |
-| 2 | 7.1% | cutlass GEMM (64×128) |
-| 3 | 7.0% | cutlass GEMM (128×64) |
-| 4 | 6.6% | `triton_tem_fused_mm_t_4` (matmul) |
-| 5 | 5.1% | cutlass GEMM (128×128) |
-
-Canon drops entirely out of the top 10. The profile is now dominated by GEMMs and NCCL
-collectives — the expected profile for a well-optimized transformer.
-
-### Remaining fusion opportunities
-
-1. **LayerNorm → canon_fwd** (96 occurrences): fusing would eliminate one kernel launch +
-   one intermediate (T,C) store/load = 100 MB round-trip, saving ~50-80 μs/call.
-2. **bwd_dx + bwd_dw_db merge**: both read `grad_out`; merging saves one 100 MB pass
-   (~56 μs). Risk: register pressure from combining both accumulation patterns.
-3. **Absorb zero-fill into bwd_dw_db**: 4 tiny `FillFunctor` kernels (1 μs each) precede
-   every `bwd_dw_db` call. Moving the zeroing into the Triton kernel eliminates 4 launch
-   overheads per call.
-4. **Fuse bwd_dw_db → dtype_cast**: the fp32→bf16 weight grad cast could be done in-kernel.
+3. **Fully fused backward**: merging dw_db accumulation into the per-row kernel
+   would save one `grad_out` read pass (~100 MB), but requires K register-resident
+   accumulators per channel (28KB at K=7, BLOCK_N=1024) — feasible but increases
+   register pressure.
 
 ## Correctness
 
-44 tests cover:
+82 tests cover:
 
-- **Forward**: parametrized over `radius={1,2,3}`, `C={64,768}`, multi-sequence layouts (2–12 seqs)
-- **Backward**: grad_x, grad_weight, grad_bias compared against reference autograd (bf16 + fp32)
-- **Gradcheck**: finite-difference verification at fp64 precision
+- **Unfused Conv**: forward (bf16/fp32), backward (bf16/fp32), gradcheck (fp64),
+  multi-sequence layouts
+- **Fused LN+Conv**: forward (bf16/fp32, C={64,768}), backward (bf16/fp32),
+  gradcheck (fp64), multi-sequence layouts
 - **Integration**: full `ModernBertCanonLayer` end-to-end (varlen + padded paths)
 
 Run with:
@@ -236,6 +270,7 @@ pytest tests/test_canon_correctness.py -v
 
 Benchmark with:
 ```bash
+python tests/canon_ln_benchmark.py [--T 65536] [--C 768] [--radius 3] [--n-seqs 256]
 python tests/canon_benchmark.py [--T 65536] [--C 768] [--radius 3] [--n-seqs 256]
 ```
 
@@ -255,13 +290,31 @@ fragments compilation and prevents Inductor from optimizing the surrounding
 ops. The torch.library approach keeps the graph intact — Inductor sees the ops
 as opaque leaves but can still fuse everything around them.
 
-**Why separate block sizes per kernel?**
-The three kernels have different register pressure profiles and access patterns.
-The forward and bwd_dx kernels are pure streaming ops that benefit from smaller
-tiles to avoid spilling. The bwd_dw_db kernel performs a reduction via
-`atomic_add`, where larger T tiles reduce contention but require more registers
-for the inner loop. A single block size for all three leaves significant
-performance on the table.
+**Why FlashAttention-style 1D kernels for LN?**
+The LN stats, LN backward, and fused conv_bwd_dx + LN backward kernels use a
+1D grid with `BLOCK_N >= C` (full hidden dim in registers). This pattern, from
+FlashAttention's Triton LayerNorm, enables:
+- Single-pass stats (no two-pass mean+var)
+- Per-row backward with all reductions in registers (no shared memory)
+- Multi-row loops with partial dgamma accumulation (no atomics)
+- Natural fusion with the conv transpose (K-tap loop over neighbors in registers)
+
+The 2D `(T, C)` tiled approach used for the unfused conv kernels cannot fuse
+with LN backward because LN's reduction over C requires the full hidden dim.
+
+**Why partial buffers instead of atomic_add for dw_db?**
+The unfused `_canon_bwd_dw_db_kernel` uses `tl.atomic_add` with `ceil(T/BLOCK_T)`
+blocks writing to the same `(C, K)` output — severe contention at 48% efficiency.
+The fused `_canon_ln_bwd_dw_db_partial_kernel` writes to per-block partial buffers
+and reduces on the host with `.sum(0)`. This eliminates all atomic contention
+and improved efficiency to 64%.
+
+**Why fuse conv_bwd_dx + LN backward?**
+The unfused backward computed: (1) conv_bwd_dx → write `grad_conv`, (2) add →
+write `grad_ln_out`, (3) LN backward → read `grad_ln_out`. This materialized
+two (T,C) intermediates (~400 MB). The fused kernel computes the conv transpose
+in registers, adds `grad_out`, and runs LN backward — all in one pass per row.
+This improved backward efficiency from 39% to 51%.
 
 **Boundary handling vs reference**:
 `torch.roll` wraps around modulo T. For a single sequence (all tokens share

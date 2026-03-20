@@ -81,6 +81,15 @@ BWD_RTOL = 1e-2
 BWD_ATOL_FP32 = 1e-5
 BWD_RTOL_FP32 = 1e-5
 
+# Fused LN+Conv tolerances: wider for bf16 because the fused path avoids bf16
+# truncation of the LN intermediate while stats computation may differ slightly
+# from F.layer_norm's internal kernel (different fp32 reduction order).
+# Mathematical correctness is verified by fp64 gradcheck.
+FUSED_FWD_ATOL_BF16 = 0.15
+FUSED_FWD_RTOL_BF16 = 5e-2
+FUSED_BWD_ATOL_BF16 = 1.0
+FUSED_BWD_RTOL_BF16 = 0.1
+
 
 # ── Forward tests ────────────────────────────────────────────────────────
 
@@ -255,6 +264,173 @@ class TestGradcheck:
             return self.ops.varlen_canon_conv(x_, seq_id, w_, b_, radius)
 
         torch.autograd.gradcheck(fn, (x, w, b), eps=1e-6, atol=1e-4, rtol=1e-3)
+
+
+# ── Fused LayerNorm + Conv tests ──────────────────────────────────────────
+
+
+class TestFusedLNConvForward:
+    """Forward: fused LN+Conv vs separate LN → Conv + skip."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.ops = _import_ops()
+
+    def _run_fwd(self, seq_lengths, C, radius, dtype=torch.bfloat16):
+        K = 2 * radius + 1
+        cu = _make_cu_seqlens(seq_lengths)
+        T = int(cu[-1].item())
+        seq_id = _make_seq_id(cu)
+        ln_eps = 1e-5
+
+        x = _rand((T, C), dtype=dtype)
+        ln_w = _rand((C,), dtype=dtype) + 1.0  # center near 1
+        conv_w = _rand((C, K), dtype=dtype)
+        conv_b = _rand((C,), dtype=dtype)
+
+        # Reference in fp32 (both paths should be close to fp32 ground truth)
+        x32 = x.float()
+        ln_w32 = ln_w.float()
+        conv_w32 = conv_w.float()
+        conv_b32 = conv_b.float()
+        seq_id32 = seq_id
+        ln_out32 = torch.nn.functional.layer_norm(x32, (C,), weight=ln_w32, eps=ln_eps)
+        ref32 = ln_out32 + self.ops.varlen_canon_conv(ln_out32, seq_id32, conv_w32, conv_b32, radius)
+
+        # Fused
+        fused = self.ops.varlen_ln_canon_conv(x, seq_id, ln_w, ln_eps, conv_w, conv_b, radius)
+
+        if dtype == torch.float32:
+            _assert_close("fused_ln_fwd", fused, ref32, 1e-5, 1e-5)
+        else:
+            _assert_close("fused_ln_fwd", fused, ref32.to(dtype), FUSED_FWD_ATOL_BF16, FUSED_FWD_RTOL_BF16)
+
+    @pytest.mark.parametrize("radius", [1, 2, 3])
+    @pytest.mark.parametrize(
+        "seq_lengths",
+        [[32, 32], [10, 20, 34], [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 9]],
+    )
+    @pytest.mark.parametrize("C", [64, 768])
+    def test_fused_ln_fwd_bf16(self, C, seq_lengths, radius):
+        self._run_fwd(seq_lengths, C, radius)
+
+    @pytest.mark.parametrize("radius", [1, 2, 3])
+    def test_fused_ln_fwd_fp32(self, radius):
+        self._run_fwd([20, 30, 14], C=128, radius=radius, dtype=torch.float32)
+
+
+class TestFusedLNConvBackward:
+    """Backward: fused LN+Conv vs separate LN → Conv + skip."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.ops = _import_ops()
+
+    def _run_bwd(self, seq_lengths, C, radius, dtype=torch.bfloat16):
+        K = 2 * radius + 1
+        cu = _make_cu_seqlens(seq_lengths)
+        T = int(cu[-1].item())
+        seq_id = _make_seq_id(cu)
+        ln_eps = 1e-5
+
+        x = _rand((T, C), dtype=dtype)
+        ln_w = _rand((C,), dtype=dtype) + 1.0
+        conv_w = _rand((C, K), dtype=dtype)
+        conv_b = _rand((C,), dtype=dtype)
+
+        # Reference in fp32 (avoids bf16 truncation of LN intermediate)
+        x_ref = x.float().detach().clone().requires_grad_(True)
+        ln_w_ref = ln_w.float().detach().clone().requires_grad_(True)
+        conv_w_ref = conv_w.float().detach().clone().requires_grad_(True)
+        conv_b_ref = conv_b.float().detach().clone().requires_grad_(True)
+
+        ln_out = torch.nn.functional.layer_norm(x_ref, (C,), weight=ln_w_ref, eps=ln_eps)
+        ref = ln_out + self.ops.varlen_canon_conv(ln_out, seq_id, conv_w_ref, conv_b_ref, radius)
+        ref.sum().backward()
+
+        # Fused path
+        x_fused = x.detach().clone().requires_grad_(True)
+        ln_w_fused = ln_w.detach().clone().requires_grad_(True)
+        conv_w_fused = conv_w.detach().clone().requires_grad_(True)
+        conv_b_fused = conv_b.detach().clone().requires_grad_(True)
+
+        fused = self.ops.varlen_ln_canon_conv(
+            x_fused, seq_id, ln_w_fused, ln_eps, conv_w_fused, conv_b_fused, radius
+        )
+        fused.float().sum().backward()
+
+        if dtype == torch.float32:
+            atol, rtol = BWD_ATOL_FP32, BWD_RTOL_FP32
+        else:
+            atol, rtol = FUSED_BWD_ATOL_BF16, FUSED_BWD_RTOL_BF16
+
+        _assert_close("fused_grad_x", x_fused.grad, x_ref.grad.to(dtype), atol, rtol)
+        _assert_close("fused_grad_ln_w", ln_w_fused.grad, ln_w_ref.grad.to(dtype), atol, rtol)
+        _assert_close("fused_grad_conv_w", conv_w_fused.grad, conv_w_ref.grad, atol, rtol)
+        _assert_close("fused_grad_conv_b", conv_b_fused.grad, conv_b_ref.grad, atol, rtol)
+
+    @pytest.mark.parametrize("radius", [1, 2, 3])
+    @pytest.mark.parametrize(
+        "seq_lengths",
+        [[32, 32], [10, 20, 34], [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 9]],
+    )
+    def test_fused_ln_bwd_bf16(self, seq_lengths, radius):
+        self._run_bwd(seq_lengths, C=64, radius=radius)
+
+    @pytest.mark.parametrize("radius", [1, 2, 3])
+    def test_fused_ln_bwd_fp32(self, radius):
+        self._run_bwd([20, 30, 14], C=128, radius=radius, dtype=torch.float32)
+
+    def test_fused_ln_bwd_large_C(self):
+        self._run_bwd([128, 128], C=768, radius=3)
+
+
+class TestFusedLNConvGradcheck:
+    """Finite-difference gradcheck for fused LN+Conv."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.ops = _import_ops()
+
+    @pytest.mark.parametrize("radius", [1, 2, 3])
+    def test_gradcheck(self, radius):
+        K = 2 * radius + 1
+        T, C = 12, 8
+        cu = _make_cu_seqlens([4, 4, 4])
+        seq_id = _make_seq_id(cu)
+        ln_eps = 1e-5
+
+        x = torch.randn(T, C, device=_DEVICE, dtype=torch.float64, requires_grad=True)
+        ln_w = torch.randn(C, device=_DEVICE, dtype=torch.float64, requires_grad=True)
+        conv_w = torch.randn(C, K, device=_DEVICE, dtype=torch.float64, requires_grad=True)
+        conv_b = torch.randn(C, device=_DEVICE, dtype=torch.float64, requires_grad=True)
+
+        def fn(x_, ln_w_, conv_w_, conv_b_):
+            return self.ops.varlen_ln_canon_conv(
+                x_, seq_id, ln_w_, ln_eps, conv_w_, conv_b_, radius
+            )
+
+        torch.autograd.gradcheck(fn, (x, ln_w, conv_w, conv_b), eps=1e-6, atol=1e-4, rtol=1e-3)
+
+    def test_gradcheck_multi_sequence(self):
+        radius = 2
+        K = 2 * radius + 1
+        T, C = 16, 6
+        cu = _make_cu_seqlens([5, 6, 5])
+        seq_id = _make_seq_id(cu)
+        ln_eps = 1e-5
+
+        x = torch.randn(T, C, device=_DEVICE, dtype=torch.float64, requires_grad=True)
+        ln_w = torch.randn(C, device=_DEVICE, dtype=torch.float64, requires_grad=True)
+        conv_w = torch.randn(C, K, device=_DEVICE, dtype=torch.float64, requires_grad=True)
+        conv_b = torch.randn(C, device=_DEVICE, dtype=torch.float64, requires_grad=True)
+
+        def fn(x_, ln_w_, conv_w_, conv_b_):
+            return self.ops.varlen_ln_canon_conv(
+                x_, seq_id, ln_w_, ln_eps, conv_w_, conv_b_, radius
+            )
+
+        torch.autograd.gradcheck(fn, (x, ln_w, conv_w, conv_b), eps=1e-6, atol=1e-4, rtol=1e-3)
 
 
 # ── Integration with ModernBertCanonLayer ─────────────────────────────────

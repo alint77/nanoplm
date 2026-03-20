@@ -23,6 +23,7 @@ from torch.utils.checkpoint import checkpoint as _checkpoint
 from . import mhc_triton_ops as _mhc_triton_ops  # noqa: F401
 # Registers torch.ops.nanoplm_canon::* — Triton varlen depthwise conv.
 from .canon_ops import varlen_canon_conv as _varlen_canon_conv
+from .canon_ops import varlen_ln_canon_conv as _varlen_ln_canon_conv
 
 _HAS_FLASH_VARLEN = False
 _flash_varlen_fn = None
@@ -547,7 +548,51 @@ class ModernBertCanonLayer(nn.Module):
             out = out * token_mask
         return out.to(dtype=x.dtype)
 
-    def forward(self, x, position_ids=None, cu_seqlens=None, attention_mask=None):
+    def _forward_varlen_fused_ln(self, x, cu_seqlens, ln_weight, ln_eps, position_ids=None):
+        """Fused LN + Canon varlen path: computes LN(x) + conv(LN(x)) without
+        materializing the intermediate LN output."""
+        T, C = x.shape
+        n_seqs = cu_seqlens.shape[0] - 1
+
+        # Single-sequence: fall back to separate LN + F.conv1d (no Triton path)
+        if n_seqs <= 1:
+            acc_dtype = _canon_accum_dtype(x)
+            # Compute LN manually to get normalized x
+            x_fp32 = x.float()
+            mean = x_fp32.mean(dim=-1, keepdim=True)
+            rstd = torch.rsqrt(x_fp32.var(dim=-1, keepdim=True, correction=0) + ln_eps)
+            ln_out = ((x_fp32 - mean) * rstd * ln_weight.float()).to(dtype=acc_dtype)
+            mixed = F.conv1d(
+                ln_out.T.unsqueeze(0),
+                self.conv.weight.to(dtype=acc_dtype),
+                bias=(
+                    self.conv.bias.to(dtype=acc_dtype)
+                    if self.conv.bias is not None
+                    else None
+                ),
+                stride=1,
+                padding=self.radius,
+                groups=self.conv.groups,
+            ).squeeze(0).T.to(dtype=x.dtype)
+            return (ln_out + mixed).to(dtype=x.dtype)
+
+        if position_ids is not None and position_ids.shape[0] == T:
+            seq_start = (position_ids == 0).to(dtype=cu_seqlens.dtype)
+            seq_start = seq_start.clone()
+            seq_start[0] = 1
+            seq_id = torch.cumsum(seq_start, dim=0) - 1
+        else:
+            positions = torch.arange(T, device=x.device, dtype=cu_seqlens.dtype)
+            seq_id = torch.searchsorted(cu_seqlens[1:], positions, right=True)
+
+        weight = self.conv.weight[:, 0, :]
+        bias = self.conv.bias
+        return _varlen_ln_canon_conv(
+            x, seq_id, ln_weight, ln_eps, weight, bias, self.radius
+        )
+
+    def forward(self, x, position_ids=None, cu_seqlens=None, attention_mask=None,
+                fuse_ln_weight=None, fuse_ln_eps=None):
         # Checkpoint at the module boundary so all Canon insertion sites (A/B/C/D)
         # and both varlen/padded paths are covered by the same flag.
         use_ckpt = (
@@ -556,6 +601,37 @@ class ModernBertCanonLayer(nn.Module):
             and torch.is_grad_enabled()
             and x.requires_grad
         )
+
+        # Fused LN+Conv path (varlen multi-sequence only)
+        if fuse_ln_weight is not None and cu_seqlens is not None:
+            if use_ckpt:
+                if position_ids is None:
+                    return _checkpoint(
+                        lambda x_, cu_: self._forward_varlen_fused_ln(
+                            x_, cu_seqlens=cu_,
+                            ln_weight=fuse_ln_weight, ln_eps=fuse_ln_eps,
+                            position_ids=None,
+                        ),
+                        x,
+                        cu_seqlens,
+                        use_reentrant=False,
+                    )
+                return _checkpoint(
+                    lambda x_, cu_, pos_: self._forward_varlen_fused_ln(
+                        x_, cu_seqlens=cu_,
+                        ln_weight=fuse_ln_weight, ln_eps=fuse_ln_eps,
+                        position_ids=pos_,
+                    ),
+                    x,
+                    cu_seqlens,
+                    position_ids,
+                    use_reentrant=False,
+                )
+            return self._forward_varlen_fused_ln(
+                x, cu_seqlens=cu_seqlens,
+                ln_weight=fuse_ln_weight, ln_eps=fuse_ln_eps,
+                position_ids=position_ids,
+            )
 
         if cu_seqlens is not None:
             if use_ckpt:
@@ -1055,19 +1131,34 @@ class ModernBertEncoderLayer(nn.Module):
             _token_mask = token_mask
             _repo_active = repo_active
 
+            _fuse_ln_a = (
+                self.canon_a is not None
+                and isinstance(self.attn_norm, nn.LayerNorm)
+                and _cu_seqlens is not None
+            )
+
             def _attn_branch(
                 x_in: torch.Tensor,
                 *,
                 _layer: "ModernBertEncoderLayer" = self,
             ) -> torch.Tensor:
-                attn_in = _layer.attn_norm(x_in)
-                if _layer.canon_a is not None:
+                if _fuse_ln_a:
                     attn_in = _layer.canon_a(
-                        attn_in,
+                        x_in,
                         position_ids=_position_ids,
                         cu_seqlens=_cu_seqlens,
-                        attention_mask=_token_mask,
+                        fuse_ln_weight=_layer.attn_norm.weight,
+                        fuse_ln_eps=_layer.attn_norm.eps,
                     )
+                else:
+                    attn_in = _layer.attn_norm(x_in)
+                    if _layer.canon_a is not None:
+                        attn_in = _layer.canon_a(
+                            attn_in,
+                            position_ids=_position_ids,
+                            cu_seqlens=_cu_seqlens,
+                            attention_mask=_token_mask,
+                        )
                 return _layer.attn(
                     attn_in,
                     cos_sin=_cos_sin,
@@ -1086,14 +1177,28 @@ class ModernBertEncoderLayer(nn.Module):
                 attn_out = _checkpoint(_attn_branch, x)
             x = x + prores_alpha * attn_out
         else:
-            attn_in = self.attn_norm(x)
-            if self.canon_a is not None:
+            fuse_ln_a = (
+                self.canon_a is not None
+                and isinstance(self.attn_norm, nn.LayerNorm)
+                and cu_seqlens is not None
+            )
+            if fuse_ln_a:
                 attn_in = self.canon_a(
-                    attn_in,
+                    x,
                     position_ids=position_ids,
                     cu_seqlens=cu_seqlens,
-                    attention_mask=token_mask,
+                    fuse_ln_weight=self.attn_norm.weight,
+                    fuse_ln_eps=self.attn_norm.eps,
                 )
+            else:
+                attn_in = self.attn_norm(x)
+                if self.canon_a is not None:
+                    attn_in = self.canon_a(
+                        attn_in,
+                        position_ids=position_ids,
+                        cu_seqlens=cu_seqlens,
+                        attention_mask=token_mask,
+                    )
             attn_out = self.attn(
                 attn_in,
                 cos_sin=cos_sin,
@@ -1116,20 +1221,34 @@ class ModernBertEncoderLayer(nn.Module):
                 _position_ids = position_ids
                 _cu_seqlens = cu_seqlens
                 _token_mask = token_mask
+                _fuse_ln_c = (
+                    self.canon_c is not None
+                    and isinstance(self.mlp_norm, nn.LayerNorm)
+                    and _cu_seqlens is not None
+                )
 
                 def _mlp_branch(
                     x_in: torch.Tensor,
                     *,
                     _layer: "ModernBertEncoderLayer" = self,
                 ) -> torch.Tensor:
-                    mlp_in = _layer.mlp_norm(x_in)
-                    if _layer.canon_c is not None:
+                    if _fuse_ln_c:
                         mlp_in = _layer.canon_c(
-                            mlp_in,
+                            x_in,
                             position_ids=_position_ids,
                             cu_seqlens=_cu_seqlens,
-                            attention_mask=_token_mask,
+                            fuse_ln_weight=_layer.mlp_norm.weight,
+                            fuse_ln_eps=_layer.mlp_norm.eps,
                         )
+                    else:
+                        mlp_in = _layer.mlp_norm(x_in)
+                        if _layer.canon_c is not None:
+                            mlp_in = _layer.canon_c(
+                                mlp_in,
+                                position_ids=_position_ids,
+                                cu_seqlens=_cu_seqlens,
+                                attention_mask=_token_mask,
+                            )
                     return _layer.mlp(
                         mlp_in,
                         position_ids=_position_ids,
@@ -1143,14 +1262,28 @@ class ModernBertEncoderLayer(nn.Module):
                     mlp_out = _checkpoint(_mlp_branch, x)
                 x = x + prores_alpha * mlp_out
             else:
-                mlp_in = self.mlp_norm(x)
-                if self.canon_c is not None:
+                fuse_ln_c = (
+                    self.canon_c is not None
+                    and isinstance(self.mlp_norm, nn.LayerNorm)
+                    and cu_seqlens is not None
+                )
+                if fuse_ln_c:
                     mlp_in = self.canon_c(
-                        mlp_in,
+                        x,
                         position_ids=position_ids,
                         cu_seqlens=cu_seqlens,
-                        attention_mask=token_mask,
+                        fuse_ln_weight=self.mlp_norm.weight,
+                        fuse_ln_eps=self.mlp_norm.eps,
                     )
+                else:
+                    mlp_in = self.mlp_norm(x)
+                    if self.canon_c is not None:
+                        mlp_in = self.canon_c(
+                            mlp_in,
+                            position_ids=position_ids,
+                            cu_seqlens=cu_seqlens,
+                            attention_mask=token_mask,
+                        )
                 mlp_out = self.mlp(
                     mlp_in,
                     position_ids=position_ids,
