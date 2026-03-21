@@ -49,18 +49,56 @@ def _autotune_configs(
     ]
 
 
-_AUTOTUNE_FWD_CONFIGS = _autotune_configs(
-    block_ts=(32, 64, 128),
-    block_cs=(64, 128),
-    warps=(4, 8),
-    stages=(2, 3),
+def _streaming_configs(configs: tuple[tuple[int, int, int, int], ...]) -> list[triton.Config]:
+    return [
+        triton.Config(
+            {"BLOCK_T": bt, "BLOCK_C": bc},
+            num_warps=nw,
+            num_stages=ns,
+        )
+        for bt, bc, nw, ns in configs
+    ]
+
+
+def _rowwise_configs(
+    configs: tuple[tuple[int, int], ...],
+    *,
+    pre_hook=None,
+) -> list[triton.Config]:
+    return [
+        triton.Config(
+            {"PROGRAM_MULTIPLIER": pm},
+            num_warps=nw,
+            pre_hook=pre_hook,
+        )
+        for pm, nw in configs
+    ]
+
+
+_AUTOTUNE_FWD_CONFIGS = _streaming_configs(
+    (
+        (16, 64, 1, 2),
+        (16, 64, 1, 3),
+        (16, 64, 1, 4),
+        (16, 128, 2, 1),
+        (32, 64, 1, 1),
+        (32, 64, 1, 4),
+        (32, 64, 4, 2),
+        (64, 128, 4, 2),
+    )
 )
 
-_AUTOTUNE_BWD_DX_CONFIGS = _autotune_configs(
-    block_ts=(32, 64, 128),
-    block_cs=(64, 128),
-    warps=(4, 8),
-    stages=(2, 3),
+_AUTOTUNE_BWD_DX_CONFIGS = _streaming_configs(
+    (
+        (16, 64, 1, 2),
+        (16, 64, 1, 3),
+        (32, 64, 1, 1),
+        (32, 64, 1, 3),
+        (32, 64, 1, 4),
+        (32, 64, 4, 2),
+        (16, 128, 2, 4),
+        (64, 128, 4, 2),
+    )
 )
 
 def _bwd_dw_db_pre_hook(nargs):
@@ -76,10 +114,16 @@ _AUTOTUNE_BWD_DW_DB_CONFIGS = [
         num_stages=ns,
         pre_hook=_bwd_dw_db_pre_hook,
     )
-    for bt in (64, 128, 256)
-    for bc in (32, 64, 128)
-    for nw in (4, 8)
-    for ns in (2, 3)
+    for bt, bc, nw, ns in (
+        (256, 64, 4, 2),
+        (256, 64, 4, 1),
+        (256, 64, 4, 3),
+        (256, 32, 4, 2),
+        (256, 32, 4, 1),
+        (128, 64, 4, 2),
+        (128, 64, 2, 2),
+        (128, 32, 2, 2),
+    )
 ]
 
 
@@ -362,12 +406,12 @@ def _canon_ln_fwd_kernel(
     BLOCK_C: tl.constexpr,
     FP32_ACCUM: tl.constexpr,
 ):
-    """out[t,c] = LN(x)[t,c] + conv_bias[c] + Σ_k conv_w[c,k] * LN(x)[t+k-r,c]
+    """out[t,c] = gamma[c] * (x_hat[t,c] + Σ_k conv_w[c,k] * x_hat[t+k-r,c]) + conv_bias[c]
 
-    LN(x)[t,c] = (x[t,c] - mean[t]) * rstd[t] * gamma[c]
+    x_hat[t,c] = (x[t,c] - mean[t]) * rstd[t]
 
-    Fuses the LN normalize+scale into the conv forward, eliminating the
-    intermediate (T, C) LN output tensor.
+    Gamma is factored out of the K-tap loop to shorten live ranges and
+    reduce register pressure (enabling higher occupancy on H100).
     """
     K: tl.constexpr = 2 * RADIUS + 1
 
@@ -386,7 +430,7 @@ def _canon_ln_fwd_kernel(
     if FP32_ACCUM:
         gamma = gamma.to(tl.float32)
 
-    # Skip connection: LN(x)[t, c] for the residual
+    # Skip connection: x_hat[t, c] for the residual (gamma applied after loop)
     x_self_ptrs = x_ptr + t_offs[:, None] * stride_t + c_offs[None, :] * stride_c
     x_self = tl.load(x_self_ptrs, mask=t_mask[:, None] & c_mask[None, :], other=0.0)
     if FP32_ACCUM:
@@ -396,18 +440,18 @@ def _canon_ln_fwd_kernel(
     if FP32_ACCUM:
         my_mean = my_mean.to(tl.float32)
         my_rstd = my_rstd.to(tl.float32)
-    skip = (x_self - my_mean[:, None]) * my_rstd[:, None] * gamma[None, :]
+    x_hat_self = (x_self - my_mean[:, None]) * my_rstd[:, None]
 
-    # Conv bias
-    cb = tl.load(conv_b_ptr + c_offs, mask=c_mask, other=0.0)
+    # Center-tap specialization: the center tap (k=RADIUS) reads the same
+    # row as x_self, so fuse it with the skip connection to save 1 x load
+    # and 1 normalization per CTA.
+    w_center = tl.load(conv_w_ptr + c_offs * K + RADIUS, mask=c_mask, other=0.0)
     if FP32_ACCUM:
-        cb = cb.to(tl.float32)
+        w_center = w_center.to(tl.float32)
+    acc = (1.0 + w_center[None, :]) * x_hat_self
 
-    # Initialize accumulator with skip + bias
-    acc = skip + cb[None, :]
-
-    # Conv taps with inline LN normalization
-    for k in tl.static_range(K):
+    # Non-center taps: two half-loops around RADIUS (gamma factored out)
+    for k in tl.range(0, RADIUS):
         offset = k - RADIUS
         nbr_t = t_offs + offset
         in_bounds = (nbr_t >= 0) & (nbr_t < T)
@@ -415,28 +459,57 @@ def _canon_ln_fwd_kernel(
         nbr_seq = tl.load(seq_id_ptr + nbr_t, mask=in_bounds & t_mask, other=-1)
         valid = in_bounds & (my_seq == nbr_seq)
 
-        # Load raw x at neighbor position
         x_ptrs = x_ptr + nbr_t[:, None] * stride_t + c_offs[None, :] * stride_c
         x_val = tl.load(x_ptrs, mask=valid[:, None] & c_mask[None, :], other=0.0)
         if FP32_ACCUM:
             x_val = x_val.to(tl.float32)
 
-        # Inline LN normalize
         nbr_mean = tl.load(mean_ptr + nbr_t, mask=in_bounds & t_mask, other=0.0)
         nbr_rstd = tl.load(rstd_ptr + nbr_t, mask=in_bounds & t_mask, other=1.0)
         if FP32_ACCUM:
             nbr_mean = nbr_mean.to(tl.float32)
             nbr_rstd = nbr_rstd.to(tl.float32)
-        x_val = (x_val - nbr_mean[:, None]) * nbr_rstd[:, None] * gamma[None, :]
-        # Re-zero invalid positions: the normalization turns 0.0 → −mean*rstd*γ
-        x_val = tl.where(valid[:, None], x_val, 0.0)
+        x_hat = (x_val - nbr_mean[:, None]) * nbr_rstd[:, None]
+        x_hat = tl.where(valid[:, None], x_hat, 0.0)
 
-        # Conv weight
         w_k = tl.load(conv_w_ptr + c_offs * K + k, mask=c_mask, other=0.0)
         if FP32_ACCUM:
             w_k = w_k.to(tl.float32)
 
-        acc += x_val * w_k[None, :]
+        acc += x_hat * w_k[None, :]
+
+    for k in tl.range(RADIUS + 1, K):
+        offset = k - RADIUS
+        nbr_t = t_offs + offset
+        in_bounds = (nbr_t >= 0) & (nbr_t < T)
+
+        nbr_seq = tl.load(seq_id_ptr + nbr_t, mask=in_bounds & t_mask, other=-1)
+        valid = in_bounds & (my_seq == nbr_seq)
+
+        x_ptrs = x_ptr + nbr_t[:, None] * stride_t + c_offs[None, :] * stride_c
+        x_val = tl.load(x_ptrs, mask=valid[:, None] & c_mask[None, :], other=0.0)
+        if FP32_ACCUM:
+            x_val = x_val.to(tl.float32)
+
+        nbr_mean = tl.load(mean_ptr + nbr_t, mask=in_bounds & t_mask, other=0.0)
+        nbr_rstd = tl.load(rstd_ptr + nbr_t, mask=in_bounds & t_mask, other=1.0)
+        if FP32_ACCUM:
+            nbr_mean = nbr_mean.to(tl.float32)
+            nbr_rstd = nbr_rstd.to(tl.float32)
+        x_hat = (x_val - nbr_mean[:, None]) * nbr_rstd[:, None]
+        x_hat = tl.where(valid[:, None], x_hat, 0.0)
+
+        w_k = tl.load(conv_w_ptr + c_offs * K + k, mask=c_mask, other=0.0)
+        if FP32_ACCUM:
+            w_k = w_k.to(tl.float32)
+
+        acc += x_hat * w_k[None, :]
+
+    # Apply gamma and conv bias after the loop
+    cb = tl.load(conv_b_ptr + c_offs, mask=c_mask, other=0.0)
+    if FP32_ACCUM:
+        cb = cb.to(tl.float32)
+    acc = acc * gamma[None, :] + cb[None, :]
 
     out_ptrs = out_ptr + t_offs[:, None] * stride_t + c_offs[None, :] * stride_c
     tl.store(out_ptrs, acc, mask=t_mask[:, None] & c_mask[None, :])
@@ -611,7 +684,7 @@ def _fused_conv_bwd_dx_ln_bwd_kernel(
 
         # ── Step 1: conv_bwd_dx — transpose conv with flipped weights ──
         conv_acc = tl.zeros((BLOCK_N,), dtype=go_self.dtype)
-        for k in tl.static_range(K):
+        for k in tl.range(0, K):
             offset = k - RADIUS
             nbr = row + offset
             in_bounds = (nbr >= 0) & (nbr < T)
@@ -714,8 +787,24 @@ def _canon_ln_bwd_dw_db_partial_kernel(
     pb = tl.sum(go, axis=0)
     tl.store(partial_b_ptr + pid_t * C + c_offs, pb, mask=c_mask)
 
-    # Weight grad partials with inline LN recompute
-    for k in tl.static_range(K):
+    # Center-tap specialization: k=RADIUS reads t_offs (self), same as x_self.
+    # Compute it once without redundant x/mean/rstd loads.
+    x_self_ptrs = x_ptr + t_offs[:, None] * stride_t + c_offs[None, :] * stride_c
+    x_self = tl.load(x_self_ptrs, mask=t_mask[:, None] & c_mask[None, :], other=0.0)
+    if FP32_ACCUM:
+        x_self = x_self.to(tl.float32)
+    my_mean = tl.load(mean_ptr + t_offs, mask=t_mask, other=0.0)
+    my_rstd = tl.load(rstd_ptr + t_offs, mask=t_mask, other=1.0)
+    if FP32_ACCUM:
+        my_mean = my_mean.to(tl.float32)
+        my_rstd = my_rstd.to(tl.float32)
+    x_hat_self = (x_self - my_mean[:, None]) * my_rstd[:, None]
+
+    pw_center = tl.sum(go * x_hat_self, axis=0) * gamma
+    tl.store(partial_w_ptr + pid_t * C * K + c_offs * K + RADIUS, pw_center, mask=c_mask)
+
+    # Non-center taps: two half-loops around RADIUS
+    for k in tl.range(0, RADIUS):
         offset = k - RADIUS
         nbr_t = t_offs + offset
         in_bounds = (nbr_t >= 0) & (nbr_t < T)
@@ -733,33 +822,103 @@ def _canon_ln_bwd_dw_db_partial_kernel(
         if FP32_ACCUM:
             nbr_mean = nbr_mean.to(tl.float32)
             nbr_rstd = nbr_rstd.to(tl.float32)
-        x_val = (x_val - nbr_mean[:, None]) * nbr_rstd[:, None] * gamma[None, :]
-        x_val = tl.where(valid[:, None], x_val, 0.0)
+        x_hat = (x_val - nbr_mean[:, None]) * nbr_rstd[:, None]
+        x_hat = tl.where(valid[:, None], x_hat, 0.0)
 
-        pw_k = tl.sum(go * x_val, axis=0)
+        pw_k = tl.sum(go * x_hat, axis=0) * gamma
+        tl.store(partial_w_ptr + pid_t * C * K + c_offs * K + k, pw_k, mask=c_mask)
+
+    for k in tl.range(RADIUS + 1, K):
+        offset = k - RADIUS
+        nbr_t = t_offs + offset
+        in_bounds = (nbr_t >= 0) & (nbr_t < T)
+
+        nbr_seq = tl.load(seq_id_ptr + nbr_t, mask=in_bounds & t_mask, other=-1)
+        valid = in_bounds & (my_seq == nbr_seq)
+
+        x_ptrs = x_ptr + nbr_t[:, None] * stride_t + c_offs[None, :] * stride_c
+        x_val = tl.load(x_ptrs, mask=valid[:, None] & c_mask[None, :], other=0.0)
+        if FP32_ACCUM:
+            x_val = x_val.to(tl.float32)
+
+        nbr_mean = tl.load(mean_ptr + nbr_t, mask=in_bounds & t_mask, other=0.0)
+        nbr_rstd = tl.load(rstd_ptr + nbr_t, mask=in_bounds & t_mask, other=1.0)
+        if FP32_ACCUM:
+            nbr_mean = nbr_mean.to(tl.float32)
+            nbr_rstd = nbr_rstd.to(tl.float32)
+        x_hat = (x_val - nbr_mean[:, None]) * nbr_rstd[:, None]
+        x_hat = tl.where(valid[:, None], x_hat, 0.0)
+
+        pw_k = tl.sum(go * x_hat, axis=0) * gamma
         tl.store(partial_w_ptr + pid_t * C * K + c_offs * K + k, pw_k, mask=c_mask)
 
 
 # ── Fused LN+Conv autotune configs ─────────────────────────────────────
 
-_AUTOTUNE_LN_FWD_CONFIGS = _autotune_configs(
-    block_ts=(32, 64, 128),
-    block_cs=(64, 128),
-    warps=(4, 8),
-    stages=(2, 3),
+_AUTOTUNE_LN_FWD_CONFIGS = _streaming_configs(
+    (
+        # H100 160-sweep winners (C=1024, center-tap + gamma factoring)
+        (64, 32, 2, 1),    # best: 0.2050 ms
+        (32, 32, 1, 3),    # 0.2078 ms
+        (32, 32, 1, 2),    # 0.2081 ms
+        (32, 32, 1, 1),    # 0.2083 ms
+        (64, 32, 2, 2),    # 0.2114 ms
+        (64, 64, 4, 2),    # 0.2120 ms
+        (32, 128, 1, 1),   # 0.2141 ms (step2 winner)
+        # Anchors (different T shapes)
+        (16, 64, 2, 1),
+        (16, 128, 4, 2),
+        (64, 128, 4, 2),
+    )
 )
 
 _AUTOTUNE_LN_STATS_CONFIGS = [
-    triton.Config({}, num_warps=nw) for nw in (1, 2, 4, 8)
+    triton.Config({}, num_warps=nw, num_stages=ns)
+    for nw, ns in (
+        # H100 160-sweep winners (C=1024)
+        (1, 1),   # best: 0.0569 ms
+        (2, 2),   # 0.0581 ms
+        (2, 3),   # 0.0581 ms
+        (1, 3),   # 0.0582 ms
+        (1, 4),   # 0.0585 ms
+    )
 ]
 
-_AUTOTUNE_LN_BWD_CONFIGS = [
-    triton.Config({}, num_warps=nw) for nw in (1, 2, 4, 8)
-]
 
-_AUTOTUNE_FUSED_CONV_LN_BWD_CONFIGS = [
-    triton.Config({}, num_warps=nw) for nw in (1, 2, 4, 8)
-]
+def _ln_bwd_pre_hook(nargs):
+    nargs["partial_dgamma_ptr"].zero_()
+
+
+_AUTOTUNE_LN_BWD_CONFIGS = _rowwise_configs(
+    (
+        (8, 1),
+        (8, 4),
+        (10, 1),
+        (10, 2),
+        (24, 1),
+        (18, 4),
+    ),
+    pre_hook=_ln_bwd_pre_hook,
+)
+
+_AUTOTUNE_FUSED_CONV_LN_BWD_CONFIGS = _rowwise_configs(
+    (
+        # H100 160-sweep winners (C=1024, tl.range K-loop + center-tap)
+        (64, 8),   # best: 0.3799 ms
+        (72, 8),   # 0.3809 ms
+        (76, 8),   # 0.3811 ms
+        (80, 8),   # 0.3819 ms
+        (88, 8),   # 0.3819 ms
+        (56, 8),   # 0.3833 ms
+        (4, 8),    # 0.3892 ms
+        # Anchors (different T shapes)
+        (12, 8),
+        (24, 8),
+        (64, 4),
+        (64, 2),
+    ),
+    pre_hook=_ln_bwd_pre_hook,
+)
 
 
 def _ln_bwd_dw_db_partial_pre_hook(nargs):
@@ -775,10 +934,21 @@ _AUTOTUNE_LN_BWD_DW_DB_PARTIAL_CONFIGS = [
         num_stages=ns,
         pre_hook=_ln_bwd_dw_db_partial_pre_hook,
     )
-    for bt in (64, 128, 256)
-    for bc in (32, 64, 128)
-    for nw in (4, 8)
-    for ns in (2, 3)
+    for bt, bc, nw, ns in (
+        # H100 160-sweep winners (C=1024, center-tap + gamma factoring)
+        (64, 32, 1, 3),    # best: 0.2402 ms
+        (64, 32, 1, 1),    # 0.2407 ms
+        (64, 32, 1, 4),    # 0.2411 ms
+        (64, 32, 1, 2),    # 0.2417 ms
+        (64, 64, 1, 2),    # 0.2652 ms
+        (64, 64, 1, 1),    # 0.2667 ms (step2 winner)
+        (128, 64, 2, 1),   # 0.2583 ms
+        # Anchors (different T shapes)
+        (64, 64, 2, 1),
+        (128, 32, 2, 2),
+        (256, 32, 4, 2),
+        (256, 64, 4, 2),
+    )
 ]
 
 
@@ -826,10 +996,12 @@ def _ln_bwd_kernel_autotuned(
     grad_ln_out_ptr, x_ptr, mean_ptr, rstd_ptr, ln_w_ptr,
     grad_x_ptr, partial_dgamma_ptr,
     T, C, stride_t, stride_c,
-    rows_per_program,
+    num_sms,
     BLOCK_N: tl.constexpr,
+    PROGRAM_MULTIPLIER: tl.constexpr,
     FP32_ACCUM: tl.constexpr,
 ):
+    rows_per_program = tl.cdiv(T, num_sms * PROGRAM_MULTIPLIER)
     _ln_bwd_kernel(
         grad_ln_out_ptr, x_ptr, mean_ptr, rstd_ptr, ln_w_ptr,
         grad_x_ptr, partial_dgamma_ptr,
@@ -844,11 +1016,13 @@ def _fused_conv_bwd_dx_ln_bwd_kernel_autotuned(
     grad_out_ptr, x_ptr, seq_id_ptr, mean_ptr, rstd_ptr, ln_w_ptr, conv_w_ptr,
     grad_x_ptr, partial_dgamma_ptr,
     T, C, stride_t, stride_c,
-    rows_per_program,
+    num_sms,
     RADIUS: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    PROGRAM_MULTIPLIER: tl.constexpr,
     FP32_ACCUM: tl.constexpr,
 ):
+    rows_per_program = tl.cdiv(T, num_sms * PROGRAM_MULTIPLIER)
     _fused_conv_bwd_dx_ln_bwd_kernel(
         grad_out_ptr, x_ptr, seq_id_ptr, mean_ptr, rstd_ptr, ln_w_ptr, conv_w_ptr,
         grad_x_ptr, partial_dgamma_ptr,

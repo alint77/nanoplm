@@ -199,9 +199,24 @@ _FWD_BLOCK_T, _FWD_BLOCK_C = 64, 128        # 78% roofline
 _BWD_DX_BLOCK_T, _BWD_DX_BLOCK_C = 32, 128  # 83% roofline
 _BWD_DW_BLOCK_T, _BWD_DW_BLOCK_C = 256, 64  # 48% roofline (atomic_add bound)
 
+# H100-tuned fallback values (T=65536, C=1024, K=7, bf16).
+_H100_FWD = {"block_t": 16, "block_c": 64, "num_warps": 1, "num_stages": 3}
+_H100_BWD_DX = {"block_t": 32, "block_c": 64, "num_warps": 1, "num_stages": 4}
+_H100_BWD_DW = {"block_t": 256, "block_c": 64, "num_warps": 4, "num_stages": 2}
+_H100_LN_STATS = {"num_warps": 2, "num_stages": 4}
+_H100_LN_FWD = {"block_t": 32, "block_c": 32, "num_warps": 1, "num_stages": 4}
+_H100_LN_BWD_DW = {"block_t": 64, "block_c": 64, "num_warps": 2, "num_stages": 1}
+_H100_LN_BWD = {"program_multiplier": 8, "num_warps": 1}
+_H100_FUSED_CONV_LN_BWD = {"program_multiplier": 64, "num_warps": 8}
+
 
 def _needs_fp32_accum(dtype: torch.dtype) -> bool:
     return dtype in (torch.float16, torch.bfloat16)
+
+
+def _is_h100_device(device: torch.device | int | str) -> bool:
+    name = torch.cuda.get_device_properties(device).name.upper()
+    return "H100" in name
 
 
 @torch.library.impl(_lib, "varlen_conv_fwd", "CUDA")
@@ -215,6 +230,9 @@ def _fwd_cuda(x, seq_id, weight, bias, radius):
     fp32_acc = _needs_fp32_accum(x.dtype)
 
     out = torch.empty_like(x)
+    fallback = _H100_FWD if _is_h100_device(x.device) else {
+        "block_t": _FWD_BLOCK_T, "block_c": _FWD_BLOCK_C, "num_warps": 4, "num_stages": 2,
+    }
     if _autotune_enabled():
         autotuner = k._canon_fwd_kernel_autotuned
         status = _autotune_status_begin(
@@ -229,16 +247,16 @@ def _fwd_cuda(x, seq_id, weight, bias, radius):
         )
         _autotune_status_end(kernel_name="canon_fwd", autotuner=autotuner, state=status)
     else:
-        grid = (triton.cdiv(T, _FWD_BLOCK_T), triton.cdiv(C, _FWD_BLOCK_C))
+        grid = (triton.cdiv(T, fallback["block_t"]), triton.cdiv(C, fallback["block_c"]))
         k._canon_fwd_kernel[grid](
             x, seq_id, weight, bias, out,
             T, C, x.stride(0), x.stride(1),
             RADIUS=radius,
-            BLOCK_T=_FWD_BLOCK_T,
-            BLOCK_C=_FWD_BLOCK_C,
+            BLOCK_T=fallback["block_t"],
+            BLOCK_C=fallback["block_c"],
             FP32_ACCUM=fp32_acc,
-            num_warps=4,
-            num_stages=2,
+            num_warps=fallback["num_warps"],
+            num_stages=fallback["num_stages"],
         )
     return out
 
@@ -253,6 +271,9 @@ def _bwd_dx_cuda(grad_out, seq_id, weight, radius):
     fp32_acc = _needs_fp32_accum(grad_out.dtype)
 
     grad_x = torch.empty_like(grad_out)
+    fallback = _H100_BWD_DX if _is_h100_device(grad_out.device) else {
+        "block_t": _BWD_DX_BLOCK_T, "block_c": _BWD_DX_BLOCK_C, "num_warps": 4, "num_stages": 2,
+    }
     if _autotune_enabled():
         autotuner = k._canon_bwd_dx_kernel_autotuned
         status = _autotune_status_begin(
@@ -267,16 +288,16 @@ def _bwd_dx_cuda(grad_out, seq_id, weight, radius):
         )
         _autotune_status_end(kernel_name="canon_bwd_dx", autotuner=autotuner, state=status)
     else:
-        grid = (triton.cdiv(T, _BWD_DX_BLOCK_T), triton.cdiv(C, _BWD_DX_BLOCK_C))
+        grid = (triton.cdiv(T, fallback["block_t"]), triton.cdiv(C, fallback["block_c"]))
         k._canon_bwd_dx_kernel[grid](
             grad_out, seq_id, weight, grad_x,
             T, C, grad_out.stride(0), grad_out.stride(1),
             RADIUS=radius,
-            BLOCK_T=_BWD_DX_BLOCK_T,
-            BLOCK_C=_BWD_DX_BLOCK_C,
+            BLOCK_T=fallback["block_t"],
+            BLOCK_C=fallback["block_c"],
             FP32_ACCUM=fp32_acc,
-            num_warps=4,
-            num_stages=2,
+            num_warps=fallback["num_warps"],
+            num_stages=fallback["num_stages"],
         )
     return grad_x
 
@@ -295,6 +316,9 @@ def _bwd_dw_db_cuda(grad_out, x, seq_id, radius):
     acc_dtype = torch.float32 if fp32_acc else x.dtype
     grad_w = torch.zeros(C, K, dtype=acc_dtype, device=x.device)
     grad_b = torch.zeros(C, dtype=acc_dtype, device=x.device)
+    fallback = _H100_BWD_DW if _is_h100_device(x.device) else {
+        "block_t": _BWD_DW_BLOCK_T, "block_c": _BWD_DW_BLOCK_C, "num_warps": 4, "num_stages": 2,
+    }
 
     if _autotune_enabled():
         autotuner = k._canon_bwd_dw_db_kernel_autotuned
@@ -310,24 +334,21 @@ def _bwd_dw_db_cuda(grad_out, x, seq_id, radius):
         )
         _autotune_status_end(kernel_name="canon_bwd_dw_db", autotuner=autotuner, state=status)
     else:
-        grid = (triton.cdiv(T, _BWD_DW_BLOCK_T), triton.cdiv(C, _BWD_DW_BLOCK_C))
+        grid = (triton.cdiv(T, fallback["block_t"]), triton.cdiv(C, fallback["block_c"]))
         k._canon_bwd_dw_db_kernel[grid](
             grad_out, x, seq_id, grad_w, grad_b,
             T, C, grad_out.stride(0), grad_out.stride(1),
             RADIUS=radius,
-            BLOCK_T=_BWD_DW_BLOCK_T,
-            BLOCK_C=_BWD_DW_BLOCK_C,
+            BLOCK_T=fallback["block_t"],
+            BLOCK_C=fallback["block_c"],
             FP32_ACCUM=fp32_acc,
-            num_warps=4,
-            num_stages=2,
+            num_warps=fallback["num_warps"],
+            num_stages=fallback["num_stages"],
         )
     return grad_w, grad_b
 
 
 # ── Fused LN+Conv CUDA implementations ────────────────────────────────────
-
-_LN_FWD_BLOCK_T, _LN_FWD_BLOCK_C = 64, 128
-_LN_BWD_DW_BLOCK_T, _LN_BWD_DW_BLOCK_C = 256, 64
 
 
 @torch.library.impl(_lib, "varlen_ln_conv_fwd", "CUDA")
@@ -346,6 +367,7 @@ def _ln_conv_fwd_cuda(x, seq_id, ln_weight, ln_eps, conv_weight, conv_bias, radi
     acc_dtype = torch.float32 if fp32_acc else x.dtype
     mean = torch.empty(T, dtype=acc_dtype, device=x.device)
     rstd = torch.empty(T, dtype=acc_dtype, device=x.device)
+    ln_stats_fallback = _H100_LN_STATS if _is_h100_device(x.device) else {"num_warps": 4, "num_stages": 1}
     if _autotune_enabled():
         autotuner = k._ln_stats_kernel_autotuned
         status = _autotune_status_begin(
@@ -363,10 +385,14 @@ def _ln_conv_fwd_cuda(x, seq_id, ln_weight, ln_eps, conv_weight, conv_bias, radi
             x, mean, rstd,
             T, C, x.stride(0), x.stride(1),
             ln_eps, BLOCK_N=BLOCK_N, FP32_ACCUM=fp32_acc,
-            num_warps=4,
+            num_warps=ln_stats_fallback["num_warps"],
+            num_stages=ln_stats_fallback["num_stages"],
         )
 
     out = torch.empty_like(x)
+    ln_fwd_fallback = _H100_LN_FWD if _is_h100_device(x.device) else {
+        "block_t": 64, "block_c": 128, "num_warps": 4, "num_stages": 2,
+    }
     if _autotune_enabled():
         autotuner = k._canon_ln_fwd_kernel_autotuned
         status = _autotune_status_begin(
@@ -382,17 +408,17 @@ def _ln_conv_fwd_cuda(x, seq_id, ln_weight, ln_eps, conv_weight, conv_bias, radi
         )
         _autotune_status_end(kernel_name="canon_ln_fwd", autotuner=autotuner, state=status)
     else:
-        grid = (triton.cdiv(T, _LN_FWD_BLOCK_T), triton.cdiv(C, _LN_FWD_BLOCK_C))
+        grid = (triton.cdiv(T, ln_fwd_fallback["block_t"]), triton.cdiv(C, ln_fwd_fallback["block_c"]))
         k._canon_ln_fwd_kernel[grid](
             x, seq_id, mean, rstd, ln_weight,
             conv_weight, conv_bias, out,
             T, C, x.stride(0), x.stride(1),
             RADIUS=radius,
-            BLOCK_T=_LN_FWD_BLOCK_T,
-            BLOCK_C=_LN_FWD_BLOCK_C,
+            BLOCK_T=ln_fwd_fallback["block_t"],
+            BLOCK_C=ln_fwd_fallback["block_c"],
             FP32_ACCUM=fp32_acc,
-            num_warps=4,
-            num_stages=2,
+            num_warps=ln_fwd_fallback["num_warps"],
+            num_stages=ln_fwd_fallback["num_stages"],
         )
     return out, mean, rstd
 
@@ -410,7 +436,10 @@ def _ln_conv_bwd_dw_db_cuda(grad_out, x, seq_id, ln_weight, mean, rstd, radius):
 
     acc_dtype = torch.float32 if fp32_acc else x.dtype
     # Partial-buffer reduction: each T-block writes its partials, host sums.
-    _MIN_BLOCK_T = 64  # smallest BLOCK_T in autotune configs
+    fallback = _H100_LN_BWD_DW if _is_h100_device(x.device) else {
+        "block_t": 256, "block_c": 64, "num_warps": 4, "num_stages": 2,
+    }
+    _MIN_BLOCK_T = 64  # smallest BLOCK_T in tuned/autotune configs
     max_t_blocks = triton.cdiv(T, _MIN_BLOCK_T)
     partial_w = torch.zeros(max_t_blocks, C * K, dtype=acc_dtype, device=x.device)
     partial_b = torch.zeros(max_t_blocks, C, dtype=acc_dtype, device=x.device)
@@ -430,17 +459,17 @@ def _ln_conv_bwd_dw_db_cuda(grad_out, x, seq_id, ln_weight, mean, rstd, radius):
         )
         _autotune_status_end(kernel_name="canon_ln_bwd_dw_db", autotuner=autotuner, state=status)
     else:
-        grid = (triton.cdiv(T, _LN_BWD_DW_BLOCK_T), triton.cdiv(C, _LN_BWD_DW_BLOCK_C))
+        grid = (triton.cdiv(T, fallback["block_t"]), triton.cdiv(C, fallback["block_c"]))
         k._canon_ln_bwd_dw_db_partial_kernel[grid](
             grad_out, x, seq_id, mean, rstd, ln_weight,
             partial_w, partial_b,
             T, C, grad_out.stride(0), grad_out.stride(1),
             RADIUS=radius,
-            BLOCK_T=_LN_BWD_DW_BLOCK_T,
-            BLOCK_C=_LN_BWD_DW_BLOCK_C,
+            BLOCK_T=fallback["block_t"],
+            BLOCK_C=fallback["block_c"],
             FP32_ACCUM=fp32_acc,
-            num_warps=4,
-            num_stages=2,
+            num_warps=fallback["num_warps"],
+            num_stages=fallback["num_stages"],
         )
     # Reduce partial buffers
     grad_w = partial_w.view(max_t_blocks, C, K).sum(0)
@@ -460,35 +489,46 @@ def _ln_bwd_dx_dgamma_cuda(grad_ln_out, x, mean, rstd, ln_weight):
     fp32_acc = _needs_fp32_accum(x.dtype)
     acc_dtype = torch.float32 if fp32_acc else x.dtype
 
-    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count * 8
-    rows_per_program = math.ceil(T / sm_count)
-
-    grad_x = torch.empty_like(x)
-    partial_dgamma = torch.zeros(sm_count, C, dtype=acc_dtype, device=x.device)
-
+    num_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+    fallback = _H100_LN_BWD if _is_h100_device(x.device) else {"program_multiplier": 8, "num_warps": 4}
     if _autotune_enabled():
         autotuner = k._ln_bwd_kernel_autotuned
+        max_pm = max(getattr(cfg, "kwargs", {}).get("PROGRAM_MULTIPLIER", 1) for cfg in autotuner.configs)
+        max_programs = num_sms * max_pm
+    else:
+        max_programs = num_sms * fallback["program_multiplier"]
+
+    grad_x = torch.empty_like(x)
+    partial_dgamma = torch.zeros(max_programs, C, dtype=acc_dtype, device=x.device)
+
+    if _autotune_enabled():
         status = _autotune_status_begin(
             kernel_name="canon_ln_bwd", autotuner=autotuner,
             args_by_name={"T": T, "C": C},
         )
-        autotuner[(sm_count,)](
+        grid = lambda META: (num_sms * META["PROGRAM_MULTIPLIER"],)
+        autotuner[grid](
             grad_ln_out, x, mean, rstd, ln_weight,
             grad_x, partial_dgamma,
             T, C, x.stride(0), x.stride(1),
-            rows_per_program, BLOCK_N=BLOCK_N, FP32_ACCUM=fp32_acc,
+            num_sms, BLOCK_N=BLOCK_N, FP32_ACCUM=fp32_acc,
         )
         _autotune_status_end(kernel_name="canon_ln_bwd", autotuner=autotuner, state=status)
+        selected = autotuner.cache.get((T, C), getattr(autotuner, "best_config", None))
+        program_multiplier = getattr(selected, "kwargs", {}).get("PROGRAM_MULTIPLIER", fallback["program_multiplier"])
+        num_programs = num_sms * program_multiplier
     else:
-        k._ln_bwd_kernel[(sm_count,)](
+        num_programs = num_sms * fallback["program_multiplier"]
+        rows_per_program = math.ceil(T / num_programs)
+        k._ln_bwd_kernel[(num_programs,)](
             grad_ln_out, x, mean, rstd, ln_weight,
             grad_x, partial_dgamma,
             T, C, x.stride(0), x.stride(1),
             rows_per_program, BLOCK_N=BLOCK_N, FP32_ACCUM=fp32_acc,
-            num_warps=4,
+            num_warps=fallback["num_warps"],
         )
 
-    grad_gamma = partial_dgamma.sum(0).to(ln_weight.dtype)
+    grad_gamma = partial_dgamma[:num_programs].sum(0).to(ln_weight.dtype)
     return grad_x, grad_gamma
 
 
@@ -506,35 +546,46 @@ def _ln_conv_bwd_dx_dgamma_cuda(grad_out, x, seq_id, mean, rstd, ln_weight, conv
     fp32_acc = _needs_fp32_accum(x.dtype)
     acc_dtype = torch.float32 if fp32_acc else x.dtype
 
-    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count * 8
-    rows_per_program = math.ceil(T / sm_count)
-
-    grad_x = torch.empty_like(x)
-    partial_dgamma = torch.zeros(sm_count, C, dtype=acc_dtype, device=x.device)
-
+    num_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+    fallback = _H100_FUSED_CONV_LN_BWD if _is_h100_device(x.device) else {"program_multiplier": 8, "num_warps": 4}
     if _autotune_enabled():
         autotuner = k._fused_conv_bwd_dx_ln_bwd_kernel_autotuned
+        max_pm = max(getattr(cfg, "kwargs", {}).get("PROGRAM_MULTIPLIER", 1) for cfg in autotuner.configs)
+        max_programs = num_sms * max_pm
+    else:
+        max_programs = num_sms * fallback["program_multiplier"]
+
+    grad_x = torch.empty_like(x)
+    partial_dgamma = torch.zeros(max_programs, C, dtype=acc_dtype, device=x.device)
+
+    if _autotune_enabled():
         status = _autotune_status_begin(
             kernel_name="canon_fused_conv_ln_bwd", autotuner=autotuner,
             args_by_name={"T": T, "C": C},
         )
-        autotuner[(sm_count,)](
+        grid = lambda META: (num_sms * META["PROGRAM_MULTIPLIER"],)
+        autotuner[grid](
             grad_out, x, seq_id, mean, rstd, ln_weight, conv_weight,
             grad_x, partial_dgamma,
             T, C, x.stride(0), x.stride(1),
-            rows_per_program, RADIUS=radius, BLOCK_N=BLOCK_N, FP32_ACCUM=fp32_acc,
+            num_sms, RADIUS=radius, BLOCK_N=BLOCK_N, FP32_ACCUM=fp32_acc,
         )
         _autotune_status_end(kernel_name="canon_fused_conv_ln_bwd", autotuner=autotuner, state=status)
+        selected = autotuner.cache.get((T, C), getattr(autotuner, "best_config", None))
+        program_multiplier = getattr(selected, "kwargs", {}).get("PROGRAM_MULTIPLIER", fallback["program_multiplier"])
+        num_programs = num_sms * program_multiplier
     else:
-        k._fused_conv_bwd_dx_ln_bwd_kernel[(sm_count,)](
+        num_programs = num_sms * fallback["program_multiplier"]
+        rows_per_program = math.ceil(T / num_programs)
+        k._fused_conv_bwd_dx_ln_bwd_kernel[(num_programs,)](
             grad_out, x, seq_id, mean, rstd, ln_weight, conv_weight,
             grad_x, partial_dgamma,
             T, C, x.stride(0), x.stride(1),
             rows_per_program, RADIUS=radius, BLOCK_N=BLOCK_N, FP32_ACCUM=fp32_acc,
-            num_warps=4,
+            num_warps=fallback["num_warps"],
         )
 
-    grad_gamma = partial_dgamma.sum(0).to(ln_weight.dtype)
+    grad_gamma = partial_dgamma[:num_programs].sum(0).to(ln_weight.dtype)
     return grad_x, grad_gamma
 
 
