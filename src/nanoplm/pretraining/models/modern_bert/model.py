@@ -67,6 +67,13 @@ class ProtModernBertMLMConfig:
     mhc_lite_wrapping_level: str = "layer"
     use_diff_attn_v2: bool = False
     attn_layer_pattern: Optional[str] = None
+    # NOBLE
+    use_noble: bool = False
+    noble_rank: int = 64
+    noble_alpha: float = 0.01
+    noble_omega_range: tuple = (0.8, 1.2)
+    noble_phi_std: float = 0.1
+    noble_half_kaiming: bool = True
 
 
 class ProtModernBertMLM(ModernBertForMaskedLM):
@@ -75,6 +82,11 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
         self,
         config: ProtModernBertMLMConfig
     ):
+        if config.use_noble:
+            raise ValueError(
+                "NOBLE is implemented only in the pure-torch path. "
+                "Use --pure-torch with use_noble=true."
+            )
         if config.use_canon_layers:
             raise ValueError(
                 "Canon layers are currently implemented only in the pure-torch path. "
