@@ -16,7 +16,11 @@ import torch
 import torch.distributed as dist
 import transformer_engine.pytorch as te
 import wandb
-from dion import Muon as DionMuon, NorMuon as DionNorMuon
+try:
+    from dion import Muon as DionMuon, NorMuon as DionNorMuon
+except ImportError:
+    class DionMuon: pass      # sentinel – isinstance() safely returns False
+    class DionNorMuon: pass
 from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
