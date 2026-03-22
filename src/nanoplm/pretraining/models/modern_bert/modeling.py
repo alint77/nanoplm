@@ -112,6 +112,15 @@ def _resolve_canon_kernel_size(
     return canon_layers_kernel_size
 
 
+_NOBLE_TARGET_ROLES: dict[str, frozenset[str]] = {
+    "all":    frozenset({"attn_qkv", "attn_out", "ffn_wi", "ffn_wo"}),
+    "attn":   frozenset({"attn_qkv", "attn_out"}),
+    "ffn":    frozenset({"ffn_wi", "ffn_wo"}),
+    "qkv":    frozenset({"attn_qkv"}),
+    "out":    frozenset({"attn_out", "ffn_wo"}),
+}
+
+
 @dataclass
 class ModernBertConfig:
     vocab_size: int = 50368
@@ -175,6 +184,7 @@ class ModernBertConfig:
     noble_omega_range: tuple[float, float] = (0.8, 1.2)  # freq init range
     noble_phi_std: float = 0.1              # phase init std
     noble_half_kaiming: bool = True          # halve main weight init scale
+    noble_targets: str = "all"              # which projections get NOBLE: all|attn|ffn|qkv|out
 
     head_dim: int = field(init=False)
     sliding_window: int = field(init=False)
@@ -286,6 +296,11 @@ class ModernBertConfig:
                 "Low-rank factorization provides no parameter savings at this rank. "
                 "Typical values are 64–256.",
                 stacklevel=2,
+            )
+        if self.use_noble and self.noble_targets not in _NOBLE_TARGET_ROLES:
+            raise ValueError(
+                f"noble_targets={self.noble_targets!r} is not supported. "
+                f"Choose from: {', '.join(sorted(_NOBLE_TARGET_ROLES))}."
             )
 
 
@@ -602,18 +617,21 @@ def _build_linear(
     out_features: int,
     config: ModernBertConfig,
     bias: bool = False,
+    role: str = "attn_qkv",
 ) -> nn.Module:
-    """Factory: returns NOBLELinear if NOBLE is enabled, else plain nn.Linear."""
+    """Factory: returns NOBLELinear if NOBLE is enabled for this role, else plain nn.Linear."""
     if config.use_noble:
-        return NOBLELinear(
-            in_features,
-            out_features,
-            rank=config.noble_rank,
-            bias=bias,
-            alpha=config.noble_alpha,
-            omega_range=config.noble_omega_range,
-            phi_std=config.noble_phi_std,
-        )
+        targets = _NOBLE_TARGET_ROLES.get(config.noble_targets, _NOBLE_TARGET_ROLES["all"])
+        if role in targets:
+            return NOBLELinear(
+                in_features,
+                out_features,
+                rank=config.noble_rank,
+                bias=bias,
+                alpha=config.noble_alpha,
+                omega_range=config.noble_omega_range,
+                phi_std=config.noble_phi_std,
+            )
     return nn.Linear(in_features, out_features, bias=bias)
 
 
@@ -928,12 +946,14 @@ class ModernBertMLP(nn.Module):
             2 * config.intermediate_size,
             config,
             bias=config.mlp_bias,
+            role="ffn_wi",
         )
         self.Wo = _build_linear(
             config.intermediate_size,
             config.hidden_size,
             config,
             bias=config.mlp_bias,
+            role="ffn_wo",
         )
         self.drop = nn.Dropout(config.mlp_dropout)
         self.act = _get_activation(config.hidden_activation)
@@ -1016,12 +1036,14 @@ class ModernBertSwiGLUMLP(nn.Module):
             2 * config.intermediate_size,
             config,
             bias=config.mlp_bias,
+            role="ffn_wi",
         )
         self.Wo = _build_linear(
             config.intermediate_size,
             config.hidden_size,
             config,
             bias=config.mlp_bias,
+            role="ffn_wo",
         )
         self.drop = nn.Dropout(config.mlp_dropout)
         self.canon_d = (
@@ -1077,6 +1099,7 @@ class ModernBertAttention(nn.Module):
         qkv_dim = (self.num_q_heads + 2 * self.num_kv_heads) * self.head_dim
         self.Wqkv = _build_linear(
             config.hidden_size, qkv_dim, config, bias=config.attention_bias,
+            role="attn_qkv",
         )
 
         self.Wo = _build_linear(
@@ -1084,6 +1107,7 @@ class ModernBertAttention(nn.Module):
             config.hidden_size,
             config,
             bias=config.attention_bias,
+            role="attn_out",
         )
         self.out_drop = (
             nn.Dropout(config.attention_dropout)

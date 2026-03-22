@@ -74,6 +74,7 @@ class ProtModernBertMLMConfig:
     noble_omega_range: tuple = (0.8, 1.2)
     noble_phi_std: float = 0.1
     noble_half_kaiming: bool = True
+    noble_targets: str = "all"
 
 
 class ProtModernBertMLM(ModernBertForMaskedLM):

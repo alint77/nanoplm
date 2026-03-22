@@ -1205,6 +1205,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  noble_rank: 64  # NOBLE bottleneck rank (typical: 64-256)\n"
         "  noble_alpha: 0.01  # NOBLE W_up initialization scale\n"
         "  noble_half_kaiming: true  # halve main weight init scale for NOBLE layers (paper §3.3)\n"
+        "  noble_targets: all  # which projections get NOBLE: all|attn|ffn|qkv|out\n"
         "  attn_layer_pattern: null  # Attention pattern string e.g. 'FSS' (F=full, S=sliding). Tiles to num_layers. Overrides global_attn_every_n_layers.\n"
         "  activation_checkpointing: false  # Enable to reduce VRAM by recomputing activations during backward\n"
         "  activation_checkpointing_mode: \"attn\"  # (layer | attn | attn+mlp), attn mode has highest ROI \n"

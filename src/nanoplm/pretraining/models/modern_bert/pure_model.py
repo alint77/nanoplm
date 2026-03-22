@@ -88,6 +88,7 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             noble_omega_range=config.noble_omega_range,
             noble_phi_std=config.noble_phi_std,
             noble_half_kaiming=config.noble_half_kaiming,
+            noble_targets=config.noble_targets,
         )
 
         super().__init__(mb_config)
