@@ -63,8 +63,3 @@ scripts/
 
 # Planning directory (local only)
 .planning/
-
-swissprot-poc/
-e2e_test/
-new-testing/
-noble_ablation/
