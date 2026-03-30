@@ -1682,6 +1682,7 @@ def run_pure_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
+            extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
         )
         if use_static_inp_size:
             min_tokens_per_seq = max(
@@ -1723,6 +1724,7 @@ def run_pure_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
+            extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
         )
         train_sampler = DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed) if distributed else RandomSampler(train_ds)
 
@@ -1833,6 +1835,7 @@ def run_pure_pretraining(
         mask_token_probability=pretrain_config.mask_replace_prob,
         random_token_probability=pretrain_config.random_token_prob,
         keep_probability=pretrain_config.keep_probability,
+        extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
     )
 
     dl_kwargs = dict(

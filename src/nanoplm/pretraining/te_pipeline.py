@@ -466,6 +466,7 @@ def run_te_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
+            extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
         )
         if use_static_inp_size:
             assert tokens_per_micro == pack_tokens_per_micro
@@ -504,6 +505,7 @@ def run_te_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
+            extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
         )
     else:
         train_sampler = RandomSampler(train_ds)
@@ -513,6 +515,7 @@ def run_te_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
+            extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
         )
 
     # Keep orig_model reference for checkpointing/eval.
@@ -537,6 +540,7 @@ def run_te_pretraining(
         mask_token_probability=pretrain_config.mask_replace_prob,
         random_token_probability=pretrain_config.random_token_prob,
         keep_probability=pretrain_config.keep_probability,
+        extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
     )
     dl_kwargs = dict(
         num_workers=num_workers,
