@@ -19,12 +19,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _checkpoint
 
-# Registers torch.ops.nanoplm_mhc::* used by MHCLiteBlock's Triton path.
-from . import mhc_triton_ops as _mhc_triton_ops  # noqa: F401
-# Registers torch.ops.nanoplm_canon::* — Triton varlen depthwise conv.
-from . import canon_ops as _canon_ops
-from .canon_ops import varlen_canon_conv as _varlen_canon_conv
-from .canon_ops import varlen_ln_canon_conv as _varlen_ln_canon_conv
+if torch.cuda.is_available():
+    # Registers torch.ops.nanoplm_mhc::* used by MHCLiteBlock's Triton path.
+    from . import mhc_triton_ops as _mhc_triton_ops  # noqa: F401
+    # Registers torch.ops.nanoplm_canon::* — Triton varlen depthwise conv.
+    from . import canon_ops as _canon_ops
+    from .canon_ops import varlen_canon_conv as _varlen_canon_conv
+    from .canon_ops import varlen_ln_canon_conv as _varlen_ln_canon_conv
+else:
+    _mhc_triton_ops = None  # type: ignore[assignment]
+    _canon_ops = None  # type: ignore[assignment]
+    _varlen_canon_conv = None  # type: ignore[assignment]
+    _varlen_ln_canon_conv = None  # type: ignore[assignment]
 
 _HAS_FLASH_VARLEN = False
 _flash_varlen_fn = None
@@ -106,6 +112,15 @@ def _resolve_canon_kernel_size(
     return canon_layers_kernel_size
 
 
+_NOBLE_TARGET_ROLES: dict[str, frozenset[str]] = {
+    "all":    frozenset({"attn_qkv", "attn_out", "ffn_wi", "ffn_wo"}),
+    "attn":   frozenset({"attn_qkv", "attn_out"}),
+    "ffn":    frozenset({"ffn_wi", "ffn_wo"}),
+    "qkv":    frozenset({"attn_qkv"}),
+    "out":    frozenset({"attn_out", "ffn_wo"}),
+}
+
+
 @dataclass
 class ModernBertConfig:
     vocab_size: int = 50368
@@ -162,6 +177,14 @@ class ModernBertConfig:
     mhc_lite_wrapping_level: Literal["layer", "sublayers"] = "layer"
     use_diff_attn_v2: bool = False
     attn_layer_pattern: Optional[str] = None
+    # NOBLE: Nonlinear low-rank branches for linear enhancement
+    use_noble: bool = False
+    noble_rank: int = 64
+    noble_alpha: float = 0.01               # W_up init scale
+    noble_omega_range: tuple[float, float] = (0.8, 1.2)  # freq init range
+    noble_phi_std: float = 0.1              # phase init std
+    noble_half_kaiming: bool = True          # halve main weight init scale
+    noble_targets: str = "all"              # which projections get NOBLE: all|attn|ffn|qkv|out
 
     head_dim: int = field(init=False)
     sliding_window: int = field(init=False)
@@ -256,6 +279,28 @@ class ModernBertConfig:
                 "GQA (num_kv_heads != num_attention_heads) is not compatible with use_repo. "
                 "RePO predicts per-head positions for Q and K jointly, which requires "
                 "equal Q/K head counts."
+            )
+        if self.use_noble and self.mlp_activation == "srelu":
+            import warnings
+            warnings.warn(
+                "use_noble=True with mlp_activation='srelu': NOBLE is applied to attention "
+                "layers (Wqkv, Wo) but NOT to SReluMLP layers (Wi uses a Triton kernel that "
+                "extracts raw weights, Wo is a raw nn.Parameter). Consider using 'swiglu' "
+                "for full NOBLE coverage.",
+                stacklevel=2,
+            )
+        if self.use_noble and self.noble_rank >= self.hidden_size:
+            import warnings
+            warnings.warn(
+                f"noble_rank ({self.noble_rank}) >= hidden_size ({self.hidden_size}). "
+                "Low-rank factorization provides no parameter savings at this rank. "
+                "Typical values are 64–256.",
+                stacklevel=2,
+            )
+        if self.use_noble and self.noble_targets not in _NOBLE_TARGET_ROLES:
+            raise ValueError(
+                f"noble_targets={self.noble_targets!r} is not supported. "
+                f"Choose from: {', '.join(sorted(_NOBLE_TARGET_ROLES))}."
             )
 
 
@@ -455,6 +500,139 @@ def _position_ids_from_cu_seqlens(
     seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
     offsets = cu_seqlens[:-1].repeat_interleave(seq_lens)
     return torch.arange(total, device=device, dtype=torch.int32) - offsets
+
+
+# ---------------------------------------------------------------------------
+# NOBLE: Nonlinear lOw-rank Branch for Linear Enhancement
+# Paper: "NOBLE: Accelerating Transformers with Nonlinear Low-Rank Branches"
+# (Smith, 2026, arXiv:2603.06492)
+# ---------------------------------------------------------------------------
+
+
+class CosNet(nn.Module):
+    """Two-layer cosine nonlinearity with learnable frequency, phase, and mixing.
+
+    CosNet(h) = cos(ω₂ ⊙ (M · cos(ω₁ ⊙ h + φ₁)) + φ₂)
+
+    where h ∈ ℝʳ is the bottleneck representation, M ∈ ℝʳˣʳ is a learned
+    mixing matrix, and each dimension i has learnable ωᵢ and φᵢ parameters.
+    """
+
+    def __init__(
+        self,
+        rank: int,
+        omega_range: tuple[float, float] = (0.8, 1.2),
+        phi_std: float = 0.1,
+    ):
+        super().__init__()
+        self.rank = rank
+        # First cosine layer: learnable frequency and phase
+        self.omega1 = nn.Parameter(torch.empty(rank))
+        self.phi1 = nn.Parameter(torch.empty(rank))
+        # Mixing matrix (r × r)
+        self.M = nn.Parameter(torch.empty(rank, rank))
+        # Second cosine layer: learnable frequency and phase
+        self.omega2 = nn.Parameter(torch.empty(rank))
+        self.phi2 = nn.Parameter(torch.empty(rank))
+
+        # --- Initialization (paper Appendix A) ---
+        # Frequencies: Uniform[ω_min, ω_max]
+        nn.init.uniform_(self.omega1, omega_range[0], omega_range[1])
+        nn.init.uniform_(self.omega2, omega_range[0], omega_range[1])
+        # Phases: Normal(0, σ_φ)
+        nn.init.normal_(self.phi1, mean=0.0, std=phi_std)
+        nn.init.normal_(self.phi2, mean=0.0, std=phi_std)
+        # Mixing matrix: Xavier uniform
+        nn.init.xavier_uniform_(self.M)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        # h: (..., rank)
+        h = torch.cos(self.omega1 * h + self.phi1)   # eq (5)
+        h = F.linear(h, self.M)                       # eq (6): M @ h (F.linear computes h @ M^T)
+        h = torch.cos(self.omega2 * h + self.phi2)   # eq (7)
+        return h
+
+
+class NOBLELinear(nn.Module):
+    """Drop-in replacement for nn.Linear with a nonlinear low-rank branch.
+
+    f_NOBLE(x) = xW + b + CosNet(x @ W_down^T) @ W_up^T
+
+    The branch starts near-silent (W_up ≈ 0) and gradually learns
+    complementary features that the main linear pathway cannot represent.
+
+    Exposes .weight and .bias properties so existing init code that does
+    ``nn.init.uniform_(module.weight, ...)`` works unchanged.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int,
+        bias: bool = False,
+        alpha: float = 0.01,
+        omega_range: tuple[float, float] = (0.8, 1.2),
+        phi_std: float = 0.1,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+
+        # Main linear pathway
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        # Low-rank nonlinear branch
+        self.W_down = nn.Linear(in_features, rank, bias=False)
+        self.cosnet = CosNet(rank, omega_range=omega_range, phi_std=phi_std)
+        self.W_up = nn.Linear(rank, out_features, bias=False)
+
+        # W_up: near-zero init (paper §3.3, α/√r)
+        nn.init.normal_(self.W_up.weight, mean=0.0, std=alpha / math.sqrt(rank))
+
+    @property
+    def weight(self) -> nn.Parameter:
+        """Delegate to main linear weight for compatibility with init_weights()."""
+        return self.linear.weight
+
+    @property
+    def bias(self) -> Optional[nn.Parameter]:
+        """Delegate to main linear bias for compatibility with init_weights()."""
+        return self.linear.bias
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"rank={self.rank}, bias={self.linear.bias is not None}"
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        main = self.linear(x)
+        branch = self.W_up(self.cosnet(self.W_down(x)))
+        return main + branch
+
+
+def _build_linear(
+    in_features: int,
+    out_features: int,
+    config: ModernBertConfig,
+    bias: bool = False,
+    role: str = "attn_qkv",
+) -> nn.Module:
+    """Factory: returns NOBLELinear if NOBLE is enabled for this role, else plain nn.Linear."""
+    if config.use_noble:
+        targets = _NOBLE_TARGET_ROLES.get(config.noble_targets, _NOBLE_TARGET_ROLES["all"])
+        if role in targets:
+            return NOBLELinear(
+                in_features,
+                out_features,
+                rank=config.noble_rank,
+                bias=bias,
+                alpha=config.noble_alpha,
+                omega_range=config.noble_omega_range,
+                phi_std=config.noble_phi_std,
+            )
+    return nn.Linear(in_features, out_features, bias=bias)
 
 
 def _make_canon_layer(
@@ -763,15 +941,19 @@ class ModernBertRotaryEmbedding(nn.Module):
 class ModernBertMLP(nn.Module):
     def __init__(self, config: ModernBertConfig):
         super().__init__()
-        self.Wi = nn.Linear(
+        self.Wi = _build_linear(
             config.hidden_size,
             2 * config.intermediate_size,
+            config,
             bias=config.mlp_bias,
+            role="ffn_wi",
         )
-        self.Wo = nn.Linear(
+        self.Wo = _build_linear(
             config.intermediate_size,
             config.hidden_size,
+            config,
             bias=config.mlp_bias,
+            role="ffn_wo",
         )
         self.drop = nn.Dropout(config.mlp_dropout)
         self.act = _get_activation(config.hidden_activation)
@@ -849,15 +1031,19 @@ class ModernBertSReluMLP(nn.Module):
 class ModernBertSwiGLUMLP(nn.Module):
     def __init__(self, config: ModernBertConfig):
         super().__init__()
-        self.Wi = nn.Linear(
+        self.Wi = _build_linear(
             config.hidden_size,
             2 * config.intermediate_size,
+            config,
             bias=config.mlp_bias,
+            role="ffn_wi",
         )
-        self.Wo = nn.Linear(
+        self.Wo = _build_linear(
             config.intermediate_size,
             config.hidden_size,
+            config,
             bias=config.mlp_bias,
+            role="ffn_wo",
         )
         self.drop = nn.Dropout(config.mlp_dropout)
         self.canon_d = (
@@ -911,14 +1097,17 @@ class ModernBertAttention(nn.Module):
             self.lambda_proj = None
 
         qkv_dim = (self.num_q_heads + 2 * self.num_kv_heads) * self.head_dim
-        self.Wqkv = nn.Linear(
-            config.hidden_size, qkv_dim, bias=config.attention_bias,
+        self.Wqkv = _build_linear(
+            config.hidden_size, qkv_dim, config, bias=config.attention_bias,
+            role="attn_qkv",
         )
 
-        self.Wo = nn.Linear(
+        self.Wo = _build_linear(
             config.hidden_size,
             config.hidden_size,
+            config,
             bias=config.attention_bias,
+            role="attn_out",
         )
         self.out_drop = (
             nn.Dropout(config.attention_dropout)
@@ -1986,9 +2175,15 @@ class ModernBertForMaskedLM(nn.Module):
 
     @torch.no_grad()
     def init_weights(self) -> None:
-        
+
         width = self.config.hidden_size
         bound = math.sqrt(3.0 / width)
+        # NOBLE half-Kaiming: halve init scale for layers that use Kaiming
+        # (Wqkv, Wi). Wo stays zero-init regardless — see §3.3 of paper.
+        noble_kaiming = (
+            self.config.use_noble and self.config.noble_half_kaiming
+        )
+        kaiming_bound = bound / 2 if noble_kaiming else bound
         embedding_std = 0.02 if self.config.tie_word_embeddings else 1.0
 
         nn.init.normal_(
@@ -2014,10 +2209,12 @@ class ModernBertForMaskedLM(nn.Module):
             else:
                 enc = layer
                 mhc_blocks = []
-            nn.init.uniform_(enc.attn.Wqkv.weight, -bound, bound)
+            wqkv_bound = kaiming_bound if isinstance(enc.attn.Wqkv, NOBLELinear) else bound
+            nn.init.uniform_(enc.attn.Wqkv.weight, -wqkv_bound, wqkv_bound)
             nn.init.zeros_(enc.attn.Wo.weight)
             if enc.mlp is not None:
-                nn.init.uniform_(enc.mlp.Wi.weight, -bound, bound)
+                wi_bound = kaiming_bound if isinstance(enc.mlp.Wi, NOBLELinear) else bound
+                nn.init.uniform_(enc.mlp.Wi.weight, -wi_bound, wi_bound)
                 if hasattr(enc.mlp, "Wo"):
                     nn.init.zeros_(enc.mlp.Wo.weight)
                 else:

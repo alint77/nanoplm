@@ -81,6 +81,14 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             mhc_lite_wrapping_level=str(config.mhc_lite_wrapping_level).strip().lower(),
             use_diff_attn_v2=config.use_diff_attn_v2,
             attn_layer_pattern=config.attn_layer_pattern,
+            # NOBLE
+            use_noble=config.use_noble,
+            noble_rank=config.noble_rank,
+            noble_alpha=config.noble_alpha,
+            noble_omega_range=config.noble_omega_range,
+            noble_phi_std=config.noble_phi_std,
+            noble_half_kaiming=config.noble_half_kaiming,
+            noble_targets=config.noble_targets,
         )
 
         super().__init__(mb_config)
@@ -90,6 +98,11 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
     """Transformer-Engine ``ProtModernBertMLM`` wrapper."""
 
     def __init__(self, config: ProtModernBertMLMConfig):
+        if config.use_noble:
+            raise ValueError(
+                "NOBLE is currently implemented only in the pure-torch path. "
+                "Disable use_noble or use --pure-torch."
+            )
         if config.use_canon_layers:
             raise ValueError(
                 "Canon layers are currently implemented only in the pure-torch path. "
