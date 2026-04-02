@@ -52,6 +52,10 @@ class PretrainingConfig:
     tf32: bool = True
     fp8: bool = False
 
+    # Embedding tying: share input embedding and output decoder weights.
+    # Set to False to use independent parameters (slightly more expressive).
+    tie_word_embeddings: bool = False
+
     # MLM settings
     mlm_probability: float = 0.3
     mask_replace_prob: float = 0.8

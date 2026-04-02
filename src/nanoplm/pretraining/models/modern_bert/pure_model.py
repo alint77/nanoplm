@@ -81,6 +81,7 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             mhc_lite_wrapping_level=str(config.mhc_lite_wrapping_level).strip().lower(),
             use_diff_attn_v2=config.use_diff_attn_v2,
             attn_layer_pattern=config.attn_layer_pattern,
+            tie_word_embeddings=config.tie_word_embeddings,
         )
 
         super().__init__(mb_config)
@@ -151,6 +152,7 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             mhc_lite_wrapping_level=str(config.mhc_lite_wrapping_level).strip().lower(),
             use_diff_attn_v2=config.use_diff_attn_v2,
             attn_layer_pattern=config.attn_layer_pattern,
+            tie_word_embeddings=config.tie_word_embeddings,
         )
 
         super().__init__(mb_config)

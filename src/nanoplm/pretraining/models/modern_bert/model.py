@@ -116,6 +116,7 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
             unk_token_id=self.tokenizer.unk_token_id,
             mask_token_id=self.tokenizer.mask_token_id,
             loss_type="ForMaskedLM",
+            tie_word_embeddings=config.tie_word_embeddings,
         )
 
         super().__init__(self.config)
