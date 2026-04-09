@@ -562,6 +562,11 @@ def pretrain():
     help="Classifier activation (srelu is supported only in pure-torch and pure-te paths)",
 )
 @click.option(
+    "--tie_word_embeddings/--no-tie_word_embeddings",
+    default=False,
+    help="Tie word embeddings between input and output",
+)
+@click.option(
     "--use-resid-lambdas/--no-use-resid-lambdas",
     default=True,
     help="Enable per-layer residual scaling (resid_lambdas). Not compatible with --use-mhc-lite.",
@@ -771,6 +776,7 @@ def run(
     attention_bias: bool,
     attention_dropout: float,
     classifier_activation: str,
+    tie_word_embeddings: bool,
     use_resid_lambdas: bool,
     use_x0_lambdas: bool,
     use_qk_norm: bool,
@@ -846,6 +852,7 @@ def run(
         world_size=world_size,
         ddp_bucket_cap_mb=ddp_bucket_cap_mb,
         project_name=project_name,
+        tie_word_embeddings=tie_word_embeddings,
     )
     
     if pure_torch and pure_te:
@@ -899,6 +906,7 @@ def run(
         attention_bias=attention_bias,
         attention_dropout=attention_dropout,
         classifier_activation=classifier_activation,
+        tie_word_embeddings=tie_word_embeddings,
         use_resid_lambdas=use_resid_lambdas,
         use_x0_lambdas=use_x0_lambdas,
         use_qk_norm=use_qk_norm,

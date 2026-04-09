@@ -51,6 +51,8 @@ from tqdm import tqdm
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
+import nanoplm.pretraining.models.modern_bert.modeling as _bert_modeling
+_bert_modeling.USE_TRITON_SRELU = False  # Fused srelu kernel may OOM on some H100s; plain PyTorch is sufficient for inference
 
 # ---------------------------------------------------------------------------
 # Config loading
@@ -113,14 +115,14 @@ def _model_config_from_dict(m: dict) -> ProtModernBertMLMConfig:
 
 def _load_biotrainer_symbols() -> dict[str, Any]:
     """Import biotrainer lazily so checkpoint helpers remain importable in tests."""
-    from biotrainer.autoeval import autoeval_pipeline
-    from biotrainer.autoeval.autoeval import (
+    from biotrainer.autoeval import autoeval_pipeline, AutoEvalReport
+    from biotrainer.autoeval.pipelines.autoeval_supervised import (
         _check_h5_file,
         _setup_embedding_functions,
         get_unique_framework_sequences,
     )
-    from biotrainer.autoeval.config_bank import AutoEvalConfigBank
-    from biotrainer.autoeval.report_manager import ReportManager
+    from biotrainer.autoeval.pipelines.autoeval_report import SupervisedFrameworkReport
+    from biotrainer.autoeval.core.autoeval_config_bank import AutoEvalConfigBank
     from biotrainer.protocols import Protocol
     from biotrainer.utilities.executer import parse_config_file_and_execute_run
 
@@ -130,7 +132,8 @@ def _load_biotrainer_symbols() -> dict[str, Any]:
         "_setup_embedding_functions": _setup_embedding_functions,
         "_check_h5_file": _check_h5_file,
         "AutoEvalConfigBank": AutoEvalConfigBank,
-        "ReportManager": ReportManager,
+        "AutoEvalReport": AutoEvalReport,
+        "SupervisedFrameworkReport": SupervisedFrameworkReport,
         "Protocol": Protocol,
         "parse_config_file_and_execute_run": parse_config_file_and_execute_run,
     }
@@ -438,6 +441,14 @@ def parse_args() -> argparse.Namespace:
         help="Number of parallel workers for downstream task training. "
              "0 = sequential (via autoeval_pipeline), >0 = parallel mode.",
     )
+    p.add_argument(
+        "--tasks",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Whitelist of task names to run (e.g. PBC-secondary_structure). "
+             "If not set, all tasks are run.",
+    )
     return p.parse_args()
 
 
@@ -480,6 +491,8 @@ def main():
 
     # ── Sequential mode (original behavior via autoeval_pipeline) ─────────
     if args.parallel_tasks <= 0:
+        if args.tasks:
+            print(f"[WARN] --tasks filter is not supported in sequential mode; ignoring.")
         print(f"\nStarting autoeval pipeline (sequential): framework={args.framework}")
         print("=" * 60)
 
@@ -536,6 +549,13 @@ def main():
         )
     )
 
+    if args.tasks:
+        task_config_tuples = [
+            (task, cfg) for task, cfg in task_config_tuples
+            if task.combined_name() in args.tasks
+        ]
+        print(f"  Filtered to tasks: {[t.combined_name() for t, _ in task_config_tuples]}")
+
     embedding_fn_per_residue, embedding_fn_per_sequence = biotrainer["_setup_embedding_functions"](
         embedder_name=embedder_name,
         output_dir=output_dir,
@@ -568,11 +588,13 @@ def main():
     # --- Phase 2: Prepare task configs -----------------------------------
     print("\n>>> Phase 2: Preparing task configs …")
     prepared_tasks: list[tuple] = []  # (task, task_name, config_dict)
-    report_manager = biotrainer["ReportManager"](
-        embedder_name=embedder_name,
-        training_date=str(datetime.now().date().isoformat()),
+    framework_report = biotrainer["SupervisedFrameworkReport"].empty(
         min_seq_len=args.min_seq_length,
         max_seq_len=args.max_seq_length,
+    )
+    autoeval_report = biotrainer["AutoEvalReport"].empty(
+        embedder_name=embedder_name,
+        training_date=str(datetime.now().date().isoformat()),
     )
 
     for task, cfg in task_config_tuples:
@@ -590,17 +612,18 @@ def main():
             config=cfg,
             embedder_name=embedder_name,
             embeddings_file=task_emb_file,
-            input_file=task.input_file,
+            input_file=task.input_files[0],
             output_dir=task_output_dir,
         )
 
         # Check for existing results (resume support)
-        maybe_result = report_manager.maybe_load_existing_result(
-            task_output_dir=task_output_dir
+        maybe_result = biotrainer["SupervisedFrameworkReport"].maybe_load_existing_result(
+            embedder_name=embedder_name,
+            task_output_dir=task_output_dir,
         )
         if maybe_result:
             print(f"  Loaded existing result for {task_name}, skipping …")
-            report_manager.add_result(task=task, result_dict=maybe_result)
+            framework_report.update_result(task_name, maybe_result)
         else:
             prepared_tasks.append((task, task_name, cfg))
 
@@ -626,7 +649,7 @@ def main():
                 task, task_name = futures[future]
                 returned_name, result = future.result()
                 if result is not None:
-                    report_manager.add_result(task=task, result_dict=result)
+                    framework_report.update_result(task_name, result)
                     print(f"  ✓ {returned_name} done")
                 else:
                     print(f"  ✗ {returned_name} FAILED")
@@ -634,7 +657,9 @@ def main():
         print(f"All tasks finished in {time.time() - t1:.1f}s")
 
     # --- Phase 4: Write report -------------------------------------------
-    report = report_manager.write(output_dir=output_dir.parent)
+    autoeval_report.add_supervised_result(args.framework.upper(), framework_report)
+    autoeval_report.write(output_dir=output_dir.parent)
+    report = autoeval_report
 
     total_time = time.time() - overall_start
     print(f"\n{'=' * 60}")

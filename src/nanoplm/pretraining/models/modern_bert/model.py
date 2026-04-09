@@ -47,6 +47,7 @@ class ProtModernBertMLMConfig:
     attention_bias: bool = False
     attention_dropout: float = 0.0
     classifier_activation: str = "gelu"
+    tie_word_embeddings: bool = False
     use_resid_lambdas: bool = False
     use_x0_lambdas: bool = False
     use_qk_norm: bool = False
