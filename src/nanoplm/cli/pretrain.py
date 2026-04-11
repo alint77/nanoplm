@@ -630,6 +630,11 @@ def pretrain():
          "'attn+mlp' checkpoints both attention and MLP branches.",
 )
 @click.option(
+    "--tie-word-embeddings/--no-tie-word-embeddings",
+    default=True,
+    help="Tie input embedding and output decoder weights (default: enabled).",
+)
+@click.option(
     "--use-diff-attn-v2/--no-use-diff-attn-v2",
     default=False,
     help="Enable Differential Attention V2: doubles query heads, applies differential "
@@ -783,6 +788,7 @@ def run(
     prores_t: int,
     activation_checkpointing: bool,
     activation_checkpointing_mode: str,
+    tie_word_embeddings: bool,
     use_diff_attn_v2: bool,
     attn_layer_pattern: Optional[str],
     use_mhc_lite: bool,
@@ -914,6 +920,7 @@ def run(
         use_mhc_lite=use_mhc_lite,
         mhc_n_streams=mhc_n_streams,
         mhc_lite_wrapping_level=mhc_lite_wrapping_level.lower(),
+        tie_word_embeddings=tie_word_embeddings,
         use_diff_attn_v2=use_diff_attn_v2,
         attn_layer_pattern=attn_layer_pattern,
     )
@@ -1180,6 +1187,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  attention_bias: false\n"
         "  attention_dropout: 0.0\n"
         "  classifier_activation: \"gelu\"  # relu | gelu | srelu (srelu requires pure_torch or pure_te)\n"
+        "  tie_word_embeddings: true  # tie input embedding and output decoder weights\n"
         "  # The options below only work on pure-torch and TE pipelines unless noted\n"
         "  use_resid_lambdas: false  # scales residual stream per layer (not compatible with use_mhc_lite)\n"
         "  use_x0_lambdas: false  # blends initial embedding x0 per layer\n"

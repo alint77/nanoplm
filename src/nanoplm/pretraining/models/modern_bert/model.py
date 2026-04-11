@@ -65,6 +65,7 @@ class ProtModernBertMLMConfig:
     mhc_n_streams: int = 4
     mhc_triton_fused: bool = False
     mhc_lite_wrapping_level: str = "layer"
+    tie_word_embeddings: bool = True
     use_diff_attn_v2: bool = False
     attn_layer_pattern: Optional[str] = None
 
@@ -115,6 +116,7 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
             bos_token_id=None,  # Not used in our tokenizer
             unk_token_id=self.tokenizer.unk_token_id,
             mask_token_id=self.tokenizer.mask_token_id,
+            tie_word_embeddings=config.tie_word_embeddings,
             loss_type="ForMaskedLM",
         )
 
