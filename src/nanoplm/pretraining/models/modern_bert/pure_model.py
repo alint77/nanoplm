@@ -79,6 +79,7 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             mhc_n_streams=config.mhc_n_streams,
             mhc_triton_fused=config.mhc_triton_fused,
             mhc_lite_wrapping_level=str(config.mhc_lite_wrapping_level).strip().lower(),
+            tie_word_embeddings=config.tie_word_embeddings,
             use_diff_attn_v2=config.use_diff_attn_v2,
             attn_layer_pattern=config.attn_layer_pattern,
         )
@@ -149,6 +150,7 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             mhc_n_streams=config.mhc_n_streams,
             mhc_triton_fused=config.mhc_triton_fused,
             mhc_lite_wrapping_level=str(config.mhc_lite_wrapping_level).strip().lower(),
+            tie_word_embeddings=config.tie_word_embeddings,
             use_diff_attn_v2=config.use_diff_attn_v2,
             attn_layer_pattern=config.attn_layer_pattern,
         )
