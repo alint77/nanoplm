@@ -68,6 +68,8 @@ class ProtModernBertMLMConfig:
     tie_word_embeddings: bool = True
     use_diff_attn_v2: bool = False
     attn_layer_pattern: Optional[str] = None
+    fused_qkv: bool = True
+    fused_up_gate: bool = True
 
 
 class ProtModernBertMLM(ModernBertForMaskedLM):

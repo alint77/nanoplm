@@ -162,6 +162,16 @@ class ModernBertConfig:
     mhc_lite_wrapping_level: Literal["layer", "sublayers"] = "layer"
     use_diff_attn_v2: bool = False
     attn_layer_pattern: Optional[str] = None
+    # When False, Q/K/V projections use separate nn.Linear modules instead of a
+    # single fused Wqkv.  Separate projections give Muon's Newton-Schulz
+    # orthogonalization independent subspaces for each head group, which is the
+    # mathematically correct formulation.  Fused (True) is faster due to wider
+    # matmuls but couples the orthogonalization across Q, K, and V.
+    fused_qkv: bool = True
+    # When False, SwiGLU/GLU up and gate projections use separate nn.Linear
+    # modules instead of a single fused Wi.  Same Muon rationale as fused_qkv:
+    # split projections keep the orthogonalization independent per subspace.
+    fused_up_gate: bool = True
 
     head_dim: int = field(init=False)
     sliding_window: int = field(init=False)
@@ -763,11 +773,27 @@ class ModernBertRotaryEmbedding(nn.Module):
 class ModernBertMLP(nn.Module):
     def __init__(self, config: ModernBertConfig):
         super().__init__()
-        self.Wi = nn.Linear(
-            config.hidden_size,
-            2 * config.intermediate_size,
-            bias=config.mlp_bias,
-        )
+        self.fused_up_gate = config.fused_up_gate
+        if self.fused_up_gate:
+            self.Wi = nn.Linear(
+                config.hidden_size,
+                2 * config.intermediate_size,
+                bias=config.mlp_bias,
+            )
+            self.W_up = None
+            self.W_gate = None
+        else:
+            self.Wi = None
+            self.W_up = nn.Linear(
+                config.hidden_size,
+                config.intermediate_size,
+                bias=config.mlp_bias,
+            )
+            self.W_gate = nn.Linear(
+                config.hidden_size,
+                config.intermediate_size,
+                bias=config.mlp_bias,
+            )
         self.Wo = nn.Linear(
             config.intermediate_size,
             config.hidden_size,
@@ -788,7 +814,10 @@ class ModernBertMLP(nn.Module):
         cu_seqlens: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        wi = self.Wi(x)
+        if self.fused_up_gate:
+            wi = self.Wi(x)
+        else:
+            wi = torch.cat([self.W_up(x), self.W_gate(x)], dim=-1)
         if self.canon_d is not None:
             wi = self.canon_d(
                 wi,
@@ -849,11 +878,27 @@ class ModernBertSReluMLP(nn.Module):
 class ModernBertSwiGLUMLP(nn.Module):
     def __init__(self, config: ModernBertConfig):
         super().__init__()
-        self.Wi = nn.Linear(
-            config.hidden_size,
-            2 * config.intermediate_size,
-            bias=config.mlp_bias,
-        )
+        self.fused_up_gate = config.fused_up_gate
+        if self.fused_up_gate:
+            self.Wi = nn.Linear(
+                config.hidden_size,
+                2 * config.intermediate_size,
+                bias=config.mlp_bias,
+            )
+            self.W_up = None
+            self.W_gate = None
+        else:
+            self.Wi = None
+            self.W_up = nn.Linear(
+                config.hidden_size,
+                config.intermediate_size,
+                bias=config.mlp_bias,
+            )
+            self.W_gate = nn.Linear(
+                config.hidden_size,
+                config.intermediate_size,
+                bias=config.mlp_bias,
+            )
         self.Wo = nn.Linear(
             config.intermediate_size,
             config.hidden_size,
@@ -873,7 +918,10 @@ class ModernBertSwiGLUMLP(nn.Module):
         cu_seqlens: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        wi = self.Wi(x)
+        if self.fused_up_gate:
+            wi = self.Wi(x)
+        else:
+            wi = torch.cat([self.W_up(x), self.W_gate(x)], dim=-1)
         if self.canon_d is not None:
             wi = self.canon_d(
                 wi,
@@ -910,10 +958,33 @@ class ModernBertAttention(nn.Module):
             self.num_q_heads = self.num_heads
             self.lambda_proj = None
 
-        qkv_dim = (self.num_q_heads + 2 * self.num_kv_heads) * self.head_dim
-        self.Wqkv = nn.Linear(
-            config.hidden_size, qkv_dim, bias=config.attention_bias,
-        )
+        self.fused_qkv = config.fused_qkv
+        q_dim = self.num_q_heads * self.head_dim
+        kv_dim = self.num_kv_heads * self.head_dim
+
+        if self.fused_qkv:
+            qkv_dim = q_dim + 2 * kv_dim
+            self.Wqkv = nn.Linear(
+                config.hidden_size, qkv_dim, bias=config.attention_bias,
+            )
+            self.Wq = None
+            self.Wq2 = None
+            self.Wk = None
+            self.Wv = None
+        else:
+            self.Wqkv = None
+            if self.use_diff_attn_v2:
+                # DiffV2 doubles Q heads into two groups for differential
+                # subtraction.  Split them into Wq (group 1) and Wq2 (group 2)
+                # so Muon orthogonalizes each group independently.
+                half_q_dim = self.num_heads * self.head_dim
+                self.Wq = nn.Linear(config.hidden_size, half_q_dim, bias=config.attention_bias)
+                self.Wq2 = nn.Linear(config.hidden_size, half_q_dim, bias=config.attention_bias)
+            else:
+                self.Wq = nn.Linear(config.hidden_size, q_dim, bias=config.attention_bias)
+                self.Wq2 = None
+            self.Wk = nn.Linear(config.hidden_size, kv_dim, bias=config.attention_bias)
+            self.Wv = nn.Linear(config.hidden_size, kv_dim, bias=config.attention_bias)
 
         self.Wo = nn.Linear(
             config.hidden_size,
@@ -925,7 +996,7 @@ class ModernBertAttention(nn.Module):
             if config.attention_dropout > 0.0
             else nn.Identity()
         )
-        qkv_out_dim = (self.num_q_heads + 2 * self.num_kv_heads) * self.head_dim
+        qkv_out_dim = q_dim + 2 * kv_dim
         self.canon_b = (
             _make_canon_layer(qkv_out_dim, config)
             if "b" in config.canon_layer_set
@@ -963,13 +1034,30 @@ class ModernBertAttention(nn.Module):
         repo_active: bool = False,
     ) -> torch.Tensor:
         total = x.shape[0]  # (total_tokens, hidden)
-        qkv = self.Wqkv(x)
-        if self.canon_b is not None:
-            qkv = self.canon_b(qkv, position_ids=position_ids, cu_seqlens=cu_seqlens)
-
         q_dim = self.num_q_heads * self.head_dim
         kv_dim = self.num_kv_heads * self.head_dim
-        q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
+
+        if self.fused_qkv:
+            qkv = self.Wqkv(x)
+            if self.canon_b is not None:
+                qkv = self.canon_b(qkv, position_ids=position_ids, cu_seqlens=cu_seqlens)
+            q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
+        else:
+            if self.Wq2 is not None:
+                # DiffV2 split: interleave the two Q groups so paired heads
+                # (0::2, 1::2) are contiguous as the rest of the code expects.
+                q1 = self.Wq(x).view(total, self.num_heads, self.head_dim)
+                q2 = self.Wq2(x).view(total, self.num_heads, self.head_dim)
+                q = torch.stack([q1, q2], dim=2).view(total, -1)
+            else:
+                q = self.Wq(x)
+            k = self.Wk(x)
+            v = self.Wv(x)
+            if self.canon_b is not None:
+                qkv = torch.cat([q, k, v], dim=-1)
+                qkv = self.canon_b(qkv, position_ids=position_ids, cu_seqlens=cu_seqlens)
+                q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
+
         q = q.view(total, self.num_q_heads, self.head_dim)
         k = k.view(total, self.num_kv_heads, self.head_dim)
         v = v.view(total, self.num_kv_heads, self.head_dim)
@@ -1039,13 +1127,28 @@ class ModernBertAttention(nn.Module):
             )
 
         bsz, seq_len, _ = x.shape
-        qkv = self.Wqkv(x)
-        if self.canon_b is not None:
-            qkv = self.canon_b(qkv, attention_mask=token_mask)
-
         q_dim = self.num_q_heads * self.head_dim
         kv_dim = self.num_kv_heads * self.head_dim
-        q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
+
+        if self.fused_qkv:
+            qkv = self.Wqkv(x)
+            if self.canon_b is not None:
+                qkv = self.canon_b(qkv, attention_mask=token_mask)
+            q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
+        else:
+            if self.Wq2 is not None:
+                q1 = self.Wq(x).view(bsz, seq_len, self.num_heads, self.head_dim)
+                q2 = self.Wq2(x).view(bsz, seq_len, self.num_heads, self.head_dim)
+                q = torch.stack([q1, q2], dim=3).view(bsz, seq_len, -1)
+            else:
+                q = self.Wq(x)
+            k = self.Wk(x)
+            v = self.Wv(x)
+            if self.canon_b is not None:
+                qkv = torch.cat([q, k, v], dim=-1)
+                qkv = self.canon_b(qkv, attention_mask=token_mask)
+                q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
+
         q = q.view(bsz, seq_len, self.num_q_heads, self.head_dim).transpose(1, 2)
         k = k.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -2014,22 +2117,55 @@ class ModernBertForMaskedLM(nn.Module):
             else:
                 enc = layer
                 mhc_blocks = []
-            nn.init.uniform_(enc.attn.Wqkv.weight, -bound, bound)
+            # QKV weight init
+            if enc.attn.Wqkv is not None:
+                nn.init.uniform_(enc.attn.Wqkv.weight, -bound, bound)
+            else:
+                nn.init.uniform_(enc.attn.Wq.weight, -bound, bound)
+                if enc.attn.Wq2 is not None:
+                    nn.init.uniform_(enc.attn.Wq2.weight, -bound, bound)
+                nn.init.uniform_(enc.attn.Wk.weight, -bound, bound)
+                nn.init.uniform_(enc.attn.Wv.weight, -bound, bound)
             nn.init.zeros_(enc.attn.Wo.weight)
+
+            # MLP weight init
             if enc.mlp is not None:
-                nn.init.uniform_(enc.mlp.Wi.weight, -bound, bound)
+                if enc.mlp.Wi is not None:
+                    nn.init.uniform_(enc.mlp.Wi.weight, -bound, bound)
+                elif hasattr(enc.mlp, "W_up") and enc.mlp.W_up is not None:
+                    nn.init.uniform_(enc.mlp.W_up.weight, -bound, bound)
+                    nn.init.uniform_(enc.mlp.W_gate.weight, -bound, bound)
                 if hasattr(enc.mlp, "Wo"):
                     nn.init.zeros_(enc.mlp.Wo.weight)
                 else:
                     nn.init.zeros_(enc.mlp.Wo_weight)
 
-            if enc.attn.Wqkv.bias is not None:
-                nn.init.zeros_(enc.attn.Wqkv.bias)
+            # QKV bias init
+            if enc.attn.Wqkv is not None:
+                if enc.attn.Wqkv.bias is not None:
+                    nn.init.zeros_(enc.attn.Wqkv.bias)
+            else:
+                if enc.attn.Wq.bias is not None:
+                    nn.init.zeros_(enc.attn.Wq.bias)
+                if enc.attn.Wq2 is not None and enc.attn.Wq2.bias is not None:
+                    nn.init.zeros_(enc.attn.Wq2.bias)
+                if enc.attn.Wk.bias is not None:
+                    nn.init.zeros_(enc.attn.Wk.bias)
+                if enc.attn.Wv.bias is not None:
+                    nn.init.zeros_(enc.attn.Wv.bias)
             if enc.attn.Wo.bias is not None:
                 nn.init.zeros_(enc.attn.Wo.bias)
+
+            # MLP bias init
             if enc.mlp is not None:
-                if enc.mlp.Wi.bias is not None:
-                    nn.init.zeros_(enc.mlp.Wi.bias)
+                if enc.mlp.Wi is not None:
+                    if enc.mlp.Wi.bias is not None:
+                        nn.init.zeros_(enc.mlp.Wi.bias)
+                elif hasattr(enc.mlp, "W_up") and enc.mlp.W_up is not None:
+                    if enc.mlp.W_up.bias is not None:
+                        nn.init.zeros_(enc.mlp.W_up.bias)
+                    if enc.mlp.W_gate.bias is not None:
+                        nn.init.zeros_(enc.mlp.W_gate.bias)
                 if hasattr(enc.mlp, "Wo"):
                     if enc.mlp.Wo.bias is not None:
                         nn.init.zeros_(enc.mlp.Wo.bias)
