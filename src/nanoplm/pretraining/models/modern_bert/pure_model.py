@@ -81,6 +81,8 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             mhc_lite_wrapping_level=str(config.mhc_lite_wrapping_level).strip().lower(),
             tie_word_embeddings=config.tie_word_embeddings,
             use_diff_attn_v2=config.use_diff_attn_v2,
+            use_iha=config.use_iha,
+            iha_num_pseudo_heads=config.iha_num_pseudo_heads,
             attn_layer_pattern=config.attn_layer_pattern,
         )
 
@@ -105,6 +107,11 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             raise ValueError(
                 "Differential Attention V2 is currently implemented only in the "
                 "pure-torch path. Disable use_diff_attn_v2 or use --pure-torch."
+            )
+        if config.use_iha:
+            raise ValueError(
+                "Interleaved Head Attention is currently implemented only in the "
+                "pure-torch path. Disable use_iha or use --pure-torch."
             )
 
         self.tokenizer = ProtModernBertTokenizer()

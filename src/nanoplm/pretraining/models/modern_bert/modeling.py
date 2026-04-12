@@ -161,6 +161,8 @@ class ModernBertConfig:
     mhc_triton_fused: bool = False
     mhc_lite_wrapping_level: Literal["layer", "sublayers"] = "layer"
     use_diff_attn_v2: bool = False
+    use_iha: bool = False
+    iha_num_pseudo_heads: Optional[int] = None  # default: num_attention_heads
     attn_layer_pattern: Optional[str] = None
 
     head_dim: int = field(init=False)
@@ -257,6 +259,27 @@ class ModernBertConfig:
                 "RePO predicts per-head positions for Q and K jointly, which requires "
                 "equal Q/K head counts."
             )
+        # IHA validation
+        if self.use_iha and self.use_diff_attn_v2:
+            raise ValueError(
+                "use_iha and use_diff_attn_v2 are mutually exclusive. "
+                "Both modify attention head structure and cannot be combined."
+            )
+        if self.use_iha and self.use_repo:
+            raise ValueError(
+                "use_iha and use_repo are mutually exclusive. "
+                "IHA assigns distinct virtual RoPE positions to each pseudo-token; "
+                "RePO replaces fixed positions with learned ones, which conflicts."
+            )
+        if self.use_iha and self.num_kv_heads != self.num_attention_heads:
+            raise ValueError(
+                "IHA requires MHA (num_kv_heads == num_attention_heads). "
+                "GQA is not compatible with IHA cross-head mixing."
+            )
+        if self.iha_num_pseudo_heads is None:
+            self.iha_num_pseudo_heads = self.num_attention_heads
+        if self.use_iha and self.iha_num_pseudo_heads < 1:
+            raise ValueError("iha_num_pseudo_heads must be >= 1.")
 
 
 def _get_activation(name: str):
@@ -950,6 +973,21 @@ class ModernBertAttention(nn.Module):
                 persistent=False,
             )
 
+        # IHA: interleaved head attention (cross-head pseudo-head mixing).
+        # Only applied to sliding-window layers per the paper's hybrid schedule.
+        self._is_sliding = config.layer_types[layer_idx] == "sliding_attention"
+        self.use_iha = config.use_iha and self._is_sliding
+        if self.use_iha:
+            self.iha_P = config.iha_num_pseudo_heads
+            H = self.num_heads
+            P = self.iha_P
+            self.alpha_q = nn.Parameter(torch.empty(H, P, H))
+            self.alpha_k = nn.Parameter(torch.empty(H, P, H))
+            self.alpha_v = nn.Parameter(torch.empty(H, P, H))
+            self.alpha_o = nn.Parameter(torch.empty(H, P, H))
+        else:
+            self.iha_P = 0
+
     # -- varlen (flash-attention) path -----------------------------------------
 
     def _forward_varlen(
@@ -961,6 +999,7 @@ class ModernBertAttention(nn.Module):
         window_size: tuple[int, int],
         position_ids: Optional[torch.Tensor] = None,
         repo_active: bool = False,
+        iha_rope_full: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         total = x.shape[0]  # (total_tokens, hidden)
         qkv = self.Wqkv(x)
@@ -973,6 +1012,28 @@ class ModernBertAttention(nn.Module):
         q = q.view(total, self.num_q_heads, self.head_dim)
         k = k.view(total, self.num_kv_heads, self.head_dim)
         v = v.view(total, self.num_kv_heads, self.head_dim)
+
+        # -- IHA: mix across heads and merge pseudo-heads into sequence dim ----
+        if self.use_iha:
+            P = self.iha_P
+            q = torch.einsum('tgd,hpg->thpd', q, self.alpha_q)
+            k = torch.einsum('tgd,hpg->thpd', k, self.alpha_k)
+            v = torch.einsum('tgd,hpg->thpd', v, self.alpha_v)
+            q = q.permute(0, 2, 1, 3).reshape(total * P, self.num_heads, self.head_dim)
+            k = k.permute(0, 2, 1, 3).reshape(total * P, self.num_heads, self.head_dim)
+            v = v.permute(0, 2, 1, 3).reshape(total * P, self.num_heads, self.head_dim)
+            # Distinct RoPE for each pseudo-token: position n → virtual
+            # positions [n*P, n*P+1, ..., n*P+P-1] per the IHA paper.
+            cos_full, sin_full = iha_rope_full  # (1, max_pos, head_dim)
+            virt_pos = (position_ids * P).unsqueeze(1) + torch.arange(
+                P, device=position_ids.device
+            )  # (total, P)
+            virt_pos = virt_pos.reshape(-1)  # (total*P,)
+            cos_sin = (cos_full[0, virt_pos], sin_full[0, virt_pos])
+            cu_seqlens = cu_seqlens * P
+            max_seqlen = max_seqlen * P
+            if window_size != (-1, -1):
+                window_size = (window_size[0] * P, window_size[1] * P)
 
         if self.repo is not None and repo_active:
             positions = self.repo(x)  # (T, num_heads)
@@ -1003,6 +1064,12 @@ class ModernBertAttention(nn.Module):
         if isinstance(y, tuple):
             y = y[0]
 
+        # -- IHA: un-merge pseudo-heads with output mixing ---------------------
+        if self.use_iha:
+            P = self.iha_P
+            y = y.view(total, P, self.num_heads, self.head_dim)
+            y = torch.einsum('tpgd,hpg->thd', y, self.alpha_o)
+
         if self.use_diff_attn_v2:
             # y: (total, 2*num_heads, head_dim) — paired heads in same GQA group
             # are contiguous, so 0::2 and 1::2 select the two halves.
@@ -1026,6 +1093,7 @@ class ModernBertAttention(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         token_mask: Optional[torch.Tensor] = None,
         repo_active: bool = False,
+        iha_rope_full: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         if cu_seqlens is not None:
             return self._forward_varlen(
@@ -1036,6 +1104,7 @@ class ModernBertAttention(nn.Module):
                 window_size,
                 position_ids=position_ids,
                 repo_active=repo_active,
+                iha_rope_full=iha_rope_full,
             )
 
         bsz, seq_len, _ = x.shape
@@ -1049,6 +1118,26 @@ class ModernBertAttention(nn.Module):
         q = q.view(bsz, seq_len, self.num_q_heads, self.head_dim).transpose(1, 2)
         k = k.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # -- IHA: mix across heads and merge pseudo-heads into sequence dim ----
+        if self.use_iha:
+            P = self.iha_P
+            # q/k/v: (B, H, S, d) → (B, H, P, S, d) → merge → (B, H, S*P, d)
+            q = torch.einsum('bgsd,hpg->bhpsd', q, self.alpha_q)
+            k = torch.einsum('bgsd,hpg->bhpsd', k, self.alpha_k)
+            v = torch.einsum('bgsd,hpg->bhpsd', v, self.alpha_v)
+            q = q.permute(0, 1, 3, 2, 4).reshape(bsz, self.num_heads, seq_len * P, self.head_dim)
+            k = k.permute(0, 1, 3, 2, 4).reshape(bsz, self.num_heads, seq_len * P, self.head_dim)
+            v = v.permute(0, 1, 3, 2, 4).reshape(bsz, self.num_heads, seq_len * P, self.head_dim)
+            # Distinct RoPE for each pseudo-token: position n → virtual
+            # positions [n*P, n*P+1, ..., n*P+P-1] per the IHA paper.
+            cos_full, sin_full = iha_rope_full  # (1, max_pos, head_dim)
+            virt_pos = torch.arange(seq_len, device=x.device) * P  # (S,)
+            virt_pos = virt_pos.unsqueeze(1) + torch.arange(P, device=x.device)  # (S, P)
+            virt_pos = virt_pos.reshape(-1)  # (S*P,)
+            cos_sin = (cos_full[:, virt_pos], sin_full[:, virt_pos])  # (1, S*P, head_dim)
+            if attn_mask is not None:
+                attn_mask = attn_mask.repeat_interleave(P, dim=-1).repeat_interleave(P, dim=-2)
 
         if self.repo is not None and repo_active:
             positions = self.repo(x)  # (B, S, num_heads)
@@ -1069,6 +1158,13 @@ class ModernBertAttention(nn.Module):
             scale=self.scale,
             enable_gqa=(self.num_q_heads != self.num_kv_heads),
         )
+
+        # -- IHA: un-merge pseudo-heads with output mixing ---------------------
+        if self.use_iha:
+            P = self.iha_P
+            # y: (B, H, S*P, d) → (B, H, S, P, d) → einsum → (B, H, S, d)
+            y = y.view(bsz, self.num_heads, seq_len, P, self.head_dim)
+            y = torch.einsum('bgspd,hpg->bhsd', y, self.alpha_o)
 
         if self.use_diff_attn_v2:
             # y: (B, 2H, S, D) -> differential subtraction
@@ -1131,6 +1227,7 @@ class ModernBertEncoderLayer(nn.Module):
         token_mask: Optional[torch.Tensor] = None,
         repo_active: bool = False,
         prores_alpha: "torch.Tensor | float" = 1.0,
+        iha_rope_full: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         do_ckpt_attn = (
             self.activation_checkpointing
@@ -1146,6 +1243,7 @@ class ModernBertEncoderLayer(nn.Module):
             _position_ids = position_ids
             _token_mask = token_mask
             _repo_active = repo_active
+            _iha_rope_full = iha_rope_full
 
             _fuse_ln_a = (
                 self.canon_a is not None
@@ -1185,6 +1283,7 @@ class ModernBertEncoderLayer(nn.Module):
                     position_ids=_position_ids,
                     token_mask=_token_mask,
                     repo_active=_repo_active,
+                    iha_rope_full=_iha_rope_full,
                 )
 
             try:
@@ -1225,6 +1324,7 @@ class ModernBertEncoderLayer(nn.Module):
                 position_ids=position_ids,
                 token_mask=token_mask,
                 repo_active=repo_active,
+                iha_rope_full=iha_rope_full,
             )
             x = x + prores_alpha * attn_out
         if self.mlp is not None:
@@ -1351,6 +1451,7 @@ class ModernBertAttnResidual(nn.Module):
             position_ids=position_ids,
             token_mask=token_mask,
             repo_active=repo_active,
+            iha_rope_full=_kwargs.get("iha_rope_full"),
         )
 
 
@@ -1788,6 +1889,15 @@ class ModernBertModel(nn.Module):
                 ),
             }
 
+            # Full (unindexed) RoPE tables for IHA distinct virtual positions.
+            if self.config.use_iha:
+                _iha_rope_full = {
+                    "full_attention": (cos_f, sin_f),
+                    "sliding_attention": (cos_s, sin_s),
+                }
+            else:
+                _iha_rope_full = None
+
             repo_active = self.repo_active
             prores_alphas = self._prores_alphas  # (num_layers,) tensor buffer
 
@@ -1809,6 +1919,8 @@ class ModernBertModel(nn.Module):
                     window_size = windows[lt]
                     position_ids = _position_ids
 
+                    iha_rf = _iha_rope_full[lt] if _iha_rope_full is not None else None
+
                     def _layer_forward(
                         x_in: torch.Tensor,
                         *,
@@ -1820,6 +1932,7 @@ class ModernBertModel(nn.Module):
                         _position_ids=position_ids,
                         _repo_active: bool = repo_active,
                         _prores_alpha=alpha,
+                        _iha_rf=iha_rf,
                     ) -> torch.Tensor:
                         return _layer(
                             x_in,
@@ -1830,6 +1943,7 @@ class ModernBertModel(nn.Module):
                             position_ids=_position_ids,
                             repo_active=_repo_active,
                             prores_alpha=_prores_alpha,
+                            iha_rope_full=_iha_rf,
                         )
 
                     try:
@@ -1846,6 +1960,7 @@ class ModernBertModel(nn.Module):
                         position_ids=_position_ids,
                         repo_active=repo_active,
                         prores_alpha=alpha,
+                        iha_rope_full=_iha_rope_full[lt] if _iha_rope_full is not None else None,
                     )
 
             if self.config.use_mhc_lite:
@@ -1891,6 +2006,22 @@ class ModernBertModel(nn.Module):
             ),
         }
 
+        # Full RoPE tables covering IHA virtual positions (seq_len * P).
+        if self.config.use_iha:
+            _P = self.config.iha_num_pseudo_heads
+            _iha_rope_full_sdpa = {
+                "full_attention": self.rotary_emb(
+                    seq_len=seq_len * _P, device=device,
+                    dtype=x.dtype, layer_type="full_attention",
+                ),
+                "sliding_attention": self.rotary_emb(
+                    seq_len=seq_len * _P, device=device,
+                    dtype=x.dtype, layer_type="sliding_attention",
+                ),
+            }
+        else:
+            _iha_rope_full_sdpa = None
+
         repo_active = self.repo_active
         prores_alphas = self._prores_alphas  # (num_layers,) tensor buffer
 
@@ -1910,6 +2041,8 @@ class ModernBertModel(nn.Module):
                 cos_sin = rope[layer_type]
                 token_mask = attention_mask
 
+                iha_rf = _iha_rope_full_sdpa[layer_type] if _iha_rope_full_sdpa is not None else None
+
                 def _layer_forward(
                     x_in: torch.Tensor,
                     *,
@@ -1919,6 +2052,7 @@ class ModernBertModel(nn.Module):
                     _token_mask=token_mask,
                     _repo_active: bool = repo_active,
                     _prores_alpha=alpha,
+                    _iha_rf=iha_rf,
                 ) -> torch.Tensor:
                     return _layer(
                         x_in,
@@ -1928,6 +2062,7 @@ class ModernBertModel(nn.Module):
                         token_mask=_token_mask,
                         repo_active=_repo_active,
                         prores_alpha=_prores_alpha,
+                        iha_rope_full=_iha_rf,
                     )
 
                 try:
@@ -1943,6 +2078,7 @@ class ModernBertModel(nn.Module):
                     token_mask=attention_mask,
                     repo_active=repo_active,
                     prores_alpha=alpha,
+                    iha_rope_full=_iha_rope_full_sdpa[layer_type] if _iha_rope_full_sdpa is not None else None,
                 )
 
         if self.config.use_mhc_lite:
@@ -2044,6 +2180,17 @@ class ModernBertForMaskedLM(nn.Module):
             # W_g and W_c keep default Kaiming uniform init.
             if enc.attn.repo is not None:
                 nn.init.zeros_(enc.attn.repo.W_z.weight)
+
+            # IHA: identity-like init so model starts as standard MHA.
+            if enc.attn.use_iha:
+                H = enc.attn.num_heads
+                P = enc.attn.iha_P
+                eye_H = torch.eye(H)
+                alpha_init = eye_H.unsqueeze(1).expand(H, P, H).clone()
+                enc.attn.alpha_q.data.copy_(alpha_init)
+                enc.attn.alpha_k.data.copy_(alpha_init)
+                enc.attn.alpha_v.data.copy_(alpha_init)
+                enc.attn.alpha_o.data.copy_(alpha_init / P)
 
             # mHC-lite: zero-init fused projection, set biases for identity behavior
             def _init_mhc_block(block: MHCLiteBlock) -> None:

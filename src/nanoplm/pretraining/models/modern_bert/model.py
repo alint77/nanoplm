@@ -67,6 +67,8 @@ class ProtModernBertMLMConfig:
     mhc_lite_wrapping_level: str = "layer"
     tie_word_embeddings: bool = True
     use_diff_attn_v2: bool = False
+    use_iha: bool = False
+    iha_num_pseudo_heads: Optional[int] = None
     attn_layer_pattern: Optional[str] = None
 
 
@@ -85,6 +87,11 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
             raise ValueError(
                 "GQA is not implemented in the HF ModernBERT path. "
                 "Set num_kv_heads equal to num_attention_heads or use --pure-torch / --pure-te."
+            )
+        if config.use_iha:
+            raise ValueError(
+                "Interleaved Head Attention is implemented only in the pure-torch path. "
+                "Use --pure-torch with use_iha=true."
             )
         if str(config.classifier_activation).strip().lower() == "srelu":
             raise ValueError(

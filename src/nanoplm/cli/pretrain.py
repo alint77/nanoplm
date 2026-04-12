@@ -635,6 +635,18 @@ def pretrain():
     help="Tie input embedding and output decoder weights (default: enabled).",
 )
 @click.option(
+    "--use-iha/--no-use-iha",
+    default=False,
+    help="Enable Interleaved Head Attention: cross-head pseudo-head mixing before "
+         "attention (pure-torch only, incompatible with DiffAttnV2 and GQA).",
+)
+@click.option(
+    "--iha-num-pseudo-heads",
+    type=int,
+    default=None,
+    help="Number of pseudo-heads per head for IHA (default: num_attention_heads).",
+)
+@click.option(
     "--use-diff-attn-v2/--no-use-diff-attn-v2",
     default=False,
     help="Enable Differential Attention V2: doubles query heads, applies differential "
@@ -789,6 +801,8 @@ def run(
     activation_checkpointing: bool,
     activation_checkpointing_mode: str,
     tie_word_embeddings: bool,
+    use_iha: bool,
+    iha_num_pseudo_heads: Optional[int],
     use_diff_attn_v2: bool,
     attn_layer_pattern: Optional[str],
     use_mhc_lite: bool,
@@ -921,6 +935,8 @@ def run(
         mhc_n_streams=mhc_n_streams,
         mhc_lite_wrapping_level=mhc_lite_wrapping_level.lower(),
         tie_word_embeddings=tie_word_embeddings,
+        use_iha=use_iha,
+        iha_num_pseudo_heads=iha_num_pseudo_heads,
         use_diff_attn_v2=use_diff_attn_v2,
         attn_layer_pattern=attn_layer_pattern,
     )
@@ -930,6 +946,11 @@ def run(
         raise click.ClickException(
             "use_diff_attn_v2 requires --pure-torch. "
             "Differential Attention V2 is not implemented in HF/TE paths."
+        )
+    if use_iha and not pure_torch:
+        raise click.ClickException(
+            "use_iha requires --pure-torch. "
+            "Interleaved Head Attention is not implemented in HF/TE paths."
         )
     if pure_te:
         logger.info("Using Transformer Engine model and training loop")
@@ -1073,6 +1094,11 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
             "model.use_diff_attn_v2=true requires pure_torch: true (or --pure-torch). "
             "Differential Attention V2 is not implemented in HF/TE paths."
         )
+    if getattr(model_config, "use_iha", False) and not pure_torch:
+        raise click.ClickException(
+            "model.use_iha=true requires pure_torch: true (or --pure-torch). "
+            "Interleaved Head Attention is not implemented in HF/TE paths."
+        )
     if str(getattr(model_config, "classifier_activation", "gelu")).lower() == "srelu" and not (pure_torch or pure_te):
         raise click.ClickException(
             "model.classifier_activation=srelu requires pure_torch: true / --pure-torch or "
@@ -1195,7 +1221,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  use_canon_layers: false # enables Canon-ABCD local mixing layers (pure_torch only)\n"
         "  canon_layers_mode: \"ac\"  # subset of Canon sites: A/B/C/D (e.g. \"ac\" for lighter mode)\n"
         "  canon_layers_kernel_size: 5  # symmetric Canon kernel size (allowed: 3/5/7, default: 5)\n"
-        "  use_repo: false  # RePO: learned per-head positions replacing fixed RoPE (pure_torch only)\n"
+        "  use_repo: false  # RePO: learned per-head positions replacing fixed RoPE (pure_torch only, incompatible with use_iha)\n"
         "  repo_after_n_layers: 3  # first N layers keep standard RoPE, layers after use RePO\n"
         "  use_prores: false  # ProRes: progressive residual warmup (deeper layers warm up slower)\n"
         "  prores_T: 1000  # ProRes warmup length for first layer; layer l finishes at step T*l\n"
@@ -1203,7 +1229,9 @@ def get_yaml(output: Optional[str], force: bool):
         "  mhc_n_streams: 4  # number of residual streams for mHC-lite (n! permutation matrices)\n"
         "  mhc_lite_wrapping_level: \"layer\"  # mHC-lite wrapping: 'layer' or 'sublayers' (pure_torch only)\n"
         "  mhc_triton_fused: true  # use fused Triton kernels for mHC-lite stream ops; first run will start slow due to Triton autotune\n"
-        "  use_diff_attn_v2: false  # Differential Attention V2: doubles Q heads with differential subtraction (pure_torch only)\n"
+        "  use_iha: false  # Interleaved Head Attention: cross-head pseudo-head mixing (pure_torch only, sliding layers only, incompatible with use_diff_attn_v2, use_repo, and GQA)\n"
+        "  # iha_num_pseudo_heads: null  # P pseudo-heads per head (default: num_attention_heads)\n"
+        "  use_diff_attn_v2: false  # Differential Attention V2: doubles Q heads with differential subtraction (pure_torch only, incompatible with use_iha)\n"
         "  attn_layer_pattern: null  # Attention pattern string e.g. 'FSS' (F=full, S=sliding). Tiles to num_layers. Overrides global_attn_every_n_layers.\n"
         "  activation_checkpointing: false  # Enable to reduce VRAM by recomputing activations during backward\n"
         "  activation_checkpointing_mode: \"attn\"  # (layer | attn | attn+mlp), attn mode has highest ROI \n"
