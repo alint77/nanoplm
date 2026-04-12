@@ -648,6 +648,18 @@ def pretrain():
          "Tiles to cover all layers. Overrides --global-attn-every-n-layers when set.",
 )
 @click.option(
+    "--fused-qkv/--no-fused-qkv",
+    default=True,
+    help="Use a single fused Wqkv projection (default). When disabled, Q/K/V use separate "
+         "linear layers so Muon orthogonalizes each subspace independently.",
+)
+@click.option(
+    "--fused-up-gate/--no-fused-up-gate",
+    default=True,
+    help="Use a single fused Wi projection for SwiGLU/GLU up+gate (default). When disabled, "
+         "up and gate use separate linear layers so Muon orthogonalizes each independently.",
+)
+@click.option(
     "--use-mhc-lite/--no-use-mhc-lite",
     default=False,
     help="Enable mHC-lite: multi-stream residual with doubly stochastic mixing (pure-torch only). "
@@ -791,6 +803,8 @@ def run(
     tie_word_embeddings: bool,
     use_diff_attn_v2: bool,
     attn_layer_pattern: Optional[str],
+    fused_qkv: bool,
+    fused_up_gate: bool,
     use_mhc_lite: bool,
     mhc_n_streams: int,
     mhc_lite_wrapping_level: str,
@@ -923,6 +937,8 @@ def run(
         tie_word_embeddings=tie_word_embeddings,
         use_diff_attn_v2=use_diff_attn_v2,
         attn_layer_pattern=attn_layer_pattern,
+        fused_qkv=fused_qkv,
+        fused_up_gate=fused_up_gate,
     )
 
     _set_seed_for_init(seed)
@@ -1205,6 +1221,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  mhc_triton_fused: true  # use fused Triton kernels for mHC-lite stream ops; first run will start slow due to Triton autotune\n"
         "  use_diff_attn_v2: false  # Differential Attention V2: doubles Q heads with differential subtraction (pure_torch only)\n"
         "  attn_layer_pattern: null  # Attention pattern string e.g. 'FSS' (F=full, S=sliding). Tiles to num_layers. Overrides global_attn_every_n_layers.\n"
+        "  fused_qkv: true  # false = separate Wq/Wk/Wv instead of a single Wqkv\n"
+        "  fused_up_gate: true  # false = separate W_up/W_gate instead of a single Wi for SwiGLU/GLU\n"
         "  activation_checkpointing: false  # Enable to reduce VRAM by recomputing activations during backward\n"
         "  activation_checkpointing_mode: \"attn\"  # (layer | attn | attn+mlp), attn mode has highest ROI \n"
         "\n"

@@ -82,6 +82,8 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             tie_word_embeddings=config.tie_word_embeddings,
             use_diff_attn_v2=config.use_diff_attn_v2,
             attn_layer_pattern=config.attn_layer_pattern,
+            fused_qkv=config.fused_qkv,
+            fused_up_gate=config.fused_up_gate,
         )
 
         super().__init__(mb_config)
@@ -153,6 +155,8 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             tie_word_embeddings=config.tie_word_embeddings,
             use_diff_attn_v2=config.use_diff_attn_v2,
             attn_layer_pattern=config.attn_layer_pattern,
+            fused_qkv=config.fused_qkv,
+            fused_up_gate=config.fused_up_gate,
         )
 
         super().__init__(mb_config)
