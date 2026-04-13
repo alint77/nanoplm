@@ -17,10 +17,14 @@ class ModernBertMLPSwiGLU(nn.Module):
 
     def __init__(self, config: ModernBertConfig):
         super().__init__()
-        self.Wi = nn.Linear(config.hidden_size, config.intermediate_size * 2, bias=config.mlp_bias)
+        self.Wi = nn.Linear(
+            config.hidden_size, config.intermediate_size * 2, bias=config.mlp_bias
+        )
         self.drop = nn.Dropout(config.mlp_dropout)
         self.act = SwiGLU()
-        self.Wo = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
+        self.Wo = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=config.mlp_bias
+        )
 
     def forward(self, hidden_states):
         x, gate = self.Wi(hidden_states).chunk(2, dim=-1)
@@ -38,8 +42,11 @@ class ProtModernBertMLMConfig:
     intermediate_size: int
     num_hidden_layers: int
     num_attention_heads: int
-    num_kv_heads: Optional[int] = None  # GQA: K,V head count (None = same as num_attention_heads = MHA)
+    num_kv_heads: Optional[int] = (
+        None  # GQA: K,V head count (None = same as num_attention_heads = MHA)
+    )
     vocab_size: int = 32
+    norm_type: str = "layernorm"  # layernorm | rmsnorm
     mlp_activation: str = "swiglu"
     mlp_dropout: float = 0.0
     mlp_bias: bool = False
@@ -73,17 +80,16 @@ class ProtModernBertMLMConfig:
 
 
 class ProtModernBertMLM(ModernBertForMaskedLM):
-
-    def __init__(
-        self,
-        config: ProtModernBertMLMConfig
-    ):
+    def __init__(self, config: ProtModernBertMLMConfig):
         if config.use_canon_layers:
             raise ValueError(
                 "Canon layers are currently implemented only in the pure-torch path. "
                 "Use --pure-torch with use_canon_layers=true."
             )
-        if config.num_kv_heads is not None and config.num_kv_heads != config.num_attention_heads:
+        if (
+            config.num_kv_heads is not None
+            and config.num_kv_heads != config.num_attention_heads
+        ):
             raise ValueError(
                 "GQA is not implemented in the HF ModernBERT path. "
                 "Set num_kv_heads equal to num_attention_heads or use --pure-torch / --pure-te."
