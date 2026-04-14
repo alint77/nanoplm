@@ -751,6 +751,7 @@ def run(
     activation_checkpointing_mode: str,
     tie_word_embeddings: bool,
     use_diff_attn_v2: bool,
+    use_paired_head_attention: bool,
     attn_layer_pattern: Optional[str],
     fused_qkv: bool,
     fused_up_gate: bool,
@@ -892,6 +893,7 @@ def run(
         mhc_lite_wrapping_level=mhc_lite_wrapping_level.lower(),
         tie_word_embeddings=tie_word_embeddings,
         use_diff_attn_v2=use_diff_attn_v2,
+        use_paired_head_attention=use_paired_head_attention,
         attn_layer_pattern=attn_layer_pattern,
         fused_qkv=fused_qkv,
         fused_up_gate=fused_up_gate,
@@ -902,6 +904,11 @@ def run(
         raise click.ClickException(
             "use_diff_attn_v2 requires --pure-torch. "
             "Differential Attention V2 is not implemented in HF/TE paths."
+        )
+    if use_paired_head_attention and not pure_torch:
+        raise click.ClickException(
+            "use_paired_head_attention requires --pure-torch. "
+            "Paired head attention is not implemented in HF/TE paths."
         )
     if pure_te:
         logger.info("Using Transformer Engine model and training loop")
@@ -1047,6 +1054,11 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
             "model.use_diff_attn_v2=true requires pure_torch: true (or --pure-torch). "
             "Differential Attention V2 is not implemented in HF/TE paths."
         )
+    if getattr(model_config, "use_paired_head_attention", False) and not pure_torch:
+        raise click.ClickException(
+            "model.use_paired_head_attention=true requires pure_torch: true (or --pure-torch). "
+            "Paired head attention is not implemented in HF/TE paths."
+        )
     if str(
         getattr(model_config, "classifier_activation", "gelu")
     ).lower() == "srelu" and not (pure_torch or pure_te):
@@ -1173,6 +1185,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  mhc_lite_wrapping_level: \"layer\"  # mHC-lite wrapping: 'layer' or 'sublayers' (pure_torch only)\n"
         "  mhc_triton_fused: true  # use fused Triton kernels for mHC-lite stream ops; first run will start slow due to Triton autotune\n"
         "  use_diff_attn_v2: false  # Differential Attention V2: doubles Q heads with differential subtraction (pure_torch only)\n"
+        "  use_paired_head_attention: false  # pairs adjacent attention heads into a shared softmax (pure_torch only; MHA only, incompatible with RePO and Canon-B)\n"
         "  attn_layer_pattern: null  # Attention pattern string e.g. 'FSS' (F=full, S=sliding). Tiles to num_layers. Overrides global_attn_every_n_layers.\n"
         "  fused_qkv: true  # false = separate Wq/Wk/Wv instead of a single Wqkv\n"
         "  fused_up_gate: true  # false = separate W_up/W_gate instead of a single Wi for SwiGLU/GLU\n"

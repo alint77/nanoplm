@@ -217,12 +217,14 @@ def _split_packed_batch(
         e = int(cu[end_seq].item())
         actual_tokens = e - s
         pad_tokens = effective_tokens_per_split - actual_tokens
+        sub_cu = cu[start_seq : end_seq + 1] - cu[start_seq]
+        actual_max_seqlen = int((sub_cu[1:] - sub_cu[:-1]).max().item())
 
         sub = {
             "input_ids": batch["input_ids"].new_zeros(effective_tokens_per_split),
             "labels": batch["labels"].new_full((effective_tokens_per_split,), -100),
-            "cu_seqlens": cu[start_seq : end_seq + 1] - cu[start_seq],
-            "max_seqlen": batch["max_seqlen"],
+            "cu_seqlens": sub_cu,
+            "max_seqlen": max(actual_max_seqlen, pad_tokens),
             "num_valid_tokens": actual_tokens,
         }
         if actual_tokens > effective_tokens_per_split:
