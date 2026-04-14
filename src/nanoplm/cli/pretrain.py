@@ -910,6 +910,10 @@ def run(
             "use_paired_head_attention requires --pure-torch. "
             "Paired head attention is not implemented in HF/TE paths."
         )
+    if use_paired_head_attention and use_diff_attn_v2:
+        raise click.ClickException(
+            "use_paired_head_attention and use_diff_attn_v2 are mutually exclusive."
+        )
     if pure_te:
         logger.info("Using Transformer Engine model and training loop")
         model = TEProtModernBertMLM(model_cfg)
@@ -1059,6 +1063,12 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
             "model.use_paired_head_attention=true requires pure_torch: true (or --pure-torch). "
             "Paired head attention is not implemented in HF/TE paths."
         )
+    if getattr(model_config, "use_paired_head_attention", False) and getattr(
+        model_config, "use_diff_attn_v2", False
+    ):
+        raise click.ClickException(
+            "model.use_paired_head_attention=true is not compatible with model.use_diff_attn_v2=true."
+        )
     if str(
         getattr(model_config, "classifier_activation", "gelu")
     ).lower() == "srelu" and not (pure_torch or pure_te):
@@ -1185,7 +1195,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  mhc_lite_wrapping_level: \"layer\"  # mHC-lite wrapping: 'layer' or 'sublayers' (pure_torch only)\n"
         "  mhc_triton_fused: true  # use fused Triton kernels for mHC-lite stream ops; first run will start slow due to Triton autotune\n"
         "  use_diff_attn_v2: false  # Differential Attention V2: doubles Q heads with differential subtraction (pure_torch only)\n"
-        "  use_paired_head_attention: false  # pairs adjacent attention heads into a shared softmax (pure_torch only; MHA only, incompatible with RePO and Canon-B)\n"
+        "  use_paired_head_attention: false  # pairs adjacent attention heads into a shared softmax (pure_torch only; MHA only; incompatible with diff_attn_v2, RePO, and Canon-B)\n"
         "  attn_layer_pattern: null  # Attention pattern string e.g. 'FSS' (F=full, S=sliding). Tiles to num_layers. Overrides global_attn_every_n_layers.\n"
         "  fused_qkv: true  # false = separate Wq/Wk/Wv instead of a single Wqkv\n"
         "  fused_up_gate: true  # false = separate W_up/W_gate instead of a single Wi for SwiGLU/GLU\n"
