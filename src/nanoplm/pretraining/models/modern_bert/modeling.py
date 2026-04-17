@@ -237,18 +237,16 @@ class ModernBertConfig:
                 "With DiffV2, 2*num_attention_heads must be divisible by num_kv_heads: "
                 f"2*{self.num_attention_heads} % {self.num_kv_heads} != 0"
             )
-        if (
-            self.use_paired_head_attention
-            and self.num_kv_heads != self.num_attention_heads
-        ):
-            raise ValueError(
-                "Paired head attention currently supports MHA only. "
-                "Set num_kv_heads equal to num_attention_heads."
-            )
         if self.use_paired_head_attention and (self.num_attention_heads % 2) != 0:
             raise ValueError(
                 "Paired head attention requires an even number of attention heads. "
                 f"Got num_attention_heads={self.num_attention_heads}."
+            )
+        if self.use_paired_head_attention and (self.num_kv_heads % 2) != 0:
+            raise ValueError(
+                "Paired head attention requires an even num_kv_heads (KV heads "
+                "are paired alongside Q heads). "
+                f"Got num_kv_heads={self.num_kv_heads}."
             )
         if self.mhc_lite_wrapping_level not in {"layer", "sublayers"}:
             raise ValueError(
@@ -1545,11 +1543,11 @@ class ModernBertAttention(nn.Module):
     ]:
         cos, sin = cos_sin
         q = q.reshape(q.shape[0], self.num_heads // 2, 2 * self.head_dim)
-        k = k.reshape(k.shape[0], self.num_heads // 2, 2 * self.head_dim)
+        k = k.reshape(k.shape[0], self.num_kv_heads // 2, 2 * self.head_dim)
         q, k = _apply_paired_rope(q, k, cos, sin)
         q = q.reshape(q.shape[0] * 2, self.num_heads // 2, self.head_dim)
-        k = k.reshape(k.shape[0] * 2, self.num_heads // 2, self.head_dim)
-        v = v.reshape(v.shape[0] * 2, self.num_heads // 2, self.head_dim)
+        k = k.reshape(k.shape[0] * 2, self.num_kv_heads // 2, self.head_dim)
+        v = v.reshape(v.shape[0] * 2, self.num_kv_heads // 2, self.head_dim)
         paired_cu = cu_seqlens * 2
         paired_max = max_seqlen * 2
         return q, k, v, paired_cu, paired_max
@@ -1567,18 +1565,18 @@ class ModernBertAttention(nn.Module):
             bsz, seq_len, self.num_heads // 2, 2 * self.head_dim
         )
         k = k.transpose(1, 2).reshape(
-            bsz, seq_len, self.num_heads // 2, 2 * self.head_dim
+            bsz, seq_len, self.num_kv_heads // 2, 2 * self.head_dim
         )
         q, k = _apply_paired_rope(q, k, cos[0], sin[0])
         q = q.reshape(bsz, 2 * seq_len, self.num_heads // 2, self.head_dim).transpose(
             1, 2
         )
-        k = k.reshape(bsz, 2 * seq_len, self.num_heads // 2, self.head_dim).transpose(
-            1, 2
-        )
+        k = k.reshape(
+            bsz, 2 * seq_len, self.num_kv_heads // 2, self.head_dim
+        ).transpose(1, 2)
         v = (
             v.transpose(1, 2)
-            .reshape(bsz, 2 * seq_len, self.num_heads // 2, self.head_dim)
+            .reshape(bsz, 2 * seq_len, self.num_kv_heads // 2, self.head_dim)
             .transpose(1, 2)
         )
         return q, k, v
