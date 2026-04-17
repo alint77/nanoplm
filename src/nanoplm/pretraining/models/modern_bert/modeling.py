@@ -893,9 +893,10 @@ class ModernBertCanonLayer(nn.Module):
             and x.requires_grad
         )
         # Eval/inference should avoid autotune warmup latency.
+        # _canon_ops is None on CPU/MPS (no CUDA) — skip the Triton autotune guard.
         autotune_ctx = (
             nullcontext()
-            if self.training
+            if self.training or _canon_ops is None
             else _canon_ops.disable_autotune_temporarily()
         )
 
