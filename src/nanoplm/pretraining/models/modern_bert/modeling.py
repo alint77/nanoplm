@@ -631,10 +631,10 @@ class NOBLELinear(nn.Module):
         # Low-rank nonlinear branch
         self.W_down = nn.Linear(in_features, rank, bias=False)
         self.cosnet = CosNet(rank, omega_range=omega_range, phi_std=phi_std)
-        self.W_up = nn.Linear(rank, out_features, bias=False)
+        self.noble_w_up = nn.Linear(rank, out_features, bias=False)
 
-        # W_up: near-zero init (paper §3.3, α/√r)
-        nn.init.normal_(self.W_up.weight, mean=0.0, std=alpha / math.sqrt(rank))
+        # noble_w_up: near-zero init
+        nn.init.normal_(self.noble_w_up.weight, mean=0.0, std=alpha / math.sqrt(rank))
 
     @property
     def weight(self) -> nn.Parameter:
@@ -654,7 +654,7 @@ class NOBLELinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         main = self.linear(x)
-        branch = self.W_up(self.cosnet(self.W_down(x)))
+        branch = self.noble_w_up(self.cosnet(self.W_down(x)))
         return main + branch
 
 

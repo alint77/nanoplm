@@ -106,11 +106,7 @@ def _classify_noble_param(name: str) -> str | None:
     """Classify a NOBLE param for optimizer routing.
 
     Returns one of: 'wup', 'M', 'freq', 'phase', or None (not a NOBLE param).
-    Note: W_down is intentionally NOT matched — it stays in Muon.
-
-    When fused_up_gate=False, the MLP contains a submodule literally named
-    'W_up' (itself a NOBLELinear). Match NOBLE's inner W_up leaf by suffix,
-    not substring, so we don't accidentally swallow its siblings.
+    W_down is intentionally NOT matched — it stays in Muon.
     """
     if ".cosnet.M" in name:
         return "M"
@@ -118,7 +114,7 @@ def _classify_noble_param(name: str) -> str | None:
         return "freq"
     if ".cosnet.phi" in name:
         return "phase"
-    if name.endswith(".W_up.weight"):
+    if name.endswith(".noble_w_up.weight"):
         return "wup"
     return None
 
