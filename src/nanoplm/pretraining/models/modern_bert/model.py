@@ -74,6 +74,7 @@ class ProtModernBertMLMConfig:
     mhc_lite_wrapping_level: str = "layer"
     tie_word_embeddings: bool = True
     use_diff_attn_v2: bool = False
+    use_paired_head_attention: bool = False
     attn_layer_pattern: Optional[str] = None
     fused_qkv: bool = True
     fused_up_gate: bool = True
@@ -121,6 +122,11 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
             raise ValueError(
                 "classifier_activation='srelu' is implemented only in the pure-torch and "
                 "Transformer Engine paths. Use --pure-torch / --pure-te or choose relu/gelu."
+            )
+        if config.use_paired_head_attention:
+            raise ValueError(
+                "Paired head attention is implemented only in the pure-torch path. "
+                "Use --pure-torch or disable use_paired_head_attention."
             )
 
         self.tokenizer = ProtModernBertTokenizer()

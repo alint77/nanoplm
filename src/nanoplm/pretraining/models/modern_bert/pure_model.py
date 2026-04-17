@@ -88,6 +88,7 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             mhc_lite_wrapping_level=str(config.mhc_lite_wrapping_level).strip().lower(),
             tie_word_embeddings=config.tie_word_embeddings,
             use_diff_attn_v2=config.use_diff_attn_v2,
+            use_paired_head_attention=config.use_paired_head_attention,
             attn_layer_pattern=config.attn_layer_pattern,
             fused_qkv=config.fused_qkv,
             fused_up_gate=config.fused_up_gate,
@@ -130,6 +131,11 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             raise ValueError(
                 "Differential Attention V2 is currently implemented only in the "
                 "pure-torch path. Disable use_diff_attn_v2 or use --pure-torch."
+            )
+        if config.use_paired_head_attention:
+            raise ValueError(
+                "Paired head attention is currently implemented only in the pure-torch "
+                "path. Disable use_paired_head_attention or use --pure-torch."
             )
         if not config.fused_qkv:
             raise ValueError(

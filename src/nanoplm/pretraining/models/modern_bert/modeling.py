@@ -188,6 +188,7 @@ class ModernBertConfig:
     mhc_triton_fused: bool = False
     mhc_lite_wrapping_level: Literal["layer", "sublayers"] = "layer"
     use_diff_attn_v2: bool = False
+    use_paired_head_attention: bool = False
     attn_layer_pattern: Optional[str] = None
     # When False, Q/K/V projections use separate nn.Linear modules instead of a
     # single fused Wqkv.  Separate projections give Muon's Newton-Schulz
@@ -236,6 +237,17 @@ class ModernBertConfig:
                 "With DiffV2, 2*num_attention_heads must be divisible by num_kv_heads: "
                 f"2*{self.num_attention_heads} % {self.num_kv_heads} != 0"
             )
+        if self.use_paired_head_attention and (self.num_attention_heads % 2) != 0:
+            raise ValueError(
+                "Paired head attention requires an even number of attention heads. "
+                f"Got num_attention_heads={self.num_attention_heads}."
+            )
+        if self.use_paired_head_attention and (self.num_kv_heads % 2) != 0:
+            raise ValueError(
+                "Paired head attention requires an even num_kv_heads (KV heads "
+                "are paired alongside Q heads). "
+                f"Got num_kv_heads={self.num_kv_heads}."
+            )
         if self.mhc_lite_wrapping_level not in {"layer", "sublayers"}:
             raise ValueError(
                 "mhc_lite_wrapping_level must be one of {'layer', 'sublayers'}, "
@@ -254,6 +266,11 @@ class ModernBertConfig:
             )
         attn_stride = max(1, int(self.global_attn_every_n_layers))
         self.head_dim = self.hidden_size // self.num_attention_heads
+        if self.use_paired_head_attention and (self.head_dim % 2) != 0:
+            raise ValueError(
+                "Paired head attention requires an even head_dim. "
+                f"Got head_dim={self.head_dim}."
+            )
         self.sliding_window = self.local_attention // 2
         self.mlp_activation = self.mlp_activation.lower()
         if self.mlp_activation not in {"swiglu", "glu", "srelu"}:
@@ -298,11 +315,24 @@ class ModernBertConfig:
                 "Differential attention V2 changes Q/K head counts which is "
                 "incompatible with RePO's per-head position prediction."
             )
+        if self.use_paired_head_attention and self.use_diff_attn_v2:
+            raise ValueError(
+                "use_paired_head_attention is not compatible with use_diff_attn_v2."
+            )
         if self.use_repo and self.num_kv_heads != self.num_attention_heads:
             raise ValueError(
                 "GQA (num_kv_heads != num_attention_heads) is not compatible with use_repo. "
                 "RePO predicts per-head positions for Q and K jointly, which requires "
                 "equal Q/K head counts."
+            )
+        if self.use_paired_head_attention and self.use_repo:
+            raise ValueError(
+                "use_paired_head_attention is not compatible with use_repo."
+            )
+        if self.use_paired_head_attention and "b" in self.canon_layer_set:
+            raise ValueError(
+                "use_paired_head_attention is not compatible with Canon-B. "
+                "Remove 'b' from canon_layers_mode."
             )
         if self.use_noble and self.mlp_activation == "srelu":
             import warnings
@@ -382,6 +412,53 @@ def _apply_rope(
     q = qf * cos + _rotate_half(qf) * sin
     k = kf * cos + _rotate_half(kf) * sin
     return q.to(dtype=q_dtype), k.to(dtype=k_dtype)
+
+
+def _apply_paired_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply staggered RoPE to paired heads.
+
+    q/k last dim is 2*D, where the first D channels belong to the first head in
+    the pair and the second D channels belong to the second head in the pair.
+    Each half is rotated independently with positions (2p) and (2p+1).
+    """
+
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+
+    q1, q2 = q.chunk(2, dim=-1)
+    k1, k2 = k.chunk(2, dim=-1)
+    cos1, cos2 = cos.chunk(2, dim=-1)
+    sin1, sin2 = sin.chunk(2, dim=-1)
+
+    q1_dtype, q2_dtype = q1.dtype, q2.dtype
+    k1_dtype, k2_dtype = k1.dtype, k2.dtype
+    q1f, q2f = q1.float(), q2.float()
+    k1f, k2f = k1.float(), k2.float()
+
+    q1 = (q1f * cos1 + _rotate_half(q1f) * sin1).to(dtype=q1_dtype)
+    q2 = (q2f * cos2 + _rotate_half(q2f) * sin2).to(dtype=q2_dtype)
+    k1 = (k1f * cos1 + _rotate_half(k1f) * sin1).to(dtype=k1_dtype)
+    k2 = (k2f * cos2 + _rotate_half(k2f) * sin2).to(dtype=k2_dtype)
+    return torch.cat((q1, q2), dim=-1), torch.cat((k1, k2), dim=-1)
+
+
+def _pair_sdpa_attention_mask(
+    attn_mask: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    if attn_mask is None:
+        return None
+    if attn_mask.shape[-2] == 1:
+        return attn_mask.repeat_interleave(2, dim=-1)
+    return attn_mask.repeat_interleave(2, dim=-1).repeat_interleave(2, dim=-2)
+
+
+def _pair_flash_window_size(window_size: tuple[int, int]) -> tuple[int, int]:
+    return tuple(-1 if w < 0 else 2 * w for w in window_size)
 
 
 def _diff_attn_v2(
@@ -1095,9 +1172,44 @@ class ModernBertRotaryEmbedding(nn.Module):
         channel = torch.arange(0, self.config.head_dim, 2, dtype=torch.float32)
         return 1.0 / (theta ** (channel / self.config.head_dim))
 
-    def forward(
+    def _select_inv_freq(self, layer_type: str, device: torch.device) -> torch.Tensor:
+        inv_freq = (
+            self.inv_freq_full
+            if layer_type == "full_attention"
+            else self.inv_freq_sliding
+        )
+        return inv_freq.to(device=device)
+
+    def paired_from_positions(
+        self,
+        positions: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+        layer_type: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        inv_freq = self._select_inv_freq(layer_type, device)
+        pos = positions.to(device=device, dtype=torch.float32)
+        even_freqs = torch.outer(2.0 * pos, inv_freq)
+        odd_freqs = torch.outer(2.0 * pos + 1.0, inv_freq)
+        even = torch.cat((even_freqs, even_freqs), dim=-1)
+        odd = torch.cat((odd_freqs, odd_freqs), dim=-1)
+        emb = torch.cat((even, odd), dim=-1)
+        return emb.cos().to(dtype=dtype), emb.sin().to(dtype=dtype)
+
+    def paired(
         self,
         seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        layer_type: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        positions = torch.arange(seq_len, device=device, dtype=torch.float32)
+        cos, sin = self.paired_from_positions(positions, device, dtype, layer_type)
+        return cos[None], sin[None]
+
+    def forward(
+        self,
+        seq_len: int | torch.Tensor,
         device: torch.device,
         dtype: torch.dtype,
         layer_type: str,
@@ -1108,7 +1220,17 @@ class ModernBertRotaryEmbedding(nn.Module):
             inv_freq = self.inv_freq_sliding
 
         inv_freq = inv_freq.to(device=device)
-        positions = torch.arange(seq_len, device=device, dtype=torch.float32)
+        if isinstance(seq_len, torch.Tensor):
+            # Dynamic tensor lengths cannot be passed to torch.arange without
+            # materializing a Python int. Slice from the model cap instead so
+            # compiled varlen paths stay graph-friendly.
+            positions = torch.arange(
+                self.config.max_position_embeddings,
+                device=device,
+                dtype=torch.float32,
+            )[:seq_len]
+        else:
+            positions = torch.arange(seq_len, device=device, dtype=torch.float32)
         freqs = torch.outer(positions, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos()[None].to(dtype=dtype), emb.sin()[None].to(dtype=dtype)
@@ -1303,6 +1425,7 @@ class ModernBertAttention(nn.Module):
         self.dropout = config.attention_dropout
         self.scale = self.head_dim**-0.5
         self.use_diff_attn_v2 = config.use_diff_attn_v2
+        self.use_paired_head_attention = config.use_paired_head_attention
 
         # GQA: num_kv_heads <= num_heads. MHA when num_kv_heads == num_heads.
         self.num_kv_heads = config.num_kv_heads
@@ -1407,6 +1530,57 @@ class ModernBertAttention(nn.Module):
                 persistent=False,
             )
 
+    def _pair_varlen_qkv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cos_sin: tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int | torch.Tensor,
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int | torch.Tensor
+    ]:
+        cos, sin = cos_sin
+        q = q.reshape(q.shape[0], self.num_heads // 2, 2 * self.head_dim)
+        k = k.reshape(k.shape[0], self.num_kv_heads // 2, 2 * self.head_dim)
+        q, k = _apply_paired_rope(q, k, cos, sin)
+        q = q.reshape(q.shape[0] * 2, self.num_heads // 2, self.head_dim)
+        k = k.reshape(k.shape[0] * 2, self.num_kv_heads // 2, self.head_dim)
+        v = v.reshape(v.shape[0] * 2, self.num_kv_heads // 2, self.head_dim)
+        paired_cu = cu_seqlens * 2
+        paired_max = max_seqlen * 2
+        return q, k, v, paired_cu, paired_max
+
+    def _pair_sdpa_qkv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cos_sin: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        bsz, _, seq_len, _ = q.shape
+        cos, sin = cos_sin
+        q = q.transpose(1, 2).reshape(
+            bsz, seq_len, self.num_heads // 2, 2 * self.head_dim
+        )
+        k = k.transpose(1, 2).reshape(
+            bsz, seq_len, self.num_kv_heads // 2, 2 * self.head_dim
+        )
+        q, k = _apply_paired_rope(q, k, cos[0], sin[0])
+        q = q.reshape(bsz, 2 * seq_len, self.num_heads // 2, self.head_dim).transpose(
+            1, 2
+        )
+        k = k.reshape(
+            bsz, 2 * seq_len, self.num_kv_heads // 2, self.head_dim
+        ).transpose(1, 2)
+        v = (
+            v.transpose(1, 2)
+            .reshape(bsz, 2 * seq_len, self.num_kv_heads // 2, self.head_dim)
+            .transpose(1, 2)
+        )
+        return q, k, v
+
     # -- varlen (flash-attention) path -----------------------------------------
 
     def _forward_varlen(
@@ -1455,12 +1629,23 @@ class ModernBertAttention(nn.Module):
         if self.repo is not None and repo_active:
             positions = self.repo(x)  # (T, num_heads)
             q, k = _apply_rope_repo(q, k, positions, self.repo_inv_freq)
-        else:
+        elif not self.use_paired_head_attention:
             cos, sin = cos_sin
             q, k = _apply_rope(q, k, cos, sin)
         if self.use_qk_norm:
             q = F.rms_norm(q, (self.head_dim,))
             k = F.rms_norm(k, (self.head_dim,))
+
+        if self.use_paired_head_attention:
+            q, k, v, cu_seqlens, max_seqlen = self._pair_varlen_qkv(
+                q,
+                k,
+                v,
+                cos_sin,
+                cu_seqlens,
+                max_seqlen,
+            )
+            window_size = _pair_flash_window_size(window_size)
 
         # When max_seqlen is already a plain int (static-shape mode) skip .item()
         # to avoid a graph break.  For tensor values (dynamic mode) .item() is
@@ -1480,6 +1665,9 @@ class ModernBertAttention(nn.Module):
         y = _flash_varlen_fn(q, k, v, **kwargs)
         if isinstance(y, tuple):
             y = y[0]
+
+        if self.use_paired_head_attention:
+            y = y.reshape(total, self.num_heads, self.head_dim)
 
         if self.use_diff_attn_v2:
             # y: (total, 2*num_heads, head_dim) — paired heads in same GQA group
@@ -1546,12 +1734,16 @@ class ModernBertAttention(nn.Module):
         if self.repo is not None and repo_active:
             positions = self.repo(x)  # (B, S, num_heads)
             q, k = _apply_rope_repo_sdpa(q, k, positions, self.repo_inv_freq)
-        else:
+        elif not self.use_paired_head_attention:
             cos, sin = cos_sin
             q, k = _apply_rope(q, k, cos, sin)
         if self.use_qk_norm:
             q = F.rms_norm(q, (self.head_dim,))
             k = F.rms_norm(k, (self.head_dim,))
+
+        if self.use_paired_head_attention:
+            q, k, v = self._pair_sdpa_qkv(q, k, v, cos_sin)
+            attn_mask = _pair_sdpa_attention_mask(attn_mask)
 
         y = F.scaled_dot_product_attention(
             q,
@@ -1562,6 +1754,13 @@ class ModernBertAttention(nn.Module):
             scale=self.scale,
             enable_gqa=(self.num_q_heads != self.num_kv_heads),
         )
+
+        if self.use_paired_head_attention:
+            y = (
+                y.transpose(1, 2)
+                .reshape(bsz, seq_len, self.num_heads, self.head_dim)
+                .transpose(1, 2)
+            )
 
         if self.use_diff_attn_v2:
             # y: (B, 2H, S, D) -> differential subtraction
@@ -2279,21 +2478,38 @@ class ModernBertModel(nn.Module):
                     _cu_seqlens, x.shape[0], x.device
                 )
 
-            # Pre-compute RoPE tables up to max_position_embeddings (fixed size
-            # avoids graph breaks / recompilation) and index by _position_ids.
-            rope_len = self.config.max_position_embeddings
+            # Build RoPE tables only up to the current batch's max sequence
+            # length when available. This trims needless work for short-sequence
+            # packed batches while preserving a safe fallback for manual callers.
+            rope_len = (
+                _max_seqlen
+                if _max_seqlen is not None
+                else self.config.max_position_embeddings
+            )
             cos_f, sin_f = self.rotary_emb(rope_len, device, x.dtype, "full_attention")
             cos_s, sin_s = self.rotary_emb(
                 rope_len, device, x.dtype, "sliding_attention"
             )
             rope = {
                 "full_attention": (
-                    cos_f[0, _position_ids],
-                    sin_f[0, _position_ids],
+                    self.rotary_emb.paired_from_positions(
+                        _position_ids,
+                        device,
+                        x.dtype,
+                        "full_attention",
+                    )
+                    if self.config.use_paired_head_attention
+                    else (cos_f[0, _position_ids], sin_f[0, _position_ids])
                 ),
                 "sliding_attention": (
-                    cos_s[0, _position_ids],
-                    sin_s[0, _position_ids],
+                    self.rotary_emb.paired_from_positions(
+                        _position_ids,
+                        device,
+                        x.dtype,
+                        "sliding_attention",
+                    )
+                    if self.config.use_paired_head_attention
+                    else (cos_s[0, _position_ids], sin_s[0, _position_ids])
                 ),
             }
             windows = {
@@ -2394,17 +2610,35 @@ class ModernBertModel(nn.Module):
         }
 
         rope = {
-            "full_attention": self.rotary_emb(
-                seq_len=seq_len,
-                device=device,
-                dtype=x.dtype,
-                layer_type="full_attention",
+            "full_attention": (
+                self.rotary_emb.paired(
+                    seq_len=seq_len,
+                    device=device,
+                    dtype=x.dtype,
+                    layer_type="full_attention",
+                )
+                if self.config.use_paired_head_attention
+                else self.rotary_emb(
+                    seq_len=seq_len,
+                    device=device,
+                    dtype=x.dtype,
+                    layer_type="full_attention",
+                )
             ),
-            "sliding_attention": self.rotary_emb(
-                seq_len=seq_len,
-                device=device,
-                dtype=x.dtype,
-                layer_type="sliding_attention",
+            "sliding_attention": (
+                self.rotary_emb.paired(
+                    seq_len=seq_len,
+                    device=device,
+                    dtype=x.dtype,
+                    layer_type="sliding_attention",
+                )
+                if self.config.use_paired_head_attention
+                else self.rotary_emb(
+                    seq_len=seq_len,
+                    device=device,
+                    dtype=x.dtype,
+                    layer_type="sliding_attention",
+                )
             ),
         }
 
