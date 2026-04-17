@@ -1023,6 +1023,11 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
 
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
+    if getattr(model_config, "use_noble", False) and not pure_torch:
+        raise click.ClickException(
+            "model.use_noble=true requires pure_torch: true (or --pure-torch). "
+            "NOBLE is not implemented in HF/TE paths."
+        )
     if model_config.use_canon_layers and not pure_torch:
         raise click.ClickException(
             "model.use_canon_layers=true requires pure_torch: true (or --pure-torch). "
@@ -1196,6 +1201,11 @@ def get_yaml(output: Optional[str], force: bool):
         "  mhc_triton_fused: true  # use fused Triton kernels for mHC-lite stream ops; first run will start slow due to Triton autotune\n"
         "  use_diff_attn_v2: false  # Differential Attention V2: doubles Q heads with differential subtraction (pure_torch only)\n"
         "  use_paired_head_attention: false  # pairs adjacent attention heads into a shared softmax (pure_torch only; MHA only; incompatible with diff_attn_v2, RePO, and Canon-B)\n"
+        "  use_noble: false  # NOBLE: nonlinear low-rank branches for linear layers (pure_torch only)\n"
+        "  noble_rank: 64  # NOBLE bottleneck rank (typical: 64-256)\n"
+        "  noble_alpha: 0.01  # NOBLE W_up initialization scale\n"
+        "  noble_half_kaiming: true  # halve main weight init scale for NOBLE layers (paper §3.3)\n"
+        "  noble_targets: all  # which projections get NOBLE: all|attn|ffn|qkv|out\n"
         "  attn_layer_pattern: null  # Attention pattern string e.g. 'FSS' (F=full, S=sliding). Tiles to num_layers. Overrides global_attn_every_n_layers.\n"
         "  fused_qkv: true  # false = separate Wq/Wk/Wv instead of a single Wqkv\n"
         "  fused_up_gate: true  # false = separate W_up/W_gate instead of a single Wi for SwiGLU/GLU\n"
@@ -1228,6 +1238,12 @@ def get_yaml(output: Optional[str], force: bool):
         "  muon_momentum: 0.95\n"
         "  muon_nesterov: true\n"
         "  muon_eps: 1e-7\n"
+        "  # NOBLE optimizer LR scaling (only used when model.use_noble=true)\n"
+        "  noble_base_lr: 3e-4  # independent base LR for NOBLE branch params\n"
+        "  noble_lr_gamma: 0.3  # W_up LR power (actual exponent = 2γ = 0.6)\n"
+        "  noble_lr_gamma_M: 0.45  # M mixing matrix LR power\n"
+        "  noble_freq_lr_mult: 3.0  # ω frequency LR multiplier\n"
+        "  noble_phase_lr_mult: 5.0  # φ phase LR multiplier\n"
         "\n"
         "  mlm_probability: 0.3\n"
         "  mask_replace_prob: 0.8\n"
@@ -1343,6 +1359,11 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         "muon_momentum",
         "muon_eps",
         "min_lr",
+        "noble_base_lr",
+        "noble_lr_gamma",
+        "noble_lr_gamma_M",
+        "noble_freq_lr_mult",
+        "noble_phase_lr_mult",
     ]
 
     def _parse_float_like(raw_value: Any, field_name: str) -> float:

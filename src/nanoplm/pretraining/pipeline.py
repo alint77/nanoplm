@@ -175,6 +175,7 @@ def run_pretraining(
         mask_token_probability=pretrain_config.mask_replace_prob,
         random_token_probability=pretrain_config.random_token_prob,
         keep_probability=pretrain_config.keep_probability,
+        extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
     )
 
     create_dirs(pretrain_config.ckp_dir)

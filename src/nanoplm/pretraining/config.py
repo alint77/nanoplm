@@ -110,6 +110,13 @@ class PretrainingConfig:
     ddp_bucket_cap_mb: int = 25
     project_name: str = "nanoplm-pretraining"
 
+    # NOBLE optimizer LR scaling (paper §3.3, Appendix A)
+    noble_base_lr: float = 3e-4          # independent base LR for NOBLE branch params
+    noble_lr_gamma: float = 0.3          # W_up LR power: actual exponent = 2γ = 0.6
+    noble_lr_gamma_M: float = 0.45       # M mixing matrix LR power
+    noble_freq_lr_mult: float = 3.0      # ω frequency LR multiplier
+    noble_phase_lr_mult: float = 5.0     # φ phase LR multiplier
+
 
 @dataclass
 class ResumeConfig:

@@ -92,6 +92,14 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             attn_layer_pattern=config.attn_layer_pattern,
             fused_qkv=config.fused_qkv,
             fused_up_gate=config.fused_up_gate,
+            # NOBLE
+            use_noble=config.use_noble,
+            noble_rank=config.noble_rank,
+            noble_alpha=config.noble_alpha,
+            noble_omega_range=config.noble_omega_range,
+            noble_phi_std=config.noble_phi_std,
+            noble_half_kaiming=config.noble_half_kaiming,
+            noble_targets=config.noble_targets,
         )
 
         super().__init__(mb_config)
@@ -101,6 +109,11 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
     """Transformer-Engine ``ProtModernBertMLM`` wrapper."""
 
     def __init__(self, config: ProtModernBertMLMConfig):
+        if config.use_noble:
+            raise ValueError(
+                "NOBLE is currently implemented only in the pure-torch path. "
+                "Disable use_noble or use --pure-torch."
+            )
         if config.use_canon_layers:
             raise ValueError(
                 "Canon layers are currently implemented only in the pure-torch path. "
@@ -123,6 +136,16 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             raise ValueError(
                 "Paired head attention is currently implemented only in the pure-torch "
                 "path. Disable use_paired_head_attention or use --pure-torch."
+            )
+        if not config.fused_qkv:
+            raise ValueError(
+                "fused_qkv=False is implemented only in the pure-torch path. "
+                "Use --pure-torch with fused_qkv=false."
+            )
+        if not config.fused_up_gate:
+            raise ValueError(
+                "fused_up_gate=False is implemented only in the pure-torch path. "
+                "Use --pure-torch with fused_up_gate=false."
             )
 
         self.tokenizer = ProtModernBertTokenizer()
