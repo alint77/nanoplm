@@ -26,11 +26,13 @@ if torch.cuda.is_available():
     from . import canon_ops as _canon_ops
     from .canon_ops import varlen_canon_conv as _varlen_canon_conv
     from .canon_ops import varlen_ln_canon_conv as _varlen_ln_canon_conv
+    from .canon_ops import varlen_rms_canon_conv as _varlen_rms_canon_conv
 else:
     _mhc_triton_ops = None  # type: ignore[assignment]
     _canon_ops = None  # type: ignore[assignment]
     _varlen_canon_conv = None  # type: ignore[assignment]
     _varlen_ln_canon_conv = None  # type: ignore[assignment]
+    _varlen_rms_canon_conv = None  # type: ignore[assignment]
 
 _HAS_FLASH_VARLEN = False
 _flash_varlen_fn = None
@@ -55,7 +57,10 @@ if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
 
 USE_TRITON_SRELU = False
 
-if torch.cuda.is_available() and (torch.cuda.get_device_capability() == (9, 0) or torch.cuda.get_device_capability() == (12, 0)):
+if torch.cuda.is_available() and (
+    torch.cuda.get_device_capability() == (9, 0)
+    or torch.cuda.get_device_capability() == (12, 0)
+):
     USE_TRITON_SRELU = True
 
 
@@ -72,7 +77,9 @@ if not _HAS_FLASH_VARLEN:
 
 def _parse_canon_layers_mode(mode: str) -> frozenset[str]:
     if not isinstance(mode, str):
-        raise ValueError(f"canon_layers_mode must be a string, got {type(mode).__name__}")
+        raise ValueError(
+            f"canon_layers_mode must be a string, got {type(mode).__name__}"
+        )
     normalized = mode.strip().lower()
     if normalized in {"", "none", "off"}:
         return frozenset()
@@ -98,7 +105,9 @@ def _resolve_canon_kernel_size(
     allowed = frozenset({3, 5, 7})
     if canon_layers_kernel_size is None:
         return 5
-    if isinstance(canon_layers_kernel_size, bool) or not isinstance(canon_layers_kernel_size, int):
+    if isinstance(canon_layers_kernel_size, bool) or not isinstance(
+        canon_layers_kernel_size, int
+    ):
         raise ValueError(
             "canon_layers_kernel_size must be an integer or null/None "
             f"(auto default). Got {canon_layers_kernel_size!r}."
@@ -128,7 +137,9 @@ class ModernBertConfig:
     intermediate_size: int = 1152
     num_hidden_layers: int = 22
     num_attention_heads: int = 12
-    num_kv_heads: Optional[int] = None  # GQA: None means MHA (num_kv_heads = num_attention_heads)
+    num_kv_heads: Optional[int] = (
+        None  # GQA: None means MHA (num_kv_heads = num_attention_heads)
+    )
     mlp_activation: str = "swiglu"
     hidden_activation: str = "gelu"
     max_position_embeddings: int = 8192
@@ -136,6 +147,7 @@ class ModernBertConfig:
     initializer_cutoff_factor: float = 2.0
     norm_eps: float = 1e-5
     norm_bias: bool = False
+    norm_type: Literal["layernorm", "rmsnorm"] = "layernorm"
     pad_token_id: int = 0
     eos_token_id: int = 1
     bos_token_id: Optional[int] = None
@@ -177,6 +189,16 @@ class ModernBertConfig:
     mhc_lite_wrapping_level: Literal["layer", "sublayers"] = "layer"
     use_diff_attn_v2: bool = False
     attn_layer_pattern: Optional[str] = None
+    # When False, Q/K/V projections use separate nn.Linear modules instead of a
+    # single fused Wqkv.  Separate projections give Muon's Newton-Schulz
+    # orthogonalization independent subspaces for each head group, which is the
+    # mathematically correct formulation.  Fused (True) is faster due to wider
+    # matmuls but couples the orthogonalization across Q, K, and V.
+    fused_qkv: bool = True
+    # When False, SwiGLU/GLU up and gate projections use separate nn.Linear
+    # modules instead of a single fused Wi.  Same Muon rationale as fused_qkv:
+    # split projections keep the orthogonalization independent per subspace.
+    fused_up_gate: bool = True
     # NOBLE: Nonlinear low-rank branches for linear enhancement
     use_noble: bool = False
     noble_rank: int = 64
@@ -206,7 +228,10 @@ class ModernBertConfig:
                 "num_attention_heads must be divisible by num_kv_heads for GQA: "
                 f"{self.num_attention_heads} % {self.num_kv_heads} != 0"
             )
-        if self.use_diff_attn_v2 and (2 * self.num_attention_heads) % self.num_kv_heads != 0:
+        if (
+            self.use_diff_attn_v2
+            and (2 * self.num_attention_heads) % self.num_kv_heads != 0
+        ):
             raise ValueError(
                 "With DiffV2, 2*num_attention_heads must be divisible by num_kv_heads: "
                 f"2*{self.num_attention_heads} % {self.num_kv_heads} != 0"
@@ -260,8 +285,7 @@ class ModernBertConfig:
                     )
             # Tile pattern to cover all layers.
             self.layer_types = [
-                _map[pattern[i % len(pattern)]]
-                for i in range(self.num_hidden_layers)
+                _map[pattern[i % len(pattern)]] for i in range(self.num_hidden_layers)
             ]
         else:
             self.layer_types = [
@@ -302,6 +326,24 @@ class ModernBertConfig:
                 f"noble_targets={self.noble_targets!r} is not supported. "
                 f"Choose from: {', '.join(sorted(_NOBLE_TARGET_ROLES))}."
             )
+        # Normalize norm_type and validate
+        self.norm_type = str(self.norm_type).strip().lower()
+        if self.norm_type not in {"layernorm", "rmsnorm"}:
+            raise ValueError(
+                f"norm_type must be 'layernorm' or 'rmsnorm', got {self.norm_type!r}"
+            )
+        if self.norm_type == "rmsnorm" and self.norm_bias:
+            raise ValueError(
+                "norm_bias=True is not compatible with norm_type='rmsnorm'. "
+                "RMSNorm does not support bias. Set norm_bias=False."
+            )
+
+
+def _create_norm(hidden_size: int, eps: float, bias: bool, norm_type: str) -> nn.Module:
+    """Create a normalization layer based on norm_type."""
+    if norm_type == "rmsnorm":
+        return nn.RMSNorm(hidden_size, eps=eps)
+    return nn.LayerNorm(hidden_size, eps=eps, bias=bias)
 
 
 def _get_activation(name: str):
@@ -363,7 +405,9 @@ class RePOModule(nn.Module):
     Architecture: SwiGLU position representation + linear per-head position assignment.
     """
 
-    def __init__(self, hidden_size: int, num_heads: int, head_dim: int, d_p: Optional[int] = None):
+    def __init__(
+        self, hidden_size: int, num_heads: int, head_dim: int, d_p: Optional[int] = None
+    ):
         super().__init__()
         d_p = d_p or hidden_size // 8
         self.W_g = nn.Linear(hidden_size, d_p, bias=False)
@@ -425,7 +469,9 @@ def _apply_rope_repo_sdpa(
     return q.to(dtype=q_dtype), k.to(dtype=k_dtype)
 
 
-def _full_attention_mask(attention_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+def _full_attention_mask(
+    attention_mask: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
     if attention_mask is None:
         return None
     if attention_mask.bool().all():
@@ -635,12 +681,12 @@ def _build_linear(
     return nn.Linear(in_features, out_features, bias=bias)
 
 
-def _make_canon_layer(
-    channels: int, config: ModernBertConfig
-) -> nn.Module:
+def _make_canon_layer(channels: int, config: ModernBertConfig) -> nn.Module:
     """Factory: returns a symmetric (bidirectional) Canon layer."""
     if config.canon_layers_kernel_size is None:
-        raise ValueError("canon_layers_kernel_size was not resolved in ModernBertConfig.__post_init__")
+        raise ValueError(
+            "canon_layers_kernel_size was not resolved in ModernBertConfig.__post_init__"
+        )
     return ModernBertCanonLayer(channels, kernel_size=config.canon_layers_kernel_size)
 
 
@@ -674,18 +720,22 @@ class ModernBertCanonLayer(nn.Module):
         if n_seqs <= 1:
             acc_dtype = _canon_accum_dtype(x)
             x_acc = x.to(dtype=acc_dtype)
-            mixed = F.conv1d(
-                x_acc.T.unsqueeze(0),
-                self.conv.weight.to(dtype=acc_dtype),
-                bias=(
-                    self.conv.bias.to(dtype=acc_dtype)
-                    if self.conv.bias is not None
-                    else None
-                ),
-                stride=1,
-                padding=self.radius,
-                groups=self.conv.groups,
-            ).squeeze(0).T.to(dtype=x.dtype)
+            mixed = (
+                F.conv1d(
+                    x_acc.T.unsqueeze(0),
+                    self.conv.weight.to(dtype=acc_dtype),
+                    bias=(
+                        self.conv.bias.to(dtype=acc_dtype)
+                        if self.conv.bias is not None
+                        else None
+                    ),
+                    stride=1,
+                    padding=self.radius,
+                    groups=self.conv.groups,
+                )
+                .squeeze(0)
+                .T.to(dtype=x.dtype)
+            )
             return x + mixed
 
         if position_ids is not None and position_ids.shape[0] == T:
@@ -727,7 +777,9 @@ class ModernBertCanonLayer(nn.Module):
             out = out * token_mask
         return out.to(dtype=x.dtype)
 
-    def _forward_varlen_fused_ln(self, x, cu_seqlens, ln_weight, ln_eps, position_ids=None):
+    def _forward_varlen_fused_ln(
+        self, x, cu_seqlens, ln_weight, ln_eps, position_ids=None
+    ):
         """Fused LN + Canon varlen path: computes LN(x) + conv(LN(x)) without
         materializing the intermediate LN output."""
         T, C = x.shape
@@ -741,18 +793,22 @@ class ModernBertCanonLayer(nn.Module):
             mean = x_fp32.mean(dim=-1, keepdim=True)
             rstd = torch.rsqrt(x_fp32.var(dim=-1, keepdim=True, correction=0) + ln_eps)
             ln_out = ((x_fp32 - mean) * rstd * ln_weight.float()).to(dtype=acc_dtype)
-            mixed = F.conv1d(
-                ln_out.T.unsqueeze(0),
-                self.conv.weight.to(dtype=acc_dtype),
-                bias=(
-                    self.conv.bias.to(dtype=acc_dtype)
-                    if self.conv.bias is not None
-                    else None
-                ),
-                stride=1,
-                padding=self.radius,
-                groups=self.conv.groups,
-            ).squeeze(0).T.to(dtype=x.dtype)
+            mixed = (
+                F.conv1d(
+                    ln_out.T.unsqueeze(0),
+                    self.conv.weight.to(dtype=acc_dtype),
+                    bias=(
+                        self.conv.bias.to(dtype=acc_dtype)
+                        if self.conv.bias is not None
+                        else None
+                    ),
+                    stride=1,
+                    padding=self.radius,
+                    groups=self.conv.groups,
+                )
+                .squeeze(0)
+                .T.to(dtype=x.dtype)
+            )
             return (ln_out + mixed).to(dtype=x.dtype)
 
         if position_ids is not None and position_ids.shape[0] == T:
@@ -770,8 +826,64 @@ class ModernBertCanonLayer(nn.Module):
             x, seq_id, ln_weight, ln_eps, weight, bias, self.radius
         )
 
-    def forward(self, x, position_ids=None, cu_seqlens=None, attention_mask=None,
-                fuse_ln_weight=None, fuse_ln_eps=None):
+    def _forward_varlen_fused_rms(
+        self, x, cu_seqlens, rms_weight, rms_eps, position_ids=None
+    ):
+        """Fused RMS + Canon varlen path: computes RMS(x) + conv(RMS(x)) without
+        materializing the intermediate RMS output."""
+        T, C = x.shape
+        n_seqs = cu_seqlens.shape[0] - 1
+
+        # Single-sequence: fall back to separate RMS + F.conv1d (no Triton path)
+        if n_seqs <= 1:
+            acc_dtype = _canon_accum_dtype(x)
+            # Compute RMS manually to get normalized x
+            x_fp32 = x.float()
+            inv_rms = torch.rsqrt(x_fp32.pow(2).mean(dim=-1, keepdim=True) + rms_eps)
+            rms_out = (x_fp32 * inv_rms * rms_weight.float()).to(dtype=acc_dtype)
+            mixed = (
+                F.conv1d(
+                    rms_out.T.unsqueeze(0),
+                    self.conv.weight.to(dtype=acc_dtype),
+                    bias=(
+                        self.conv.bias.to(dtype=acc_dtype)
+                        if self.conv.bias is not None
+                        else None
+                    ),
+                    stride=1,
+                    padding=self.radius,
+                    groups=self.conv.groups,
+                )
+                .squeeze(0)
+                .T.to(dtype=x.dtype)
+            )
+            return (rms_out + mixed).to(dtype=x.dtype)
+
+        if position_ids is not None and position_ids.shape[0] == T:
+            seq_start = (position_ids == 0).to(dtype=cu_seqlens.dtype)
+            seq_start = seq_start.clone()
+            seq_start[0] = 1
+            seq_id = torch.cumsum(seq_start, dim=0) - 1
+        else:
+            positions = torch.arange(T, device=x.device, dtype=cu_seqlens.dtype)
+            seq_id = torch.searchsorted(cu_seqlens[1:], positions, right=True)
+
+        weight = self.conv.weight[:, 0, :]
+        bias = self.conv.bias
+        return _varlen_rms_canon_conv(
+            x, seq_id, rms_weight, rms_eps, weight, bias, self.radius
+        )
+
+    def forward(
+        self,
+        x,
+        position_ids=None,
+        cu_seqlens=None,
+        attention_mask=None,
+        fuse_ln_weight=None,
+        fuse_ln_eps=None,
+        fuse_norm_type="layernorm",
+    ):
         # Checkpoint at the module boundary so all Canon insertion sites (A/B/C/D)
         # and both varlen/padded paths are covered by the same flag.
         use_ckpt = (
@@ -789,43 +901,102 @@ class ModernBertCanonLayer(nn.Module):
 
         with autotune_ctx:
             return self._forward_dispatch(
-                x, position_ids=position_ids, cu_seqlens=cu_seqlens,
-                attention_mask=attention_mask, fuse_ln_weight=fuse_ln_weight,
-                fuse_ln_eps=fuse_ln_eps, use_ckpt=use_ckpt,
+                x,
+                position_ids=position_ids,
+                cu_seqlens=cu_seqlens,
+                attention_mask=attention_mask,
+                fuse_ln_weight=fuse_ln_weight,
+                fuse_ln_eps=fuse_ln_eps,
+                fuse_norm_type=fuse_norm_type,
+                use_ckpt=use_ckpt,
             )
 
-    def _forward_dispatch(self, x, *, position_ids, cu_seqlens, attention_mask,
-                          fuse_ln_weight, fuse_ln_eps, use_ckpt):
-        # Fused LN+Conv path (varlen multi-sequence only)
+    def _forward_dispatch(
+        self,
+        x,
+        *,
+        position_ids,
+        cu_seqlens,
+        attention_mask,
+        fuse_ln_weight,
+        fuse_ln_eps,
+        fuse_norm_type,
+        use_ckpt,
+    ):
+        # Fused Norm+Conv path (varlen multi-sequence only)
         if fuse_ln_weight is not None and cu_seqlens is not None:
-            if use_ckpt:
-                if position_ids is None:
+            if fuse_norm_type == "rmsnorm":
+                # RMSNorm fusion path
+                if use_ckpt:
+                    if position_ids is None:
+                        return _checkpoint(
+                            lambda x_, cu_: self._forward_varlen_fused_rms(
+                                x_,
+                                cu_seqlens=cu_,
+                                rms_weight=fuse_ln_weight,
+                                rms_eps=fuse_ln_eps,
+                                position_ids=None,
+                            ),
+                            x,
+                            cu_seqlens,
+                            use_reentrant=False,
+                        )
                     return _checkpoint(
-                        lambda x_, cu_: self._forward_varlen_fused_ln(
-                            x_, cu_seqlens=cu_,
-                            ln_weight=fuse_ln_weight, ln_eps=fuse_ln_eps,
-                            position_ids=None,
+                        lambda x_, cu_, pos_: self._forward_varlen_fused_rms(
+                            x_,
+                            cu_seqlens=cu_,
+                            rms_weight=fuse_ln_weight,
+                            rms_eps=fuse_ln_eps,
+                            position_ids=pos_,
                         ),
                         x,
                         cu_seqlens,
+                        position_ids,
                         use_reentrant=False,
                     )
-                return _checkpoint(
-                    lambda x_, cu_, pos_: self._forward_varlen_fused_ln(
-                        x_, cu_seqlens=cu_,
-                        ln_weight=fuse_ln_weight, ln_eps=fuse_ln_eps,
-                        position_ids=pos_,
-                    ),
+                return self._forward_varlen_fused_rms(
                     x,
-                    cu_seqlens,
-                    position_ids,
-                    use_reentrant=False,
+                    cu_seqlens=cu_seqlens,
+                    rms_weight=fuse_ln_weight,
+                    rms_eps=fuse_ln_eps,
+                    position_ids=position_ids,
                 )
-            return self._forward_varlen_fused_ln(
-                x, cu_seqlens=cu_seqlens,
-                ln_weight=fuse_ln_weight, ln_eps=fuse_ln_eps,
-                position_ids=position_ids,
-            )
+            else:
+                # LayerNorm fusion path
+                if use_ckpt:
+                    if position_ids is None:
+                        return _checkpoint(
+                            lambda x_, cu_: self._forward_varlen_fused_ln(
+                                x_,
+                                cu_seqlens=cu_,
+                                ln_weight=fuse_ln_weight,
+                                ln_eps=fuse_ln_eps,
+                                position_ids=None,
+                            ),
+                            x,
+                            cu_seqlens,
+                            use_reentrant=False,
+                        )
+                    return _checkpoint(
+                        lambda x_, cu_, pos_: self._forward_varlen_fused_ln(
+                            x_,
+                            cu_seqlens=cu_,
+                            ln_weight=fuse_ln_weight,
+                            ln_eps=fuse_ln_eps,
+                            position_ids=pos_,
+                        ),
+                        x,
+                        cu_seqlens,
+                        position_ids,
+                        use_reentrant=False,
+                    )
+                return self._forward_varlen_fused_ln(
+                    x,
+                    cu_seqlens=cu_seqlens,
+                    ln_weight=fuse_ln_weight,
+                    ln_eps=fuse_ln_eps,
+                    position_ids=position_ids,
+                )
 
         if cu_seqlens is not None:
             if use_ckpt:
@@ -847,7 +1018,9 @@ class ModernBertCanonLayer(nn.Module):
                     position_ids,
                     use_reentrant=False,
                 )
-            return self._forward_varlen(x, cu_seqlens=cu_seqlens, position_ids=position_ids)
+            return self._forward_varlen(
+                x, cu_seqlens=cu_seqlens, position_ids=position_ids
+            )
         if x.dim() == 3:
             if use_ckpt:
                 if attention_mask is None:
@@ -893,7 +1066,9 @@ class ModernBertEmbeddings(nn.Module):
             config.hidden_size,
             padding_idx=config.pad_token_id,
         )
-        self.norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+        self.norm = _create_norm(
+            config.hidden_size, config.norm_eps, config.norm_bias, config.norm_type
+        )
         self.drop = nn.Dropout(config.embedding_dropout)
 
     def forward(self, input_ids: torch.LongTensor) -> torch.Tensor:
@@ -941,13 +1116,33 @@ class ModernBertRotaryEmbedding(nn.Module):
 class ModernBertMLP(nn.Module):
     def __init__(self, config: ModernBertConfig):
         super().__init__()
-        self.Wi = _build_linear(
-            config.hidden_size,
-            2 * config.intermediate_size,
-            config,
-            bias=config.mlp_bias,
-            role="ffn_wi",
-        )
+        self.fused_up_gate = config.fused_up_gate
+        if self.fused_up_gate:
+            self.Wi = _build_linear(
+                config.hidden_size,
+                2 * config.intermediate_size,
+                config,
+                bias=config.mlp_bias,
+                role="ffn_wi",
+            )
+            self.W_up = None
+            self.W_gate = None
+        else:
+            self.Wi = None
+            self.W_up = _build_linear(
+                config.hidden_size,
+                config.intermediate_size,
+                config,
+                bias=config.mlp_bias,
+                role="ffn_wi",
+            )
+            self.W_gate = _build_linear(
+                config.hidden_size,
+                config.intermediate_size,
+                config,
+                bias=config.mlp_bias,
+                role="ffn_wi",
+            )
         self.Wo = _build_linear(
             config.intermediate_size,
             config.hidden_size,
@@ -970,7 +1165,10 @@ class ModernBertMLP(nn.Module):
         cu_seqlens: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        wi = self.Wi(x)
+        if self.fused_up_gate:
+            wi = self.Wi(x)
+        else:
+            wi = torch.cat([self.W_up(x), self.W_gate(x)], dim=-1)
         if self.canon_d is not None:
             wi = self.canon_d(
                 wi,
@@ -1003,9 +1201,7 @@ class ModernBertSReluMLP(nn.Module):
             torch.empty(config.intermediate_size, config.hidden_size)
         )
         self.Wo_bias = (
-            nn.Parameter(torch.zeros(config.hidden_size))
-            if config.mlp_bias
-            else None
+            nn.Parameter(torch.zeros(config.hidden_size)) if config.mlp_bias else None
         )
         self.drop = nn.Dropout(config.mlp_dropout)
 
@@ -1017,7 +1213,10 @@ class ModernBertSReluMLP(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if USE_TRITON_SRELU:
-            from nanoplm.pretraining.models.modern_bert.triton_kernels import FusedLinearReLUSquare
+            from nanoplm.pretraining.models.modern_bert.triton_kernels import (
+                FusedLinearReLUSquare,
+            )
+
             out = FusedLinearReLUSquare.apply(x, self.Wi.weight, self.Wo_weight)
         else:
             h = F.relu(self.Wi(x))
@@ -1031,13 +1230,33 @@ class ModernBertSReluMLP(nn.Module):
 class ModernBertSwiGLUMLP(nn.Module):
     def __init__(self, config: ModernBertConfig):
         super().__init__()
-        self.Wi = _build_linear(
-            config.hidden_size,
-            2 * config.intermediate_size,
-            config,
-            bias=config.mlp_bias,
-            role="ffn_wi",
-        )
+        self.fused_up_gate = config.fused_up_gate
+        if self.fused_up_gate:
+            self.Wi = _build_linear(
+                config.hidden_size,
+                2 * config.intermediate_size,
+                config,
+                bias=config.mlp_bias,
+                role="ffn_wi",
+            )
+            self.W_up = None
+            self.W_gate = None
+        else:
+            self.Wi = None
+            self.W_up = _build_linear(
+                config.hidden_size,
+                config.intermediate_size,
+                config,
+                bias=config.mlp_bias,
+                role="ffn_wi",
+            )
+            self.W_gate = _build_linear(
+                config.hidden_size,
+                config.intermediate_size,
+                config,
+                bias=config.mlp_bias,
+                role="ffn_wi",
+            )
         self.Wo = _build_linear(
             config.intermediate_size,
             config.hidden_size,
@@ -1059,7 +1278,10 @@ class ModernBertSwiGLUMLP(nn.Module):
         cu_seqlens: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        wi = self.Wi(x)
+        if self.fused_up_gate:
+            wi = self.Wi(x)
+        else:
+            wi = torch.cat([self.W_up(x), self.W_gate(x)], dim=-1)
         if self.canon_d is not None:
             wi = self.canon_d(
                 wi,
@@ -1078,7 +1300,7 @@ class ModernBertAttention(nn.Module):
         self.head_dim = config.head_dim
         self.use_qk_norm = config.use_qk_norm
         self.dropout = config.attention_dropout
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
         self.use_diff_attn_v2 = config.use_diff_attn_v2
 
         # GQA: num_kv_heads <= num_heads. MHA when num_kv_heads == num_heads.
@@ -1090,17 +1312,60 @@ class ModernBertAttention(nn.Module):
             self.num_q_heads = 2 * self.num_heads
             # Lambda: per-token, per-head scalar controlling subtraction weight.
             self.lambda_proj = nn.Linear(
-                config.hidden_size, self.num_heads, bias=False,
+                config.hidden_size,
+                self.num_heads,
+                bias=False,
             )
         else:
             self.num_q_heads = self.num_heads
             self.lambda_proj = None
 
-        qkv_dim = (self.num_q_heads + 2 * self.num_kv_heads) * self.head_dim
-        self.Wqkv = _build_linear(
-            config.hidden_size, qkv_dim, config, bias=config.attention_bias,
-            role="attn_qkv",
-        )
+        self.fused_qkv = config.fused_qkv
+        q_dim = self.num_q_heads * self.head_dim
+        kv_dim = self.num_kv_heads * self.head_dim
+
+        if self.fused_qkv:
+            qkv_dim = q_dim + 2 * kv_dim
+            self.Wqkv = _build_linear(
+                config.hidden_size,
+                qkv_dim,
+                config,
+                bias=config.attention_bias,
+                role="attn_qkv",
+            )
+            self.Wq = None
+            self.Wq2 = None
+            self.Wk = None
+            self.Wv = None
+        else:
+            self.Wqkv = None
+            if self.use_diff_attn_v2:
+                # DiffV2 doubles Q heads into two groups for differential
+                # subtraction.  Split them into Wq (group 1) and Wq2 (group 2)
+                # so Muon orthogonalizes each group independently.
+                half_q_dim = self.num_heads * self.head_dim
+                self.Wq = _build_linear(
+                    config.hidden_size, half_q_dim, config,
+                    bias=config.attention_bias, role="attn_qkv",
+                )
+                self.Wq2 = _build_linear(
+                    config.hidden_size, half_q_dim, config,
+                    bias=config.attention_bias, role="attn_qkv",
+                )
+            else:
+                self.Wq = _build_linear(
+                    config.hidden_size, q_dim, config,
+                    bias=config.attention_bias, role="attn_qkv",
+                )
+                self.Wq2 = None
+            self.Wk = _build_linear(
+                config.hidden_size, kv_dim, config,
+                bias=config.attention_bias, role="attn_qkv",
+            )
+            self.Wv = _build_linear(
+                config.hidden_size, kv_dim, config,
+                bias=config.attention_bias, role="attn_qkv",
+            )
 
         self.Wo = _build_linear(
             config.hidden_size,
@@ -1114,7 +1379,7 @@ class ModernBertAttention(nn.Module):
             if config.attention_dropout > 0.0
             else nn.Identity()
         )
-        qkv_out_dim = (self.num_q_heads + 2 * self.num_kv_heads) * self.head_dim
+        qkv_out_dim = q_dim + 2 * kv_dim
         self.canon_b = (
             _make_canon_layer(qkv_out_dim, config)
             if "b" in config.canon_layer_set
@@ -1125,7 +1390,9 @@ class ModernBertAttention(nn.Module):
         self.repo = None
         if config.use_repo and layer_idx >= config.repo_after_n_layers:
             self.repo = RePOModule(
-                config.hidden_size, config.num_attention_heads, config.head_dim,
+                config.hidden_size,
+                config.num_attention_heads,
+                config.head_dim,
             )
             theta = (
                 config.global_rope_theta
@@ -1152,13 +1419,34 @@ class ModernBertAttention(nn.Module):
         repo_active: bool = False,
     ) -> torch.Tensor:
         total = x.shape[0]  # (total_tokens, hidden)
-        qkv = self.Wqkv(x)
-        if self.canon_b is not None:
-            qkv = self.canon_b(qkv, position_ids=position_ids, cu_seqlens=cu_seqlens)
-
         q_dim = self.num_q_heads * self.head_dim
         kv_dim = self.num_kv_heads * self.head_dim
-        q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
+
+        if self.fused_qkv:
+            qkv = self.Wqkv(x)
+            if self.canon_b is not None:
+                qkv = self.canon_b(
+                    qkv, position_ids=position_ids, cu_seqlens=cu_seqlens
+                )
+            q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
+        else:
+            if self.Wq2 is not None:
+                # DiffV2 split: interleave the two Q groups so paired heads
+                # (0::2, 1::2) are contiguous as the rest of the code expects.
+                q1 = self.Wq(x).view(total, self.num_heads, self.head_dim)
+                q2 = self.Wq2(x).view(total, self.num_heads, self.head_dim)
+                q = torch.stack([q1, q2], dim=2).view(total, -1)
+            else:
+                q = self.Wq(x)
+            k = self.Wk(x)
+            v = self.Wv(x)
+            if self.canon_b is not None:
+                qkv = torch.cat([q, k, v], dim=-1)
+                qkv = self.canon_b(
+                    qkv, position_ids=position_ids, cu_seqlens=cu_seqlens
+                )
+                q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
+
         q = q.view(total, self.num_q_heads, self.head_dim)
         k = k.view(total, self.num_kv_heads, self.head_dim)
         v = v.view(total, self.num_kv_heads, self.head_dim)
@@ -1228,13 +1516,28 @@ class ModernBertAttention(nn.Module):
             )
 
         bsz, seq_len, _ = x.shape
-        qkv = self.Wqkv(x)
-        if self.canon_b is not None:
-            qkv = self.canon_b(qkv, attention_mask=token_mask)
-
         q_dim = self.num_q_heads * self.head_dim
         kv_dim = self.num_kv_heads * self.head_dim
-        q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
+
+        if self.fused_qkv:
+            qkv = self.Wqkv(x)
+            if self.canon_b is not None:
+                qkv = self.canon_b(qkv, attention_mask=token_mask)
+            q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
+        else:
+            if self.Wq2 is not None:
+                q1 = self.Wq(x).view(bsz, seq_len, self.num_heads, self.head_dim)
+                q2 = self.Wq2(x).view(bsz, seq_len, self.num_heads, self.head_dim)
+                q = torch.stack([q1, q2], dim=3).view(bsz, seq_len, -1)
+            else:
+                q = self.Wq(x)
+            k = self.Wk(x)
+            v = self.Wv(x)
+            if self.canon_b is not None:
+                qkv = torch.cat([q, k, v], dim=-1)
+                qkv = self.canon_b(qkv, attention_mask=token_mask)
+                q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
+
         q = q.view(bsz, seq_len, self.num_q_heads, self.head_dim).transpose(1, 2)
         k = k.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -1275,14 +1578,21 @@ class ModernBertEncoderLayer(nn.Module):
         super().__init__()
         self.attention_type = config.layer_types[layer_idx]
         self.has_mlp = (layer_idx != 0) or (not config.no_mlp_on_first_layer)
-        self.activation_checkpointing = bool(getattr(config, "activation_checkpointing", False))
-        self.activation_checkpointing_mode = str(
-            getattr(config, "activation_checkpointing_mode", "layer")
-        ).strip().lower()
+        self.norm_type = config.norm_type  # Store for fused Canon path
+        self.activation_checkpointing = bool(
+            getattr(config, "activation_checkpointing", False)
+        )
+        self.activation_checkpointing_mode = (
+            str(getattr(config, "activation_checkpointing_mode", "layer"))
+            .strip()
+            .lower()
+        )
         self.attn_norm = (
             nn.Identity()
             if layer_idx == 0
-            else nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+            else _create_norm(
+                config.hidden_size, config.norm_eps, config.norm_bias, config.norm_type
+            )
         )
         self.canon_a = (
             _make_canon_layer(config.hidden_size, config)
@@ -1291,7 +1601,9 @@ class ModernBertEncoderLayer(nn.Module):
         )
         self.attn = ModernBertAttention(config, layer_idx=layer_idx)
         if self.has_mlp:
-            self.mlp_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+            self.mlp_norm = _create_norm(
+                config.hidden_size, config.norm_eps, config.norm_bias, config.norm_type
+            )
             self.canon_c = (
                 _make_canon_layer(config.hidden_size, config)
                 if "c" in config.canon_layer_set
@@ -1338,7 +1650,7 @@ class ModernBertEncoderLayer(nn.Module):
 
             _fuse_ln_a = (
                 self.canon_a is not None
-                and isinstance(self.attn_norm, nn.LayerNorm)
+                and isinstance(self.attn_norm, (nn.LayerNorm, nn.RMSNorm))
                 and _cu_seqlens is not None
             )
 
@@ -1354,6 +1666,7 @@ class ModernBertEncoderLayer(nn.Module):
                         cu_seqlens=_cu_seqlens,
                         fuse_ln_weight=_layer.attn_norm.weight,
                         fuse_ln_eps=_layer.attn_norm.eps,
+                        fuse_norm_type=_layer.norm_type,
                     )
                 else:
                     attn_in = _layer.attn_norm(x_in)
@@ -1384,7 +1697,7 @@ class ModernBertEncoderLayer(nn.Module):
         else:
             fuse_ln_a = (
                 self.canon_a is not None
-                and isinstance(self.attn_norm, nn.LayerNorm)
+                and isinstance(self.attn_norm, (nn.LayerNorm, nn.RMSNorm))
                 and cu_seqlens is not None
             )
             if fuse_ln_a:
@@ -1394,6 +1707,7 @@ class ModernBertEncoderLayer(nn.Module):
                     cu_seqlens=cu_seqlens,
                     fuse_ln_weight=self.attn_norm.weight,
                     fuse_ln_eps=self.attn_norm.eps,
+                    fuse_norm_type=self.norm_type,
                 )
             else:
                 attn_in = self.attn_norm(x)
@@ -1428,7 +1742,7 @@ class ModernBertEncoderLayer(nn.Module):
                 _token_mask = token_mask
                 _fuse_ln_c = (
                     self.canon_c is not None
-                    and isinstance(self.mlp_norm, nn.LayerNorm)
+                    and isinstance(self.mlp_norm, (nn.LayerNorm, nn.RMSNorm))
                     and _cu_seqlens is not None
                 )
 
@@ -1444,6 +1758,7 @@ class ModernBertEncoderLayer(nn.Module):
                             cu_seqlens=_cu_seqlens,
                             fuse_ln_weight=_layer.mlp_norm.weight,
                             fuse_ln_eps=_layer.mlp_norm.eps,
+                            fuse_norm_type=_layer.norm_type,
                         )
                     else:
                         mlp_in = _layer.mlp_norm(x_in)
@@ -1469,7 +1784,7 @@ class ModernBertEncoderLayer(nn.Module):
             else:
                 fuse_ln_c = (
                     self.canon_c is not None
-                    and isinstance(self.mlp_norm, nn.LayerNorm)
+                    and isinstance(self.mlp_norm, (nn.LayerNorm, nn.RMSNorm))
                     and cu_seqlens is not None
                 )
                 if fuse_ln_c:
@@ -1479,6 +1794,7 @@ class ModernBertEncoderLayer(nn.Module):
                         cu_seqlens=cu_seqlens,
                         fuse_ln_weight=self.mlp_norm.weight,
                         fuse_ln_eps=self.mlp_norm.eps,
+                        fuse_norm_type=self.norm_type,
                     )
                 else:
                     mlp_in = self.mlp_norm(x)
@@ -1609,8 +1925,13 @@ class MHCLiteBlock(nn.Module):
     Optional Triton kernels for further fusion (set triton_fused=True).
     """
 
-    def __init__(self, n_streams: int, hidden_size: int, layer: nn.Module,
-                 triton_fused: bool = False):
+    def __init__(
+        self,
+        n_streams: int,
+        hidden_size: int,
+        layer: nn.Module,
+        triton_fused: bool = False,
+    ):
         super().__init__()
         self.n = n_streams
         self.C = hidden_size
@@ -1646,14 +1967,12 @@ class MHCLiteBlock(nn.Module):
         x_norm = F.rms_norm(x_flat, (self.nC,))
 
         all_proj = F.linear(x_norm, self.W_all.weight.to(dt), None)
-        pre_proj, post_proj, res_proj = all_proj.split(
-            [n, n, self.n_fact], dim=-1
-        )
+        pre_proj, post_proj, res_proj = all_proj.split([n, n, self.n_fact], dim=-1)
 
         bias = self.W_all.bias.to(dt)
         pre_bias = bias[:n]
-        post_bias = bias[n:2 * n]
-        res_bias = bias[2 * n:]
+        post_bias = bias[n : 2 * n]
+        res_bias = bias[2 * n :]
 
         h_pre = torch.sigmoid(self.alpha_pre.to(dt) * pre_proj + pre_bias)
         h_post = 2.0 * torch.sigmoid(self.alpha_post.to(dt) * post_proj + post_bias)
@@ -1678,10 +1997,9 @@ class MHCLiteBlock(nn.Module):
         H_merged: torch.Tensor,
         h_post: torch.Tensor,
     ) -> torch.Tensor:
-        return (
-            torch.matmul(H_merged, x_streams)
-            + h_post.unsqueeze(-1) * layer_output.unsqueeze(-2)
-        )
+        return torch.matmul(H_merged, x_streams) + h_post.unsqueeze(
+            -1
+        ) * layer_output.unsqueeze(-2)
 
     def _forward_pytorch(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
         """Pure PyTorch forward path (always correct, works everywhere)."""
@@ -1736,14 +2054,14 @@ class MHCLiteBlock(nn.Module):
             x_flat, self.W_all.weight.to(dt)
         )
 
-        pre_proj, post_proj, res_proj = all_proj.split(
-            [n, n, self.n_fact], dim=-1
-        )
+        pre_proj, post_proj, res_proj = all_proj.split([n, n, self.n_fact], dim=-1)
 
         bias = self.W_all.bias.to(dt)
         h_pre = torch.sigmoid(self.alpha_pre.to(dt) * pre_proj + bias[:n])
-        h_post = 2.0 * torch.sigmoid(self.alpha_post.to(dt) * post_proj + bias[n:2*n])
-        a_res = F.softmax(self.alpha_res.to(dt) * res_proj + bias[2*n:], dim=-1)
+        h_post = 2.0 * torch.sigmoid(
+            self.alpha_post.to(dt) * post_proj + bias[n : 2 * n]
+        )
+        a_res = F.softmax(self.alpha_res.to(dt) * res_proj + bias[2 * n :], dim=-1)
 
         H_res = torch.matmul(a_res, self.perm_mat.to(dt)).unflatten(-1, (n, n))
         H_merged = H_res - h_post.unsqueeze(-1) * h_pre.unsqueeze(-2)
@@ -1891,11 +2209,17 @@ class ModernBertModel(nn.Module):
                 )
             else:
                 self.layers = nn.ModuleList(
-                    [MHCLiteSublayersLayer(config, i) for i in range(config.num_hidden_layers)]
+                    [
+                        MHCLiteSublayersLayer(config, i)
+                        for i in range(config.num_hidden_layers)
+                    ]
                 )
         else:
             self.layers = nn.ModuleList(
-                [ModernBertEncoderLayer(config, i) for i in range(config.num_hidden_layers)]
+                [
+                    ModernBertEncoderLayer(config, i)
+                    for i in range(config.num_hidden_layers)
+                ]
             )
         if config.use_resid_lambdas:
             self.resid_lambdas = nn.Parameter(torch.ones(config.num_hidden_layers))
@@ -1905,7 +2229,9 @@ class ModernBertModel(nn.Module):
             self.x0_lambdas = nn.Parameter(torch.zeros(config.num_hidden_layers))
         else:
             self.register_parameter("x0_lambdas", None)
-        self.final_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+        self.final_norm = _create_norm(
+            config.hidden_size, config.norm_eps, config.norm_bias, config.norm_type
+        )
         self.rotary_emb = ModernBertRotaryEmbedding(config)
         # RePO: disabled at init; enabled by the training loop after
         # repo_rope_warmup_steps (or warmup_steps fallback).
@@ -1926,7 +2252,9 @@ class ModernBertModel(nn.Module):
     def update_prores_alphas(self, step: int) -> None:
         """Recompute per-layer ProRes alphas. Call once per optimizer step."""
         T = self._prores_T
-        vals = [min(step / (T * (l + 1)), 1.0) for l in range(self.config.num_hidden_layers)]
+        vals = [
+            min(step / (T * (l + 1)), 1.0) for l in range(self.config.num_hidden_layers)
+        ]
         self._prores_alphas.copy_(torch.tensor(vals, dtype=self._prores_alphas.dtype))
 
     def forward(
@@ -1953,9 +2281,7 @@ class ModernBertModel(nn.Module):
             # Pre-compute RoPE tables up to max_position_embeddings (fixed size
             # avoids graph breaks / recompilation) and index by _position_ids.
             rope_len = self.config.max_position_embeddings
-            cos_f, sin_f = self.rotary_emb(
-                rope_len, device, x.dtype, "full_attention"
-            )
+            cos_f, sin_f = self.rotary_emb(rope_len, device, x.dtype, "full_attention")
             cos_s, sin_s = self.rotary_emb(
                 rope_len, device, x.dtype, "sliding_attention"
             )
@@ -1990,7 +2316,8 @@ class ModernBertModel(nn.Module):
                 if (
                     self.config.activation_checkpointing
                     and self.training
-                    and str(self.config.activation_checkpointing_mode).strip().lower() == "layer"
+                    and str(self.config.activation_checkpointing_mode).strip().lower()
+                    == "layer"
                 ):
                     cos_sin = rope[lt]
                     cu_seqlens = _cu_seqlens
@@ -2093,7 +2420,8 @@ class ModernBertModel(nn.Module):
             if (
                 self.config.activation_checkpointing
                 and self.training
-                and str(self.config.activation_checkpointing_mode).strip().lower() == "layer"
+                and str(self.config.activation_checkpointing_mode).strip().lower()
+                == "layer"
             ):
                 attn_mask = attn_masks[layer_type]
                 cos_sin = rope[layer_type]
@@ -2147,7 +2475,9 @@ class ModernBertPredictionHead(nn.Module):
             config.hidden_size,
             bias=config.classifier_bias,
         )
-        self.norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+        self.norm = _create_norm(
+            config.hidden_size, config.norm_eps, config.norm_bias, config.norm_type
+        )
         self.act = _get_activation(config.classifier_activation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -2163,7 +2493,9 @@ class ModernBertForMaskedLM(nn.Module):
 
         self.model = ModernBertModel(config)
         self.head = ModernBertPredictionHead(config)
-        self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=config.decoder_bias)
+        self.decoder = nn.Linear(
+            config.hidden_size, config.vocab_size, bias=config.decoder_bias
+        )
 
         self.sparse_prediction = config.sparse_prediction
         self.sparse_pred_ignore_index = config.sparse_pred_ignore_index
@@ -2184,6 +2516,10 @@ class ModernBertForMaskedLM(nn.Module):
             self.config.use_noble and self.config.noble_half_kaiming
         )
         kaiming_bound = bound / 2 if noble_kaiming else bound
+
+        def _noble_bound(mod: nn.Module) -> float:
+            return kaiming_bound if isinstance(mod, NOBLELinear) else bound
+
         embedding_std = 0.02 if self.config.tie_word_embeddings else 1.0
 
         nn.init.normal_(
@@ -2193,10 +2529,10 @@ class ModernBertForMaskedLM(nn.Module):
         )
 
         for module in self.modules():
-            if isinstance(module, nn.LayerNorm):
+            if isinstance(module, (nn.LayerNorm, nn.RMSNorm)):
                 if module.weight is not None:
                     nn.init.ones_(module.weight)
-                if module.bias is not None:
+                if hasattr(module, "bias") and module.bias is not None:
                     nn.init.zeros_(module.bias)
 
         for layer in self.model.layers:
@@ -2205,28 +2541,69 @@ class ModernBertForMaskedLM(nn.Module):
                 mhc_blocks = [layer]
             elif isinstance(layer, MHCLiteSublayersLayer):
                 enc = layer.enc
-                mhc_blocks = [b for b in (layer.mhc_attn, layer.mhc_mlp) if b is not None]
+                mhc_blocks = [
+                    b for b in (layer.mhc_attn, layer.mhc_mlp) if b is not None
+                ]
             else:
                 enc = layer
                 mhc_blocks = []
-            wqkv_bound = kaiming_bound if isinstance(enc.attn.Wqkv, NOBLELinear) else bound
-            nn.init.uniform_(enc.attn.Wqkv.weight, -wqkv_bound, wqkv_bound)
+            # QKV weight init (NOBLE modules get half-Kaiming bound)
+            if enc.attn.Wqkv is not None:
+                b = _noble_bound(enc.attn.Wqkv)
+                nn.init.uniform_(enc.attn.Wqkv.weight, -b, b)
+            else:
+                bq = _noble_bound(enc.attn.Wq)
+                nn.init.uniform_(enc.attn.Wq.weight, -bq, bq)
+                if enc.attn.Wq2 is not None:
+                    bq2 = _noble_bound(enc.attn.Wq2)
+                    nn.init.uniform_(enc.attn.Wq2.weight, -bq2, bq2)
+                bk = _noble_bound(enc.attn.Wk)
+                nn.init.uniform_(enc.attn.Wk.weight, -bk, bk)
+                bv = _noble_bound(enc.attn.Wv)
+                nn.init.uniform_(enc.attn.Wv.weight, -bv, bv)
             nn.init.zeros_(enc.attn.Wo.weight)
+
+            # MLP weight init (NOBLE modules get half-Kaiming bound)
             if enc.mlp is not None:
-                wi_bound = kaiming_bound if isinstance(enc.mlp.Wi, NOBLELinear) else bound
-                nn.init.uniform_(enc.mlp.Wi.weight, -wi_bound, wi_bound)
+                if enc.mlp.Wi is not None:
+                    bi = _noble_bound(enc.mlp.Wi)
+                    nn.init.uniform_(enc.mlp.Wi.weight, -bi, bi)
+                elif hasattr(enc.mlp, "W_up") and enc.mlp.W_up is not None:
+                    bu = _noble_bound(enc.mlp.W_up)
+                    nn.init.uniform_(enc.mlp.W_up.weight, -bu, bu)
+                    bg = _noble_bound(enc.mlp.W_gate)
+                    nn.init.uniform_(enc.mlp.W_gate.weight, -bg, bg)
                 if hasattr(enc.mlp, "Wo"):
                     nn.init.zeros_(enc.mlp.Wo.weight)
                 else:
                     nn.init.zeros_(enc.mlp.Wo_weight)
 
-            if enc.attn.Wqkv.bias is not None:
-                nn.init.zeros_(enc.attn.Wqkv.bias)
+            # QKV bias init
+            if enc.attn.Wqkv is not None:
+                if enc.attn.Wqkv.bias is not None:
+                    nn.init.zeros_(enc.attn.Wqkv.bias)
+            else:
+                if enc.attn.Wq.bias is not None:
+                    nn.init.zeros_(enc.attn.Wq.bias)
+                if enc.attn.Wq2 is not None and enc.attn.Wq2.bias is not None:
+                    nn.init.zeros_(enc.attn.Wq2.bias)
+                if enc.attn.Wk.bias is not None:
+                    nn.init.zeros_(enc.attn.Wk.bias)
+                if enc.attn.Wv.bias is not None:
+                    nn.init.zeros_(enc.attn.Wv.bias)
             if enc.attn.Wo.bias is not None:
                 nn.init.zeros_(enc.attn.Wo.bias)
+
+            # MLP bias init
             if enc.mlp is not None:
-                if enc.mlp.Wi.bias is not None:
-                    nn.init.zeros_(enc.mlp.Wi.bias)
+                if enc.mlp.Wi is not None:
+                    if enc.mlp.Wi.bias is not None:
+                        nn.init.zeros_(enc.mlp.Wi.bias)
+                elif hasattr(enc.mlp, "W_up") and enc.mlp.W_up is not None:
+                    if enc.mlp.W_up.bias is not None:
+                        nn.init.zeros_(enc.mlp.W_up.bias)
+                    if enc.mlp.W_gate.bias is not None:
+                        nn.init.zeros_(enc.mlp.W_gate.bias)
                 if hasattr(enc.mlp, "Wo"):
                     if enc.mlp.Wo.bias is not None:
                         nn.init.zeros_(enc.mlp.Wo.bias)
@@ -2251,10 +2628,10 @@ class ModernBertForMaskedLM(nn.Module):
                 bias[:n_s].fill_(-1.0)
                 bias[0] = 1.0
                 # post bias: next n values
-                bias[n_s:2 * n_s].fill_(-1.0)
+                bias[n_s : 2 * n_s].fill_(-1.0)
                 bias[n_s] = 1.0
                 # res bias: last n! values
-                bias[2 * n_s:].fill_(-8.0)
+                bias[2 * n_s :].fill_(-8.0)
                 bias[2 * n_s + block._identity_idx] = 0.0
                 block.alpha_pre.fill_(0.01)
                 block.alpha_post.fill_(0.01)
@@ -2323,9 +2700,7 @@ class ModernBertForMaskedLM(nn.Module):
             return {"loss": loss, "logits": logits}
 
         use_varlen = (
-            _HAS_FLASH_VARLEN
-            and input_ids.is_cuda
-            and attention_mask is not None
+            _HAS_FLASH_VARLEN and input_ids.is_cuda and attention_mask is not None
         )
 
         # ---- varlen (flash-attention) path --------------------------------
@@ -2407,13 +2782,19 @@ class ModernBertForMaskedLM(nn.Module):
 
     def num_parameters(self, only_trainable: bool = True) -> int:
         return sum(
-            p.numel() for p in self.parameters() if (p.requires_grad or not only_trainable)
+            p.numel()
+            for p in self.parameters()
+            if (p.requires_grad or not only_trainable)
         )
 
 
-def map_hf_state_dict_to_pure(hf_state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def map_hf_state_dict_to_pure(
+    hf_state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
     return {k: v for k, v in hf_state_dict.items() if not k.startswith("_")}
 
 
-def map_pure_state_dict_to_hf(pure_state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def map_pure_state_dict_to_hf(
+    pure_state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
     return dict(pure_state_dict)
