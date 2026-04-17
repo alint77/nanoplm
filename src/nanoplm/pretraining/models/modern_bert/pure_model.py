@@ -131,6 +131,16 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
                 "Differential Attention V2 is currently implemented only in the "
                 "pure-torch path. Disable use_diff_attn_v2 or use --pure-torch."
             )
+        if not config.fused_qkv:
+            raise ValueError(
+                "fused_qkv=False is implemented only in the pure-torch path. "
+                "Use --pure-torch with fused_qkv=false."
+            )
+        if not config.fused_up_gate:
+            raise ValueError(
+                "fused_up_gate=False is implemented only in the pure-torch path. "
+                "Use --pure-torch with fused_up_gate=false."
+            )
 
         self.tokenizer = ProtModernBertTokenizer()
         # Keep the original high-level config for checkpoint serialization.
