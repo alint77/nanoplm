@@ -16,7 +16,11 @@ import torch
 import torch.distributed as dist
 import transformer_engine.pytorch as te
 import wandb
-from dion import Muon as DionMuon, NorMuon as DionNorMuon
+try:
+    from dion import Muon as DionMuon, NorMuon as DionNorMuon
+except ImportError:
+    class DionMuon: pass      # sentinel – isinstance() safely returns False
+    class DionNorMuon: pass
 from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
@@ -462,6 +466,7 @@ def run_te_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
+            extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
         )
         if use_static_inp_size:
             assert tokens_per_micro == pack_tokens_per_micro
@@ -500,6 +505,7 @@ def run_te_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
+            extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
         )
     else:
         train_sampler = RandomSampler(train_ds)
@@ -509,6 +515,7 @@ def run_te_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
+            extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
         )
 
     # Keep orig_model reference for checkpointing/eval.
@@ -533,6 +540,7 @@ def run_te_pretraining(
         mask_token_probability=pretrain_config.mask_replace_prob,
         random_token_probability=pretrain_config.random_token_prob,
         keep_probability=pretrain_config.keep_probability,
+        extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
     )
     dl_kwargs = dict(
         num_workers=num_workers,

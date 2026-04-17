@@ -102,6 +102,23 @@ def _is_zero_init_fragile_param(name: str) -> bool:
     return False
 
 
+def _classify_noble_param(name: str) -> str | None:
+    """Classify a NOBLE param for optimizer routing.
+
+    Returns one of: 'wup', 'M', 'freq', 'phase', or None (not a NOBLE param).
+    W_down is intentionally NOT matched — it stays in Muon.
+    """
+    if ".cosnet.M" in name:
+        return "M"
+    if ".cosnet.omega" in name:
+        return "freq"
+    if ".cosnet.phi" in name:
+        return "phase"
+    if name.endswith(".noble_w_up.weight"):
+        return "wup"
+    return None
+
+
 def build_muon_optimizer(
     model: torch.nn.Module,
     pretrain_config: PretrainingConfig,
@@ -113,6 +130,11 @@ def build_muon_optimizer(
     adamw_params: list[torch.nn.Parameter] = []
     resid_params: list[torch.nn.Parameter] = []
     x0_params: list[torch.nn.Parameter] = []
+    # NOBLE param groups (separate LR each)
+    noble_wup_params: list[torch.nn.Parameter] = []
+    noble_M_params: list[torch.nn.Parameter] = []
+    noble_freq_params: list[torch.nn.Parameter] = []
+    noble_phase_params: list[torch.nn.Parameter] = []
     seen: set[int] = set()
 
     for name, param in raw_model.named_parameters():
@@ -125,6 +147,11 @@ def build_muon_optimizer(
             resid_params.append(param)
         elif lname.endswith("x0_lambdas") or ".x0_lambdas" in lname:
             x0_params.append(param)
+        # NOBLE routing (must come before generic ndim checks).
+        # W_down is NOT matched — falls through to Muon as a normal 2D weight.
+        elif (noble_kind := _classify_noble_param(name)) is not None:
+            {"wup": noble_wup_params, "M": noble_M_params,
+             "freq": noble_freq_params, "phase": noble_phase_params}[noble_kind].append(param)
         elif param.ndim == 1 or _is_embedding_or_unembedding_param(name):
             adamw_params.append(param)
         elif param.ndim == 2:
@@ -140,18 +167,57 @@ def build_muon_optimizer(
             "No eligible matrix parameters found for Muon (expected 2D hidden-layer weights)."
         )
 
+    noble_total = len(noble_wup_params) + len(noble_M_params) + len(noble_freq_params) + len(noble_phase_params)
     logger.info(
         f"Muon grouping: muon_params={len(muon_params)} tensors, "
         f"adamw_params={len(adamw_params)} tensors, "
         f"resid_scalar_params={len(resid_params)} tensors, "
         f"x0_scalar_params={len(x0_params)} tensors"
+        + (f", noble_params={noble_total} tensors (wup={len(noble_wup_params)}, "
+           f"M={len(noble_M_params)}, freq={len(noble_freq_params)}, "
+           f"phase={len(noble_phase_params)})" if noble_total > 0 else "")
     )
+
+    # Compute NOBLE LR values if any NOBLE params exist
+    noble_lrs: dict | None = None
+    if noble_total > 0:
+        # Extract hidden_size from model for LR ratio computation
+        hidden_size = getattr(getattr(raw_model, "config", None), "hidden_size", None)
+        if hidden_size is None:
+            hidden_size = getattr(getattr(raw_model, "model_config", None), "hidden_size", None)
+        noble_rank = getattr(getattr(raw_model, "config", None), "noble_rank", None)
+        if noble_rank is None:
+            noble_rank = getattr(getattr(raw_model, "model_config", None), "noble_rank", None)
+        if hidden_size is None or noble_rank is None:
+            raise ValueError(
+                f"Cannot determine hidden_size (got {hidden_size}) / noble_rank "
+                f"(got {noble_rank}) for NOBLE LR scaling. Ensure the model has "
+                f".config.hidden_size and .config.noble_rank attributes."
+            )
+        base_lr = pretrain_config.noble_base_lr
+        ratio = hidden_size / noble_rank
+        noble_lrs = {
+            "wup": base_lr * (ratio ** (2 * pretrain_config.noble_lr_gamma)),
+            "M": base_lr * (ratio ** pretrain_config.noble_lr_gamma_M),
+            "freq": base_lr * pretrain_config.noble_freq_lr_mult,
+            "phase": base_lr * pretrain_config.noble_phase_lr_mult,
+        }
+        logger.info(
+            f"NOBLE LR scaling: ratio={ratio:.1f}, "
+            f"wup_lr={noble_lrs['wup']:.6f}, M_lr={noble_lrs['M']:.6f}, "
+            f"freq_lr={noble_lrs['freq']:.6f}, phase_lr={noble_lrs['phase']:.6f}"
+        )
 
     return build_optimizer(
         muon_params=muon_params,
         adamw_params=adamw_params,
         resid_params=resid_params,
         x0_params=x0_params,
+        noble_wup_params=noble_wup_params,
+        noble_M_params=noble_M_params,
+        noble_freq_params=noble_freq_params,
+        noble_phase_params=noble_phase_params,
+        noble_lrs=noble_lrs,
         muon_learning_rate=pretrain_config.muon_learning_rate,
         muon_weight_decay=pretrain_config.muon_weight_decay,
         muon_cautious_weight_decay=pretrain_config.muon_cautious_weight_decay,
@@ -217,6 +283,11 @@ def build_optimizer(
     adamw_epsilon: float,
     resid_params: list[torch.nn.Parameter] | None = None,
     x0_params: list[torch.nn.Parameter] | None = None,
+    noble_wup_params: list[torch.nn.Parameter] | None = None,
+    noble_M_params: list[torch.nn.Parameter] | None = None,
+    noble_freq_params: list[torch.nn.Parameter] | None = None,
+    noble_phase_params: list[torch.nn.Parameter] | None = None,
+    noble_lrs: dict | None = None,
     use_normuon: bool = False,
     distributed_mesh=None,
 ) -> MuonAdamWGroup:
@@ -225,7 +296,12 @@ def build_optimizer(
         raise ValueError("Muon optimizer requires at least one matrix parameter.")
     resid_params = resid_params or []
     x0_params = x0_params or []
-    if not (adamw_params or resid_params or x0_params):
+    noble_wup_params = noble_wup_params or []
+    noble_M_params = noble_M_params or []
+    noble_freq_params = noble_freq_params or []
+    noble_phase_params = noble_phase_params or []
+    has_adamw = adamw_params or resid_params or x0_params or noble_wup_params
+    if not has_adamw:
         raise ValueError("Muon optimizer requires at least one AdamW/scalar parameter.")
 
     if distributed_mesh is None:
@@ -289,6 +365,39 @@ def build_optimizer(
             weight_decay=0.0,
             betas=NANOCHAT_X0_BETAS,
             eps=NANOCHAT_SCALAR_EPS,
+        ))
+    # NOBLE param groups with elevated LRs (paper §3.3)
+    if noble_wup_params and noble_lrs:
+        adamw_groups.append(dict(
+            params=noble_wup_params,
+            lr=noble_lrs["wup"],
+            weight_decay=float(adamw_weight_decay),
+            betas=adamw_betas,
+            eps=float(adamw_epsilon),
+        ))
+    if noble_M_params and noble_lrs:
+        adamw_groups.append(dict(
+            params=noble_M_params,
+            lr=noble_lrs["M"],
+            weight_decay=float(adamw_weight_decay),
+            betas=adamw_betas,
+            eps=float(adamw_epsilon),
+        ))
+    if noble_freq_params and noble_lrs:
+        adamw_groups.append(dict(
+            params=noble_freq_params,
+            lr=noble_lrs["freq"],
+            weight_decay=float(adamw_weight_decay),
+            betas=adamw_betas,
+            eps=float(adamw_epsilon),
+        ))
+    if noble_phase_params and noble_lrs:
+        adamw_groups.append(dict(
+            params=noble_phase_params,
+            lr=noble_lrs["phase"],
+            weight_decay=float(adamw_weight_decay),
+            betas=adamw_betas,
+            eps=float(adamw_epsilon),
         ))
 
     adamw_opt = torch.optim.AdamW(adamw_groups, fused=True)

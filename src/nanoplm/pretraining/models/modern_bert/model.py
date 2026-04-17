@@ -77,10 +77,33 @@ class ProtModernBertMLMConfig:
     attn_layer_pattern: Optional[str] = None
     fused_qkv: bool = True
     fused_up_gate: bool = True
+    # NOBLE
+    use_noble: bool = False
+    noble_rank: int = 64
+    noble_alpha: float = 0.01
+    noble_omega_range: tuple = (0.8, 1.2)
+    noble_phi_std: float = 0.1
+    noble_half_kaiming: bool = True
+    noble_targets: str = "all"
 
 
 class ProtModernBertMLM(ModernBertForMaskedLM):
     def __init__(self, config: ProtModernBertMLMConfig):
+        if config.use_noble:
+            raise ValueError(
+                "NOBLE is implemented only in the pure-torch path. "
+                "Use --pure-torch with use_noble=true."
+            )
+        if not config.fused_qkv:
+            raise ValueError(
+                "fused_qkv=False is implemented only in the pure-torch path. "
+                "Use --pure-torch with fused_qkv=false."
+            )
+        if not config.fused_up_gate:
+            raise ValueError(
+                "fused_up_gate=False is implemented only in the pure-torch path. "
+                "Use --pure-torch with fused_up_gate=false."
+            )
         if config.use_canon_layers:
             raise ValueError(
                 "Canon layers are currently implemented only in the pure-torch path. "

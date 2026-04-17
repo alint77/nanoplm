@@ -11,7 +11,11 @@ import os
 import yaml
 from copy import deepcopy
 from dataclasses import asdict
-from dion import Muon,NorMuon
+try:
+    from dion import Muon, NorMuon
+except ImportError:
+    Muon = None  # type: ignore[assignment,misc]
+    NorMuon = None  # type: ignore[assignment,misc]
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 # Default to safer Inductor reduction codegen. Inductor's async compile uses
 # subprocess workers that read these env vars at process start, so setting them
@@ -860,16 +864,48 @@ def _create_optimizer(model, cfg, distributed_mesh=None):
     if name in {"muon", "normuon"}:
         return build_muon_optimizer(model, cfg, distributed_mesh=distributed_mesh)
 
+    from nanoplm.pretraining.optim import _classify_noble_param
+
     decay, no_decay = [], []
+    noble_wup, noble_M, noble_freq, noble_phase = [], [], [], []
     for p_name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        (decay if _use_weight_decay(p_name, param) else no_decay).append(param)
+        noble_kind = _classify_noble_param(p_name)
+        if noble_kind is not None:
+            {"wup": noble_wup, "M": noble_M,
+             "freq": noble_freq, "phase": noble_phase}[noble_kind].append(param)
+        else:
+            (decay if _use_weight_decay(p_name, param) else no_decay).append(param)
 
     groups = [
         {"params": decay, "weight_decay": float(cfg.adam_weight_decay)},
         {"params": no_decay, "weight_decay": 0.0},
     ]
+
+    # NOBLE param groups with elevated LRs (paper §3.3)
+    noble_total = len(noble_wup) + len(noble_M) + len(noble_freq) + len(noble_phase)
+    if noble_total > 0:
+        raw = model.module if hasattr(model, "module") else model
+        hidden_size = getattr(getattr(raw, "config", None), "hidden_size", None)
+        noble_rank = getattr(getattr(raw, "config", None), "noble_rank", None)
+        if hidden_size is None or noble_rank is None:
+            raise ValueError("Cannot determine hidden_size/noble_rank for NOBLE LR scaling.")
+        base_lr = cfg.noble_base_lr
+        ratio = hidden_size / noble_rank
+        wd = float(cfg.adam_weight_decay)
+        betas = (float(cfg.adam_beta1), float(cfg.adam_beta2))
+        eps = float(cfg.adam_epsilon)
+        for params, lr in [
+            (noble_wup, base_lr * (ratio ** (2 * cfg.noble_lr_gamma))),
+            (noble_M, base_lr * (ratio ** cfg.noble_lr_gamma_M)),
+            (noble_freq, base_lr * cfg.noble_freq_lr_mult),
+            (noble_phase, base_lr * cfg.noble_phase_lr_mult),
+        ]:
+            if params:
+                groups.append({"params": params, "lr": lr, "weight_decay": wd,
+                               "betas": betas, "eps": eps})
+
     kwargs = dict(
         params=groups,
         lr=float(cfg.adam_learning_rate),
@@ -1646,6 +1682,7 @@ def run_pure_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
+            extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
         )
         if use_static_inp_size:
             min_tokens_per_seq = max(
@@ -1687,6 +1724,7 @@ def run_pure_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
+            extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
         )
         train_sampler = DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed) if distributed else RandomSampler(train_ds)
 
@@ -1797,6 +1835,7 @@ def run_pure_pretraining(
         mask_token_probability=pretrain_config.mask_replace_prob,
         random_token_probability=pretrain_config.random_token_prob,
         keep_probability=pretrain_config.keep_probability,
+        extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
     )
 
     dl_kwargs = dict(
