@@ -2472,6 +2472,8 @@ class ModernBertModel(nn.Module):
             if self.config.use_mhc_lite:
                 n = self.config.mhc_n_streams
                 x = F.pad(x.unsqueeze(-2), (0, 0, 0, n - 1))  # (T, n, C)
+                if torch.is_autocast_enabled(device.type):
+                    x = x.to(torch.get_autocast_dtype(device.type))
             x0 = x if self.x0_lambdas is not None else None
             if _position_ids is None:
                 _position_ids = _position_ids_from_cu_seqlens(
@@ -2597,6 +2599,8 @@ class ModernBertModel(nn.Module):
         if self.config.use_mhc_lite:
             n = self.config.mhc_n_streams
             x = F.pad(x.unsqueeze(-2), (0, 0, 0, n - 1))  # (B, S, n, C)
+            if torch.is_autocast_enabled(device.type):
+                x = x.to(torch.get_autocast_dtype(device.type))
         x0 = x if self.x0_lambdas is not None else None
 
         attn_masks = {

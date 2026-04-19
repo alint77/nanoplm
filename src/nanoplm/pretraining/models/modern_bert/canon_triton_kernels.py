@@ -618,100 +618,104 @@ def _fused_conv_bwd_dx_ln_bwd_kernel(
     C,
     stride_t,
     stride_c,
-    rows_per_program,
     RADIUS: tl.constexpr,
+    BLOCK_T: tl.constexpr,
     BLOCK_N: tl.constexpr,
     FP32_ACCUM: tl.constexpr,
 ):
     """Fused conv transpose + residual add + LN backward.
 
-    Grid = (num_programs,) where num_programs = SM_count * 8.
-    Each program handles ``rows_per_program`` consecutive rows.
-    Per row: compute conv_bwd_dx via K-tap transpose conv in registers,
-    add to grad_out for grad_ln_out, then run LN backward for dx + dgamma.
+    2-D tile: each program processes a (BLOCK_T, BLOCK_N) window in parallel,
+    where BLOCK_N >= C covers the full hidden dim. Grid = (ceil(T / BLOCK_T),).
+    K-tap neighbor loads are shared across all BLOCK_T rows in the tile,
+    exposing reuse and lifting block-level parallelism by BLOCK_T× versus
+    the previous per-row serial design.
     """
     K: tl.constexpr = 2 * RADIUS + 1
 
     pid = tl.program_id(0)
-    row_start = pid * rows_per_program
-    row_end = min(row_start + rows_per_program, T)
-
+    t_offs = pid * BLOCK_T + tl.arange(0, BLOCK_T)
     cols = tl.arange(0, BLOCK_N)
-    mask = cols < C
+    t_mask = t_offs < T
+    c_mask = cols < C
+    tc_mask = t_mask[:, None] & c_mask[None, :]
 
-    gamma = tl.load(ln_w_ptr + cols, mask=mask, other=0.0)
+    gamma = tl.load(ln_w_ptr + cols, mask=c_mask, other=0.0)
     if FP32_ACCUM:
         gamma = gamma.to(tl.float32)
-    dgamma_acc = tl.zeros((BLOCK_N,), dtype=gamma.dtype)
 
-    # Pre-load conv weights (K values per channel, all fit in registers)
-    # We need flipped weights for transpose conv: index K-1-k
-    # Load all K taps upfront to avoid repeated global loads
-    # conv_w layout: (C, K) — conv_w_ptr[c * K + k]
+    my_seq = tl.load(seq_id_ptr + t_offs, mask=t_mask, other=-1)
 
-    for row in range(row_start, row_end):
-        row_off = row * stride_t
+    # Load grad_out self tile (skip contribution for grad_ln_out)
+    go_self = tl.load(
+        grad_out_ptr + t_offs[:, None] * stride_t + cols[None, :] * stride_c,
+        mask=tc_mask,
+        other=0.0,
+    )
+    if FP32_ACCUM:
+        go_self = go_self.to(tl.float32)
 
-        # Load grad_out for this row
-        go_self = tl.load(
-            grad_out_ptr + row_off + cols * stride_c, mask=mask, other=0.0
+    # ── Step 1: conv_bwd_dx — transpose conv with flipped weights ──
+    acc_dtype = tl.float32 if FP32_ACCUM else go_self.dtype
+    conv_acc = tl.zeros((BLOCK_T, BLOCK_N), dtype=acc_dtype)
+    for k in tl.static_range(K):
+        offset = k - RADIUS
+        nbr_t = t_offs + offset
+        in_bounds = (nbr_t >= 0) & (nbr_t < T)
+
+        nbr_seq = tl.load(seq_id_ptr + nbr_t, mask=in_bounds & t_mask, other=-1)
+        valid = in_bounds & (my_seq == nbr_seq)
+
+        go_nbr = tl.load(
+            grad_out_ptr + nbr_t[:, None] * stride_t + cols[None, :] * stride_c,
+            mask=valid[:, None] & c_mask[None, :],
+            other=0.0,
         )
         if FP32_ACCUM:
-            go_self = go_self.to(tl.float32)
+            go_nbr = go_nbr.to(tl.float32)
 
-        my_seq = tl.load(seq_id_ptr + row)
-
-        # ── Step 1: conv_bwd_dx — transpose conv with flipped weights ──
-        conv_acc = tl.zeros((BLOCK_N,), dtype=go_self.dtype)
-        for k in tl.static_range(K):
-            offset = k - RADIUS
-            nbr = row + offset
-            in_bounds = (nbr >= 0) & (nbr < T)
-
-            nbr_seq = tl.load(seq_id_ptr + nbr, mask=in_bounds, other=-1)
-            valid = in_bounds & (my_seq == nbr_seq)
-
-            go_nbr = tl.load(
-                grad_out_ptr + nbr * stride_t + cols * stride_c,
-                mask=valid & mask,
-                other=0.0,
-            )
-            if FP32_ACCUM:
-                go_nbr = go_nbr.to(tl.float32)
-
-            # Flipped weight: K-1-k
-            w_k = tl.load(conv_w_ptr + cols * K + (K - 1 - k), mask=mask, other=0.0)
-            if FP32_ACCUM:
-                w_k = w_k.to(tl.float32)
-
-            conv_acc += go_nbr * w_k
-
-        # ── Step 2: grad_ln_out = grad_out + conv_grad (skip + conv) ──
-        grad_ln_out = go_self + conv_acc
-
-        # ── Step 3: LN backward ──
-        x_row = tl.load(x_ptr + row_off + cols * stride_c, mask=mask, other=0.0)
+        # Flipped weight: K-1-k
+        w_k = tl.load(conv_w_ptr + cols * K + (K - 1 - k), mask=c_mask, other=0.0)
         if FP32_ACCUM:
-            x_row = x_row.to(tl.float32)
-        m = tl.load(mean_ptr + row)
-        r = tl.load(rstd_ptr + row)
-        if FP32_ACCUM:
-            m = m.to(tl.float32)
-            r = r.to(tl.float32)
+            w_k = w_k.to(tl.float32)
 
-        x_hat = (x_row - m) * r
-        x_hat = tl.where(mask, x_hat, 0.0)
+        conv_acc += go_nbr * w_k[None, :]
 
-        dgamma_acc += grad_ln_out * x_hat
+    # ── Step 2: grad_ln_out = grad_out + conv_grad (skip + conv) ──
+    grad_ln_out = go_self + conv_acc
 
-        wdy = grad_ln_out * gamma
-        c1 = tl.sum(x_hat * wdy, axis=0) / C
-        c2 = tl.sum(wdy, axis=0) / C
-        dx = (wdy - x_hat * c1 - c2) * r
+    # ── Step 3: LN backward (vectorized across BLOCK_T rows) ──
+    x_tile = tl.load(
+        x_ptr + t_offs[:, None] * stride_t + cols[None, :] * stride_c,
+        mask=tc_mask,
+        other=0.0,
+    )
+    if FP32_ACCUM:
+        x_tile = x_tile.to(tl.float32)
+    m = tl.load(mean_ptr + t_offs, mask=t_mask, other=0.0)
+    r = tl.load(rstd_ptr + t_offs, mask=t_mask, other=1.0)
+    if FP32_ACCUM:
+        m = m.to(tl.float32)
+        r = r.to(tl.float32)
 
-        tl.store(grad_x_ptr + row_off + cols * stride_c, dx, mask=mask)
+    x_hat = (x_tile - m[:, None]) * r[:, None]
+    x_hat = tl.where(c_mask[None, :], x_hat, 0.0)
 
-    tl.store(partial_dgamma_ptr + pid * C + cols, dgamma_acc, mask=mask)
+    # Partial dgamma: sum across the BLOCK_T rows of this tile
+    dgamma_tile = tl.sum(grad_ln_out * x_hat, axis=0)  # (BLOCK_N,)
+
+    wdy = grad_ln_out * gamma[None, :]
+    # Per-row reductions across cols
+    c1 = tl.sum(x_hat * wdy, axis=1) / C  # (BLOCK_T,)
+    c2 = tl.sum(wdy, axis=1) / C  # (BLOCK_T,)
+    dx = (wdy - x_hat * c1[:, None] - c2[:, None]) * r[:, None]
+
+    tl.store(
+        grad_x_ptr + t_offs[:, None] * stride_t + cols[None, :] * stride_c,
+        dx,
+        mask=tc_mask,
+    )
+    tl.store(partial_dgamma_ptr + pid * C + cols, dgamma_tile, mask=c_mask)
 
 
 # ── Fused LN+Conv backward dw/db with partial buffers ───────────────────
@@ -1022,92 +1026,101 @@ def _fused_conv_bwd_dx_rms_bwd_kernel(
     C,
     stride_t,
     stride_c,
-    rows_per_program,
     RADIUS: tl.constexpr,
+    BLOCK_T: tl.constexpr,
     BLOCK_N: tl.constexpr,
     FP32_ACCUM: tl.constexpr,
 ):
     """Fused conv transpose + residual add + RMSNorm backward.
 
-    Grid = (num_programs,) where num_programs = SM_count * 8.
-    Each program handles ``rows_per_program`` consecutive rows.
-    Per row: compute conv_bwd_dx via K-tap transpose conv in registers,
-    add to grad_out for grad_rms_out, then run RMS backward for dx + dgamma.
+    2-D tile: each program processes a (BLOCK_T, BLOCK_N) window in parallel,
+    where BLOCK_N >= C covers the full hidden dim. Grid = (ceil(T / BLOCK_T),).
+    K-tap neighbor loads are shared across all BLOCK_T rows in the tile,
+    exposing reuse and lifting block-level parallelism by BLOCK_T× versus
+    the previous per-row serial design.
     """
     K: tl.constexpr = 2 * RADIUS + 1
 
     pid = tl.program_id(0)
-    row_start = pid * rows_per_program
-    row_end = min(row_start + rows_per_program, T)
-
+    t_offs = pid * BLOCK_T + tl.arange(0, BLOCK_T)
     cols = tl.arange(0, BLOCK_N)
-    mask = cols < C
+    t_mask = t_offs < T
+    c_mask = cols < C
+    tc_mask = t_mask[:, None] & c_mask[None, :]
 
-    gamma = tl.load(rms_w_ptr + cols, mask=mask, other=0.0)
+    gamma = tl.load(rms_w_ptr + cols, mask=c_mask, other=0.0)
     if FP32_ACCUM:
         gamma = gamma.to(tl.float32)
-    dgamma_acc = tl.zeros((BLOCK_N,), dtype=gamma.dtype)
 
-    for row in range(row_start, row_end):
-        row_off = row * stride_t
+    my_seq = tl.load(seq_id_ptr + t_offs, mask=t_mask, other=-1)
 
-        # Load grad_out for this row
-        go_self = tl.load(
-            grad_out_ptr + row_off + cols * stride_c, mask=mask, other=0.0
+    # Load grad_out self tile (skip contribution for grad_rms_out)
+    go_self = tl.load(
+        grad_out_ptr + t_offs[:, None] * stride_t + cols[None, :] * stride_c,
+        mask=tc_mask,
+        other=0.0,
+    )
+    if FP32_ACCUM:
+        go_self = go_self.to(tl.float32)
+
+    # ── Step 1: conv_bwd_dx — transpose conv with flipped weights ──
+    acc_dtype = tl.float32 if FP32_ACCUM else go_self.dtype
+    conv_acc = tl.zeros((BLOCK_T, BLOCK_N), dtype=acc_dtype)
+    for k in tl.static_range(K):
+        offset = k - RADIUS
+        nbr_t = t_offs + offset
+        in_bounds = (nbr_t >= 0) & (nbr_t < T)
+
+        nbr_seq = tl.load(seq_id_ptr + nbr_t, mask=in_bounds & t_mask, other=-1)
+        valid = in_bounds & (my_seq == nbr_seq)
+
+        go_nbr = tl.load(
+            grad_out_ptr + nbr_t[:, None] * stride_t + cols[None, :] * stride_c,
+            mask=valid[:, None] & c_mask[None, :],
+            other=0.0,
         )
         if FP32_ACCUM:
-            go_self = go_self.to(tl.float32)
+            go_nbr = go_nbr.to(tl.float32)
 
-        my_seq = tl.load(seq_id_ptr + row)
-
-        # ── Step 1: conv_bwd_dx — transpose conv with flipped weights ──
-        conv_acc = tl.zeros((BLOCK_N,), dtype=go_self.dtype)
-        for k in tl.static_range(K):
-            offset = k - RADIUS
-            nbr = row + offset
-            in_bounds = (nbr >= 0) & (nbr < T)
-
-            nbr_seq = tl.load(seq_id_ptr + nbr, mask=in_bounds, other=-1)
-            valid = in_bounds & (my_seq == nbr_seq)
-
-            go_nbr = tl.load(
-                grad_out_ptr + nbr * stride_t + cols * stride_c,
-                mask=valid & mask,
-                other=0.0,
-            )
-            if FP32_ACCUM:
-                go_nbr = go_nbr.to(tl.float32)
-
-            # Flipped weight: K-1-k
-            w_k = tl.load(conv_w_ptr + cols * K + (K - 1 - k), mask=mask, other=0.0)
-            if FP32_ACCUM:
-                w_k = w_k.to(tl.float32)
-
-            conv_acc += go_nbr * w_k
-
-        # ── Step 2: grad_rms_out = grad_out + conv_grad (skip + conv) ──
-        grad_rms_out = go_self + conv_acc
-
-        # ── Step 3: RMS backward ──
-        x_row = tl.load(x_ptr + row_off + cols * stride_c, mask=mask, other=0.0)
+        # Flipped weight: K-1-k
+        w_k = tl.load(conv_w_ptr + cols * K + (K - 1 - k), mask=c_mask, other=0.0)
         if FP32_ACCUM:
-            x_row = x_row.to(tl.float32)
-        inv_rms = tl.load(inv_rms_ptr + row)
-        if FP32_ACCUM:
-            inv_rms = inv_rms.to(tl.float32)
+            w_k = w_k.to(tl.float32)
 
-        x_norm = x_row * inv_rms
-        x_norm = tl.where(mask, x_norm, 0.0)
+        conv_acc += go_nbr * w_k[None, :]
 
-        dgamma_acc += grad_rms_out * x_norm
+    # ── Step 2: grad_rms_out = grad_out + conv_grad (skip + conv) ──
+    grad_rms_out = go_self + conv_acc
 
-        wdy = grad_rms_out * gamma
-        c1 = inv_rms * inv_rms * tl.sum(x_row * wdy, axis=0) / C
-        dx = inv_rms * (wdy - x_row * c1)
+    # ── Step 3: RMSNorm backward (vectorized across BLOCK_T rows) ──
+    x_tile = tl.load(
+        x_ptr + t_offs[:, None] * stride_t + cols[None, :] * stride_c,
+        mask=tc_mask,
+        other=0.0,
+    )
+    if FP32_ACCUM:
+        x_tile = x_tile.to(tl.float32)
+    inv_rms = tl.load(inv_rms_ptr + t_offs, mask=t_mask, other=1.0)
+    if FP32_ACCUM:
+        inv_rms = inv_rms.to(tl.float32)
 
-        tl.store(grad_x_ptr + row_off + cols * stride_c, dx, mask=mask)
+    x_norm = x_tile * inv_rms[:, None]
+    x_norm = tl.where(c_mask[None, :], x_norm, 0.0)
 
-    tl.store(partial_dgamma_ptr + pid * C + cols, dgamma_acc, mask=mask)
+    # Partial dgamma: sum across the BLOCK_T rows of this tile
+    dgamma_tile = tl.sum(grad_rms_out * x_norm, axis=0)  # (BLOCK_N,)
+
+    wdy = grad_rms_out * gamma[None, :]
+    # Per-row reduction across cols: c1 = inv_rms^2 * sum(x * wdy) / C
+    c1 = inv_rms * inv_rms * tl.sum(x_tile * wdy, axis=1) / C  # (BLOCK_T,)
+    dx = inv_rms[:, None] * (wdy - x_tile * c1[:, None])
+
+    tl.store(
+        grad_x_ptr + t_offs[:, None] * stride_t + cols[None, :] * stride_c,
+        dx,
+        mask=tc_mask,
+    )
+    tl.store(partial_dgamma_ptr + pid * C + cols, dgamma_tile, mask=c_mask)
 
 
 @triton.jit
@@ -1200,7 +1213,10 @@ _AUTOTUNE_LN_STATS_CONFIGS = [triton.Config({}, num_warps=nw) for nw in (1, 2, 4
 _AUTOTUNE_LN_BWD_CONFIGS = [triton.Config({}, num_warps=nw) for nw in (1, 2, 4, 8)]
 
 _AUTOTUNE_FUSED_CONV_LN_BWD_CONFIGS = [
-    triton.Config({}, num_warps=nw) for nw in (1, 2, 4, 8)
+    triton.Config({"BLOCK_T": bt}, num_warps=nw, num_stages=ns)
+    for bt in (16, 32)
+    for nw in (4, 8)
+    for ns in (2, 3)
 ]
 
 
@@ -1239,7 +1255,10 @@ _AUTOTUNE_RMS_STATS_CONFIGS = [triton.Config({}, num_warps=nw) for nw in (1, 2, 
 _AUTOTUNE_RMS_BWD_CONFIGS = [triton.Config({}, num_warps=nw) for nw in (1, 2, 4, 8)]
 
 _AUTOTUNE_FUSED_CONV_RMS_BWD_CONFIGS = [
-    triton.Config({}, num_warps=nw) for nw in (1, 2, 4, 8)
+    triton.Config({"BLOCK_T": bt}, num_warps=nw, num_stages=ns)
+    for bt in (16, 32)
+    for nw in (4, 8)
+    for ns in (2, 3)
 ]
 
 
@@ -1388,8 +1407,8 @@ def _fused_conv_bwd_dx_ln_bwd_kernel_autotuned(
     C,
     stride_t,
     stride_c,
-    rows_per_program,
     RADIUS: tl.constexpr,
+    BLOCK_T: tl.constexpr,
     BLOCK_N: tl.constexpr,
     FP32_ACCUM: tl.constexpr,
 ):
@@ -1407,8 +1426,8 @@ def _fused_conv_bwd_dx_ln_bwd_kernel_autotuned(
         C,
         stride_t,
         stride_c,
-        rows_per_program,
         RADIUS,
+        BLOCK_T,
         BLOCK_N,
         FP32_ACCUM,
     )
@@ -1576,8 +1595,8 @@ def _fused_conv_bwd_dx_rms_bwd_kernel_autotuned(
     C,
     stride_t,
     stride_c,
-    rows_per_program,
     RADIUS: tl.constexpr,
+    BLOCK_T: tl.constexpr,
     BLOCK_N: tl.constexpr,
     FP32_ACCUM: tl.constexpr,
 ):
@@ -1594,8 +1613,8 @@ def _fused_conv_bwd_dx_rms_bwd_kernel_autotuned(
         C,
         stride_t,
         stride_c,
-        rows_per_program,
         RADIUS,
+        BLOCK_T,
         BLOCK_N,
         FP32_ACCUM,
     )

@@ -731,11 +731,27 @@ def _ln_conv_bwd_dx_dgamma_cuda(
     fp32_acc = _needs_fp32_accum(x.dtype)
     acc_dtype = torch.float32 if fp32_acc else x.dtype
 
-    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count * 8
-    rows_per_program = math.ceil(T / sm_count)
+    # Sized for the smallest BLOCK_T in the autotune configs (= max program
+    # count). torch.empty is safe iff every row is written by the kernel,
+    # which holds when the selected BLOCK_T equals _MIN_BLOCK_T; for larger
+    # BLOCK_T we zero below only the unused tail.
+    _MIN_BLOCK_T = 16
+    max_programs = triton.cdiv(T, _MIN_BLOCK_T)
 
     grad_x = torch.empty_like(x)
-    partial_dgamma = torch.zeros(sm_count, C, dtype=acc_dtype, device=x.device)
+    partial_dgamma = torch.empty(max_programs, C, dtype=acc_dtype, device=x.device)
+
+    # Look up chosen BLOCK_T from the autotune cache so we only sum & zero
+    # what the kernel actually touches. On the very first call the cache is
+    # empty and we fall back to the full (correctly zeroed) buffer.
+    _chosen_bt = None
+    if _autotune_enabled():
+        _at = k._fused_conv_bwd_dx_ln_bwd_kernel_autotuned
+        for _cfg in _at.cache.values():
+            _chosen_bt = _cfg.kwargs.get("BLOCK_T")
+            break
+    if _chosen_bt is None or _chosen_bt != _MIN_BLOCK_T:
+        partial_dgamma.zero_()
 
     if _autotune_enabled():
         autotuner = k._fused_conv_bwd_dx_ln_bwd_kernel_autotuned
@@ -744,7 +760,8 @@ def _ln_conv_bwd_dx_dgamma_cuda(
             autotuner=autotuner,
             args_by_name={"T": T, "C": C},
         )
-        autotuner[(sm_count,)](
+        grid = lambda META: (triton.cdiv(T, META["BLOCK_T"]),)
+        autotuner[grid](
             grad_out,
             x,
             seq_id,
@@ -758,7 +775,6 @@ def _ln_conv_bwd_dx_dgamma_cuda(
             C,
             x.stride(0),
             x.stride(1),
-            rows_per_program,
             RADIUS=radius,
             BLOCK_N=BLOCK_N,
             FP32_ACCUM=fp32_acc,
@@ -767,7 +783,9 @@ def _ln_conv_bwd_dx_dgamma_cuda(
             kernel_name="canon_fused_conv_ln_bwd", autotuner=autotuner, state=status
         )
     else:
-        k._fused_conv_bwd_dx_ln_bwd_kernel[(sm_count,)](
+        _FALLBACK_BLOCK_T = 16
+        grid = (triton.cdiv(T, _FALLBACK_BLOCK_T),)
+        k._fused_conv_bwd_dx_ln_bwd_kernel[grid](
             grad_out,
             x,
             seq_id,
@@ -781,11 +799,12 @@ def _ln_conv_bwd_dx_dgamma_cuda(
             C,
             x.stride(0),
             x.stride(1),
-            rows_per_program,
             RADIUS=radius,
+            BLOCK_T=_FALLBACK_BLOCK_T,
             BLOCK_N=BLOCK_N,
             FP32_ACCUM=fp32_acc,
-            num_warps=4,
+            num_warps=8,
+            num_stages=2,
         )
 
     grad_gamma = partial_dgamma.sum(0).to(ln_weight.dtype)
@@ -1058,11 +1077,24 @@ def _rms_conv_bwd_dx_dgamma_cuda(
     fp32_acc = _needs_fp32_accum(x.dtype)
     acc_dtype = torch.float32 if fp32_acc else x.dtype
 
-    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count * 8
-    rows_per_program = math.ceil(T / sm_count)
+    # Sized for the smallest BLOCK_T in the autotune configs (= max program
+    # count). torch.empty is safe iff every row is written by the kernel,
+    # which holds when the selected BLOCK_T equals _MIN_BLOCK_T; for larger
+    # BLOCK_T we zero below only the unused tail.
+    _MIN_BLOCK_T = 16
+    max_programs = triton.cdiv(T, _MIN_BLOCK_T)
 
     grad_x = torch.empty_like(x)
-    partial_dgamma = torch.zeros(sm_count, C, dtype=acc_dtype, device=x.device)
+    partial_dgamma = torch.empty(max_programs, C, dtype=acc_dtype, device=x.device)
+
+    _chosen_bt = None
+    if _autotune_enabled():
+        _at = k._fused_conv_bwd_dx_rms_bwd_kernel_autotuned
+        for _cfg in _at.cache.values():
+            _chosen_bt = _cfg.kwargs.get("BLOCK_T")
+            break
+    if _chosen_bt is None or _chosen_bt != _MIN_BLOCK_T:
+        partial_dgamma.zero_()
 
     if _autotune_enabled():
         autotuner = k._fused_conv_bwd_dx_rms_bwd_kernel_autotuned
@@ -1071,7 +1103,8 @@ def _rms_conv_bwd_dx_dgamma_cuda(
             autotuner=autotuner,
             args_by_name={"T": T, "C": C},
         )
-        autotuner[(sm_count,)](
+        grid = lambda META: (triton.cdiv(T, META["BLOCK_T"]),)
+        autotuner[grid](
             grad_out,
             x,
             seq_id,
@@ -1084,7 +1117,6 @@ def _rms_conv_bwd_dx_dgamma_cuda(
             C,
             x.stride(0),
             x.stride(1),
-            rows_per_program,
             RADIUS=radius,
             BLOCK_N=BLOCK_N,
             FP32_ACCUM=fp32_acc,
@@ -1093,7 +1125,9 @@ def _rms_conv_bwd_dx_dgamma_cuda(
             kernel_name="canon_fused_conv_rms_bwd", autotuner=autotuner, state=status
         )
     else:
-        k._fused_conv_bwd_dx_rms_bwd_kernel[(sm_count,)](
+        _FALLBACK_BLOCK_T = 16
+        grid = (triton.cdiv(T, _FALLBACK_BLOCK_T),)
+        k._fused_conv_bwd_dx_rms_bwd_kernel[grid](
             grad_out,
             x,
             seq_id,
@@ -1106,11 +1140,12 @@ def _rms_conv_bwd_dx_dgamma_cuda(
             C,
             x.stride(0),
             x.stride(1),
-            rows_per_program,
             RADIUS=radius,
+            BLOCK_T=_FALLBACK_BLOCK_T,
             BLOCK_N=BLOCK_N,
             FP32_ACCUM=fp32_acc,
-            num_warps=4,
+            num_warps=8,
+            num_stages=2,
         )
 
     grad_gamma = partial_dgamma.sum(0).to(rms_weight.dtype)
