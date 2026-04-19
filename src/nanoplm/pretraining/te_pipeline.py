@@ -944,7 +944,7 @@ def run_te_pretraining(
                             out = model(**fwd_kwargs)
 
                         loss = out["loss"] if isinstance(out, dict) else out.loss
-                        if not torch.isfinite(loss.detach()).all():
+                        if debug_non_finite_params and not torch.isfinite(loss.detach()).all():
                             rank = dist.get_rank() if distributed and dist.is_initialized() else 0
                             logger.error(
                                 "Skipping optimizer step %d due to non-finite loss on rank %d (epoch=%d data_step=%d sub_batch=%d).",
