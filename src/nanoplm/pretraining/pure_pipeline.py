@@ -77,6 +77,7 @@ from nanoplm.pretraining.utils import (
 from nanoplm.utils.common import create_dirs, get_device, resolve_world_size
 from nanoplm.utils.logger import logger
 from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
+from nanoplm.pretraining.debug_metrics import LayerwiseDebugTracker
 
 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
@@ -2107,6 +2108,24 @@ def run_pure_pretraining(
     log_window_t0 = time.perf_counter()
     first_step_of_run = True
     debug_non_finite_params = bool(getattr(pretrain_config, "debug_non_finite_params", True))
+    debug_layerwise_enabled = bool(getattr(pretrain_config, "debug_layerwise_metrics", False))
+    debug_tracker: LayerwiseDebugTracker | None = None
+    if debug_layerwise_enabled:
+        if is_main:
+            logger.warning(
+                "debug_layerwise_metrics=True: forward hooks will be installed on "
+                "every transformer block and the lm_head. If torch.compile is "
+                "enabled, expect graph breaks at those boundaries (5-20%% throughput "
+                "regression typical)."
+            )
+        debug_tracker = LayerwiseDebugTracker(
+            model=orig_model,
+            log_every=int(getattr(pretrain_config, "debug_layerwise_log_every", 20)),
+            device=device,
+            output_dir=output_dir,
+            is_main=is_main,
+            distributed=bool(distributed and dist.is_initialized()),
+        )
     has_batch_t = (
         torch.empty((), device=device, dtype=torch.int32)
         if distributed and dist.is_initialized() else None
@@ -2339,6 +2358,8 @@ def run_pure_pretraining(
                             scaler.unscale_(optimizer.adamw)
                         else:
                             scaler.unscale_(optimizer)
+                    if debug_tracker is not None and debug_tracker.should_flush(upcoming_step):
+                        debug_tracker.record_step_boundary()
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         orig_model.parameters(),
                         max_norm=max_grad_norm,
@@ -2504,6 +2525,14 @@ def run_pure_pretraining(
                                 wandb_enabled = False
                                 logger.warning(f"W&B log failed; disabling. Error: {exc}")
 
+                    if debug_tracker is not None and debug_tracker.should_flush(global_step):
+                        debug_payload = debug_tracker.flush(global_step)
+                        if is_main and debug_payload is not None and wandb_enabled and wandb.run is not None:
+                            try:
+                                wandb.log({**debug_payload, "train/global_step": global_step})
+                            except Exception as exc:
+                                logger.warning(f"W&B debug log failed: {exc}")
+
                     if first_step_of_run:
                         first_step_of_run = False
                         gc.collect(); gc.freeze(); gc.disable()
@@ -2606,6 +2635,9 @@ def run_pure_pretraining(
         total_steps=total_steps, warmup_steps=warmup_steps,
         dataset_fingerprint=_dataset_fingerprint,
     )
+
+    if debug_tracker is not None:
+        debug_tracker.close()
 
     if is_main and wandb_enabled and wandb.run is not None:
         try:
