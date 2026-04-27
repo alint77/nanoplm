@@ -109,6 +109,7 @@ class PretrainingConfig:
     fsdp_shard_granularity: str = "layer"
     ddp_bucket_cap_mb: int = 25
     project_name: str = "nanoplm-pretraining"
+    run_name: str = "run"
 
     # NOBLE optimizer LR scaling (paper §3.3, Appendix A)
     noble_base_lr: float = 3e-4          # independent base LR for NOBLE branch params

@@ -390,7 +390,13 @@ def pretrain():
     "--project-name",
     type=str,
     default="nanoplm-pretraining",
-    help="Weights & Biases project name (new runs named run-DDMMHHMM, unique)",
+    help="Weights & Biases project name",
+)
+@click.option(
+    "--run-name",
+    type=str,
+    default="run",
+    help=f"Weights & Biases run name under the project name as DDMMHHMM-<run_name>",
 )
 # Resume options
 @click.option(
@@ -712,6 +718,7 @@ def run(
     world_size: str,
     ddp_bucket_cap_mb: int,
     project_name: str,
+    run_name: str,
     resume: bool,
     resume_checkpoint_dir: str,
     resume_extra_epochs: Optional[int],
@@ -816,6 +823,7 @@ def run(
         world_size=world_size,
         ddp_bucket_cap_mb=ddp_bucket_cap_mb,
         project_name=project_name,
+        run_name=run_name
     )
 
     if pure_torch and pure_te:
@@ -1277,6 +1285,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  world_size: 'auto'\n"
         "  ddp_bucket_cap_mb: 25  # only used when distributed_mode: ddp in pure_torch/pure_te; HF path ignores it\n"
         '  project_name: "nanoplm-pretraining"\n'
+        '  run_name: "run" # will be DDMMHHMM-<run_name>\n'
         "  profiler_enabled: false\n"
         "  profiler_start_step: 10\n"
         "  profiler_end_step: 15\n"
